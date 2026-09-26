@@ -21,5 +21,6 @@ tracing = "0.1.44"
 unicode-normalization = "0.1.25"
 
 [dev-dependencies]
+proptest = "1.11.0"
 tempfile = "3.27.0"
 tokio = { version = "1.53.1", features = ["full"] }
