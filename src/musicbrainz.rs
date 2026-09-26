@@ -277,6 +277,8 @@ pub struct ReleaseHit {
     #[serde(default)]
     pub score: u32,
     pub title: String,
+    #[serde(default, rename = "track-count")]
+    pub track_count: usize,
 }
 
 #[derive(Debug, Clone, Deserialize)]

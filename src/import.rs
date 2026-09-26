@@ -212,8 +212,13 @@ impl Importer {
                 break;
             }
         }
+        // An album usually has many pressings scoring alike; the ones with
+        // as many tracks as the folder are looked up first, since the
+        // lookups run out before the list does.
+        hits.retain(|h| h.score >= 50);
+        hits.sort_by_key(|h| h.track_count.abs_diff(tracks.len()));
         for hit in hits {
-            if releases.len() > LOOKUPS || hit.score < 50 {
+            if releases.len() > LOOKUPS {
                 break;
             }
             if releases.iter().any(|r| r.id == hit.id) {
