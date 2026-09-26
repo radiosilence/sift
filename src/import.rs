@@ -226,6 +226,13 @@ impl Importer {
         })
     }
 
+    /// Whether `import_as_is` would accept the folder as its tags stand,
+    /// and if not, why: the same check, without filing anything.
+    pub async fn check_as_is(&self, dir: &Path) -> Result<(), ImportError> {
+        let (tracks, _) = one_copy_each(read_dir(dir).await?);
+        as_is_tags(&tracks).map(|_| ())
+    }
+
     /// The folder's files and the tags they carry, as an import would read
     /// them.
     pub async fn tracks(&self, dir: &Path) -> Result<Vec<Track>, ImportError> {
