@@ -113,10 +113,17 @@ pub fn string_distance(a: &str, b: &str) -> f64 {
     1.0 - strsim::normalized_levenshtein(&a, &b)
 }
 
+/// Beets' flat allowance, widened in proportion for long tracks. A trimmed
+/// silence or a vinyl edit moves a twenty-minute side by twenty seconds,
+/// which the flat allowance reads as a different recording; anything under
+/// about eight minutes is judged exactly as beets judges it.
 fn length_distance(local_secs: f64, remote_ms: Option<u64>) -> f64 {
     let Some(ms) = remote_ms else { return 0.0 };
-    let diff = (local_secs - ms as f64 / 1000.0).abs();
-    ((diff - LENGTH_GRACE_SECS) / (LENGTH_MAX_SECS - LENGTH_GRACE_SECS)).clamp(0.0, 1.0)
+    let remote = ms as f64 / 1000.0;
+    let grace = LENGTH_GRACE_SECS.max(remote * 0.02);
+    let max = LENGTH_MAX_SECS.max(remote * 0.06);
+    let diff = (local_secs - remote).abs();
+    ((diff - grace) / (max - grace)).clamp(0.0, 1.0)
 }
 
 #[derive(Debug, Clone)]
@@ -129,6 +136,27 @@ pub struct Match {
     pub missing: usize,
     /// Files with no release track.
     pub extra: usize,
+    /// What the distance is made of, each in 0..1: album title, artist,
+    /// and the mean over paired tracks of title and length.
+    pub parts: Parts,
+}
+
+#[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
+pub struct Parts {
+    pub album: f64,
+    pub artist: f64,
+    pub titles: f64,
+    pub lengths: f64,
+}
+
+impl std::fmt::Display for Parts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "album {:.2}, artist {:.2}, titles {:.2}, lengths {:.2}",
+            self.album, self.artist, self.titles, self.lengths
+        )
+    }
 }
 
 impl Match {
@@ -192,11 +220,15 @@ pub fn score(local: &[Track], release: &Release) -> Match {
 
     let mut num = W_ALBUM * d_album + W_ARTIST * d_artist;
     let mut den = W_ALBUM + W_ARTIST;
+    let (mut titles, mut lengths) = (0.0, 0.0);
     for &(l, r) in &pairs {
         let (t, len) = cost(l, r);
+        titles += t;
+        lengths += len;
         num += W_TITLE * t + W_LENGTH * len;
         den += W_TITLE + W_LENGTH;
     }
+    let paired = pairs.len().max(1) as f64;
     let missing = remote.len() - pairs.len();
     let extra = local.len() - pairs.len();
     num += W_MISSING * missing as f64 + W_EXTRA * extra as f64;
@@ -208,6 +240,12 @@ pub fn score(local: &[Track], release: &Release) -> Match {
         pairs,
         missing,
         extra,
+        parts: Parts {
+            album: d_album,
+            artist: d_artist,
+            titles: titles / paired,
+            lengths: lengths / paired,
+        },
     }
 }
 
@@ -295,6 +333,15 @@ mod tests {
             duration: Duration::from_secs(secs),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn length_allowance_grows_with_long_tracks() {
+        // A twenty-minute side 21 s short: the same recording.
+        assert_eq!(length_distance(1202.7, Some(1_224_000)), 0.0);
+        // A three-minute song 21 s off: judged as beets judges it.
+        assert!((length_distance(201.0, Some(180_000)) - 0.55).abs() < 1e-9);
+        assert_eq!(length_distance(185.0, Some(180_000)), 0.0);
     }
 
     #[test]

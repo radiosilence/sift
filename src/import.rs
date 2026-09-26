@@ -154,11 +154,12 @@ impl Importer {
         };
         let _ = writeln!(
             log,
-            "best: {} — {} ({}), distance {:.3}",
+            "best: {} — {} ({}), distance {:.3} ({})",
             best.release.artist(),
             best.release.title,
             best.release.id,
-            best.distance
+            best.distance,
+            best.parts
         );
 
         if release_id.is_none() {

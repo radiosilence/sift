@@ -30,9 +30,14 @@ instead of disambiguated.
 - **Matching** is beets-shaped — a weighted distance over album, artist and
   per-track title and length, with penalties for missing and extra tracks —
   but tracks are paired by disc and track number when the files carry them,
-  and by cheapest title-and-length pairing only when they do not. An album is
-  applied without asking only when it is below the threshold *and* complete;
-  otherwise the candidates are returned.
+  and by cheapest title-and-length pairing only when they do not. The length
+  allowance is beets' 10 s (full penalty at 30 s) or 2% (6%) of the track,
+  whichever is larger, since a long side routinely differs by more than ten
+  seconds between editions. An album is applied without asking only when it
+  is below the threshold *and* complete; otherwise the candidates are
+  returned, with what the distance is made of in the log.
+- **One copy of each track.** A folder holding an album in two formats, or
+  with `(1)` duplicates, is imported from the best copy of each track.
 - **Nothing is overwritten.** Every destination is planned and checked before
   any file changes, including case-insensitive collisions on macOS. Each file
   claims its name with `create_new` before it moves, and a move across
