@@ -2,8 +2,12 @@
 //!
 //! The service allows one request per second per client and rejects anonymous
 //! user agents, so every request goes through one gate and carries a name and
-//! contact. A 503 is the service saying slow down; it is retried after a
-//! pause rather than reported.
+//! contact. It also has a global budget shared by every client, reported in
+//! `X-RateLimit-*` headers; when that runs dry everyone is refused, however
+//! politely they ask. So the gate paces itself: refusals widen the spacing,
+//! successes relax it, and a nearly spent budget is waited out until it
+//! resets. Refusals, server errors and dropped connections are retried rather
+//! than reported.
 
 use std::time::Duration;
 
@@ -13,13 +17,15 @@ use tokio::time::Instant;
 
 const BASE: &str = "https://musicbrainz.org/ws/2";
 const SPACING: Duration = Duration::from_millis(1100);
+const MAX_SPACING: Duration = Duration::from_secs(10);
+const ATTEMPTS: u32 = 10;
 
 #[derive(Debug, thiserror::Error)]
 pub enum MbError {
     #[error("MusicBrainz request failed: {0}")]
     Http(#[from] reqwest::Error),
-    #[error("MusicBrainz is rate limiting and did not recover")]
-    RateLimited,
+    #[error("MusicBrainz is refusing requests (HTTP {0}) and did not recover")]
+    Unavailable(u16),
     #[error("MusicBrainz sent something unreadable: {0}")]
     Decode(String),
 }
@@ -27,7 +33,7 @@ pub enum MbError {
 pub struct MusicBrainz {
     http: reqwest::Client,
     base: String,
-    last: Mutex<Option<Instant>>,
+    gate: Mutex<Gate>,
     /// Responses kept on disk. Releases barely change and a retried import
     /// asks for the same ones again, so a cache is most of what stands
     /// between an import and the rate limit.
@@ -51,7 +57,7 @@ impl MusicBrainz {
                 .build()
                 .expect("static client config"),
             base: base.trim_end_matches('/').to_string(),
-            last: Mutex::new(None),
+            gate: Mutex::new(Gate::default()),
             cache: None,
         }
     }
@@ -107,41 +113,43 @@ impl MusicBrainz {
     }
 
     async fn fetch(&self, path: &str, query: &[(&str, &str)]) -> Result<bytes::Bytes, MbError> {
-        // The limit is per address, and anything else on the same network
-        // (a laptop running beets, a player looking up art) spends from the
-        // same budget. So a 503 is waited out patiently — the Retry-After the
-        // service sends, or an exponential backoff to a minute — and the gate
-        // is held meanwhile so no other request from here makes it worse.
-        for attempt in 0..10u32 {
-            let mut last = self.last.lock().await;
-            if let Some(t) = *last {
-                let wait = SPACING.saturating_sub(t.elapsed());
-                tokio::time::sleep(wait).await;
-            }
-            *last = Some(Instant::now());
-            let resp = self
+        // The gate is held for the whole exchange, waits included, so a
+        // refusal slows every request from here and not just this one.
+        let mut gate = self.gate.lock().await;
+        let mut attempt = 0;
+        loop {
+            gate.wait().await;
+            let sent = self
                 .http
                 .get(format!("{}/{path}", self.base))
                 .query(query)
                 .query(&[("fmt", "json")])
                 .send()
-                .await?;
-            if resp.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE {
-                let wait = resp
-                    .headers()
-                    .get(reqwest::header::RETRY_AFTER)
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|v| v.trim().parse::<u64>().ok())
-                    .unwrap_or(2u64 << attempt.min(5))
-                    .clamp(1, 60);
-                tokio::time::sleep(Duration::from_secs(wait)).await;
-                *last = Some(Instant::now());
-                continue;
+                .await;
+            attempt += 1;
+            let backoff = Duration::from_secs(2u64 << attempt.min(5));
+            let (wait, failure) = match sent {
+                Ok(resp) if retryable(resp.status()) => {
+                    let wait = resp
+                        .headers()
+                        .get(reqwest::header::RETRY_AFTER)
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(|v| v.trim().parse::<u64>().ok())
+                        .map_or(backoff, Duration::from_secs);
+                    (wait, MbError::Unavailable(resp.status().as_u16()))
+                }
+                Ok(resp) => {
+                    gate.succeeded(resp.headers());
+                    return Ok(resp.error_for_status()?.bytes().await?);
+                }
+                Err(e) if e.is_timeout() || e.is_connect() => (backoff, MbError::Http(e)),
+                Err(e) => return Err(e.into()),
+            };
+            if attempt >= ATTEMPTS {
+                return Err(failure);
             }
-            drop(last);
-            return Ok(resp.error_for_status()?.bytes().await?);
+            gate.refused(wait.clamp(Duration::from_secs(1), Duration::from_secs(60)));
         }
-        Err(MbError::RateLimited)
     }
 
     /// Releases matching an artist and album title, best first.
@@ -176,6 +184,76 @@ impl MusicBrainz {
 
 /// Escape the characters Lucene gives meaning to, so a title like
 /// `AC/DC: Live!` is a phrase rather than syntax.
+#[derive(Debug)]
+struct Gate {
+    next: Option<Instant>,
+    spacing: Duration,
+}
+
+impl Default for Gate {
+    fn default() -> Self {
+        Self {
+            next: None,
+            spacing: SPACING,
+        }
+    }
+}
+
+impl Gate {
+    async fn wait(&self) {
+        if let Some(t) = self.next {
+            tokio::time::sleep_until(t).await;
+        }
+    }
+
+    fn succeeded(&mut self, headers: &reqwest::header::HeaderMap) {
+        self.spacing = self.spacing.mul_f64(0.9).max(SPACING);
+        let mut next = Instant::now() + self.spacing;
+        if let Some(reset) = budget_reset(headers) {
+            next = next.max(Instant::now() + reset);
+        }
+        self.next = Some(next);
+    }
+
+    fn refused(&mut self, wait: Duration) {
+        self.spacing = (self.spacing * 2).min(MAX_SPACING);
+        self.next = Some(Instant::now() + wait.max(self.spacing));
+    }
+}
+
+fn retryable(status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
+}
+
+/// How long until the global budget resets, when less than a twentieth of it
+/// is left.
+fn budget_reset(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    let num = |name: &str| -> Option<u64> { headers.get(name)?.to_str().ok()?.trim().parse().ok() };
+    let limit = num("x-ratelimit-limit")?;
+    let remaining = num("x-ratelimit-remaining")?;
+    let reset = num("x-ratelimit-reset")?;
+    if remaining.saturating_mul(20) >= limit {
+        return None;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_secs();
+    Some(Duration::from_secs(reset.saturating_sub(now).min(60)))
+}
+
+impl MbError {
+    /// Whether trying again later could succeed: the service was busy or
+    /// unreachable, not wrong about what was asked.
+    pub fn is_transient(&self) -> bool {
+        match self {
+            Self::Unavailable(_) => true,
+            Self::Http(e) => e.is_timeout() || e.is_connect() || e.status().is_some_and(retryable),
+            Self::Decode(_) => false,
+        }
+    }
+}
+
 fn lucene(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
@@ -315,6 +393,41 @@ pub struct Recording {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_nearly_spent_budget_is_waited_out() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let headers = |remaining: u64| {
+            let mut h = reqwest::header::HeaderMap::new();
+            h.insert("x-ratelimit-limit", "1900".parse().unwrap());
+            h.insert(
+                "x-ratelimit-remaining",
+                remaining.to_string().parse().unwrap(),
+            );
+            h.insert("x-ratelimit-reset", (now + 5).to_string().parse().unwrap());
+            h
+        };
+        assert_eq!(budget_reset(&headers(1800)), None);
+        let wait = budget_reset(&headers(10)).unwrap();
+        assert!(wait <= Duration::from_secs(5) && wait >= Duration::from_secs(4));
+        assert_eq!(budget_reset(&reqwest::header::HeaderMap::new()), None);
+    }
+
+    #[test]
+    fn spacing_widens_on_refusal_and_relaxes_on_success() {
+        let mut gate = Gate::default();
+        for _ in 0..10 {
+            gate.refused(Duration::from_secs(1));
+        }
+        assert_eq!(gate.spacing, MAX_SPACING);
+        for _ in 0..100 {
+            gate.succeeded(&reqwest::header::HeaderMap::new());
+        }
+        assert_eq!(gate.spacing, SPACING);
+    }
 
     #[test]
     fn escapes_lucene_syntax() {

@@ -26,6 +26,14 @@ pub enum ImportError {
     Conflict(String),
 }
 
+impl ImportError {
+    /// Whether the same import could succeed later without anything
+    /// changing here.
+    pub fn is_transient(&self) -> bool {
+        matches!(self, Self::MusicBrainz(e) if e.is_transient())
+    }
+}
+
 /// A release that might be the album, for someone to choose between.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Candidate {

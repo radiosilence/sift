@@ -41,8 +41,12 @@ instead of disambiguated.
   becomes a directory, empty or relative components are refused rather than
   dropped, and the final path is checked against the library root.
 - **Copying leaves the source byte-identical**; tags are written to the copy.
-- **MusicBrainz** is called at one request per second with an identifying
-  user agent, and a 503 is backed off rather than reported. Cover art comes
+- **MusicBrainz** is called at most once a second with an identifying user
+  agent. The service also has a global budget shared by every client, and
+  refuses everyone when it runs out, so pacing adapts: refusals slow requests
+  down, successes speed them back up, and a nearly spent budget is waited out.
+  Refusals, server errors and dropped connections are retried; responses are
+  cached on disk so a retried import asks for nothing twice. Cover art comes
   from the Cover Art Archive's own thumbnails, so no image is decoded or
   re-encoded here.
 
