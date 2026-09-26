@@ -28,8 +28,6 @@ pub enum ConfigError {
         pattern: String,
         source: regex::Error,
     },
-    #[error("no library directory: set `directory` in the config")]
-    NoDirectory,
 }
 
 #[derive(Debug, Clone)]
@@ -212,9 +210,9 @@ impl Config {
         if let Some(w) = art_width {
             cfg.art_max_width = w;
         }
-        if cfg.directory.as_os_str().is_empty() {
-            return Err(ConfigError::NoDirectory);
-        }
+        // No `directory` is allowed: a shared base config often leaves it to
+        // a per-machine file, and a caller may set it after loading. Whoever
+        // imports checks it is set.
         Ok(cfg)
     }
 
