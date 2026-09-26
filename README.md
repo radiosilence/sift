@@ -5,6 +5,7 @@ art and files it into a library. A library and a CLI; the CLI reads an
 existing beets `config.yaml`, so it can stand in for `beet import`.
 
 ```console
+$ brew install radiosilence/sift/sift         # or a static binary from the releases
 $ sift import ~/Downloads/some-album          # uses ~/.config/beets/config.yaml
 $ sift match ~/Downloads/some-album           # show candidates, change nothing
 $ sift import --search-id <mbid> <dir>        # apply a specific release
