@@ -159,6 +159,12 @@ impl MusicBrainz {
         album: &str,
         limit: usize,
     ) -> Result<Vec<ReleaseHit>, MbError> {
+        // Taggers abbreviate; MusicBrainz credits every compilation to one
+        // artist spelled in full.
+        let artist = match crate::matching::normalise(artist).as_str() {
+            "va" | "v a" | "various" | "various artist" => "Various Artists",
+            _ => artist,
+        };
         let mut query = format!("release:\"{}\"", lucene(album));
         if !artist.is_empty() {
             query.push_str(&format!(" AND artist:\"{}\"", lucene(artist)));
