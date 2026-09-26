@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Importing an album that is already filed, every file the same recording in the same place, succeeds and moves nothing. A retry, or a second request queued behind the first, used to fail on the first file already present. A partial overlap is still refused, and nothing is ever overwritten.
 - `Importer::check_as_is` answers whether an import as-is would be accepted, and why not, without filing anything.
 - `Importer::compare` lines a folder up against one release track by track: pairs with title and length differences, and release tracks with no file and files with no track, for deciding a review.
 - `Importer::tracks` returns a folder's files and their tags as an import reads them.

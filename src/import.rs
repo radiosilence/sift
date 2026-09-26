@@ -444,13 +444,42 @@ impl Importer {
                     dest.display()
                 )));
             }
-            if dest.exists() {
-                return Err(ImportError::Conflict(format!(
-                    "{} is already in the library",
-                    dest.display()
-                )));
-            }
             plan.push((l, tags, dest));
+        }
+
+        // Every destination already there, each the same recording as its
+        // source, is this album filed once before: a repeated import (a
+        // retry, a second request queued behind the first) succeeds and
+        // moves nothing. Anything short of that is a conflict, and nothing
+        // is overwritten either way.
+        let present: Vec<bool> = plan.iter().map(|(_, _, d)| d.exists()).collect();
+        if present.iter().all(|p| *p) && !plan.is_empty() {
+            let same = plan.iter().all(|(l, _, d)| {
+                meta::read(d).is_ok_and(|there| {
+                    let here = &tracks[*l];
+                    there.format == here.format
+                        && (there.duration.as_secs_f64() - here.duration.as_secs_f64()).abs() < 1.0
+                })
+            });
+            let dir = plan[0]
+                .2
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_default();
+            if same {
+                let _ = writeln!(
+                    log,
+                    "already in the library as {}; nothing moved",
+                    dir.display()
+                );
+                return Ok(dir);
+            }
+        }
+        if let Some(i) = present.iter().position(|p| *p) {
+            return Err(ImportError::Conflict(format!(
+                "{} is already in the library",
+                plan[i].2.display()
+            )));
         }
 
         let cover = if self.cfg.fetch_art {
