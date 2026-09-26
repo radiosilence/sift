@@ -99,7 +99,7 @@ async fn run() -> anyhow::Result<ExitCode> {
             let mut failed = false;
             for dir in paths {
                 let outcome = if as_is {
-                    importer.import_as_is(&dir).await
+                    importer.import_as_is(&dir, &sift::Edits::default()).await
                 } else {
                     importer.import(&dir, search_id.as_deref()).await
                 };

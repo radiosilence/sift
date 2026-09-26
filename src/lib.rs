@@ -7,4 +7,4 @@ pub mod musicbrainz;
 pub mod paths;
 
 pub use config::Config;
-pub use import::{Candidate, ImportError, Importer, Outcome};
+pub use import::{Candidate, Comparison, Edits, ImportError, Importer, Outcome, TrackEdit};

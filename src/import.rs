@@ -203,9 +203,10 @@ impl Importer {
     /// describe one album: an album and an artist every file agrees on, and
     /// a title and a distinct track number for each file (taken from the
     /// file name where a tag is missing).
-    pub async fn import_as_is(&self, dir: &Path) -> Result<Outcome, ImportError> {
+    pub async fn import_as_is(&self, dir: &Path, edits: &Edits) -> Result<Outcome, ImportError> {
         let mut log = String::new();
-        let tracks = read_dir(dir).await?;
+        let mut tracks = read_dir(dir).await?;
+        edits.apply(&mut tracks)?;
         let _ = writeln!(log, "{} audio files in {}", tracks.len(), dir.display());
         let (tracks, spare) = one_copy_each(tracks);
         for t in &spare {
@@ -222,6 +223,77 @@ impl Importer {
             dir: dest,
             release: None,
             log,
+        })
+    }
+
+    /// The folder's files and the tags they carry, as an import would read
+    /// them.
+    pub async fn tracks(&self, dir: &Path) -> Result<Vec<Track>, ImportError> {
+        read_dir(dir).await
+    }
+
+    /// How the folder lines up against one release, track by track: what a
+    /// person or assistant needs to decide whether it is the right one, and
+    /// what differs if it nearly is.
+    pub async fn compare(&self, dir: &Path, release_id: &str) -> Result<Comparison, ImportError> {
+        let (tracks, _) = one_copy_each(read_dir(dir).await?);
+        let release = self.mb.release(release_id).await?;
+        let m = matching::score(&tracks, &release);
+        let remote: Vec<_> = release.tracks().collect();
+        let name = |t: &Track| {
+            t.path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        };
+        let pairs = m
+            .pairs
+            .iter()
+            .map(|&(l, r)| {
+                let (medium, rt) = remote[r];
+                let local = &tracks[l];
+                PairView {
+                    file: name(local),
+                    file_title: local.title.clone(),
+                    disc: medium.position,
+                    position: rt.position,
+                    title: rt.title.clone(),
+                    title_distance: (matching::string_distance(
+                        local.title.as_deref().unwrap_or_default(),
+                        &rt.title,
+                    ) * 1000.0)
+                        .round()
+                        / 1000.0,
+                    length_delta_secs: rt
+                        .length
+                        .or(rt.recording.length)
+                        .map(|ms| (local.duration.as_secs_f64() - ms as f64 / 1000.0).round()),
+                }
+            })
+            .collect();
+        let missing = remote
+            .iter()
+            .enumerate()
+            .filter(|(r, _)| !m.pairs.iter().any(|&(_, pr)| pr == *r))
+            .map(|(_, (medium, rt))| ReleaseTrackView {
+                disc: medium.position,
+                position: rt.position,
+                title: rt.title.clone(),
+                length_secs: rt.length.or(rt.recording.length).map(|ms| ms / 1000),
+            })
+            .collect();
+        let extra = tracks
+            .iter()
+            .enumerate()
+            .filter(|(l, _)| !m.pairs.iter().any(|&(pl, _)| pl == *l))
+            .map(|(_, t)| name(t))
+            .collect();
+        Ok(Comparison {
+            release: Candidate::from(&m),
+            parts: m.parts,
+            pairs,
+            missing,
+            extra,
         })
     }
 
@@ -534,6 +606,100 @@ fn strip_brackets(s: &str) -> String {
     out.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// Corrections to the files' own tags, applied before an import as-is and
+/// checked by the same rules as the tags themselves: fields set here apply to
+/// every file, and per-file fields to the file named.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct Edits {
+    pub album: Option<String>,
+    pub album_artist: Option<String>,
+    pub date: Option<String>,
+    #[serde(default)]
+    pub tracks: Vec<TrackEdit>,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct TrackEdit {
+    /// The file's name in the folder, as `tracks` reports it.
+    pub file: String,
+    pub title: Option<String>,
+    pub artist: Option<String>,
+    pub track: Option<u32>,
+    pub disc: Option<u32>,
+}
+
+impl Edits {
+    fn apply(&self, tracks: &mut [Track]) -> Result<(), ImportError> {
+        for t in tracks.iter_mut() {
+            if let Some(v) = &self.album {
+                t.album = Some(v.clone());
+            }
+            if let Some(v) = &self.album_artist {
+                t.album_artist = Some(v.clone());
+            }
+            if let Some(v) = &self.date {
+                t.date = Some(v.clone());
+            }
+        }
+        for e in &self.tracks {
+            let t = tracks
+                .iter_mut()
+                .find(|t| {
+                    t.path
+                        .file_name()
+                        .is_some_and(|n| n.to_string_lossy() == e.file)
+                })
+                .ok_or_else(|| ImportError::Untagged(format!("no file named {:?}", e.file)))?;
+            if let Some(v) = &e.title {
+                t.title = Some(v.clone());
+            }
+            if let Some(v) = &e.artist {
+                t.artist = Some(v.clone());
+            }
+            if e.track.is_some() {
+                t.track = e.track;
+            }
+            if e.disc.is_some() {
+                t.disc = e.disc;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A folder against one release. See [`Importer::compare`].
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Comparison {
+    pub release: Candidate,
+    pub parts: matching::Parts,
+    pub pairs: Vec<PairView>,
+    /// Release tracks with no file.
+    pub missing: Vec<ReleaseTrackView>,
+    /// Files with no release track.
+    pub extra: Vec<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PairView {
+    pub file: String,
+    pub file_title: Option<String>,
+    pub disc: u32,
+    pub position: u32,
+    pub title: String,
+    /// 0 is identical.
+    pub title_distance: f64,
+    /// The file's length less the release's, when the release gives one.
+    pub length_delta_secs: Option<f64>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ReleaseTrackView {
+    pub disc: u32,
+    pub position: u32,
+    pub title: String,
+    pub length_secs: Option<u64>,
+}
+
 /// Tags for filing each file as it is, or why its tags cannot be trusted to.
 fn as_is_tags(tracks: &[Track]) -> Result<Vec<(usize, Tags)>, ImportError> {
     let norm = |s: Option<&str>| s.map(matching::normalise).filter(|s| !s.is_empty());
@@ -781,6 +947,91 @@ mod tests {
             artist: artist.map(str::to_string),
             ..track(path, "FLAC", n, title)
         }
+    }
+
+    #[test]
+    fn edits_fix_what_the_tags_got_wrong_and_the_gate_still_holds() {
+        let mut tracks = vec![
+            tagged("a/01 x.flac", Some("Wrong"), Some("A"), Some(1), Some("x")),
+            tagged("a/02 y.flac", Some("Other"), Some("A"), None, Some("y")),
+        ];
+        let edits = Edits {
+            album: Some("Right".into()),
+            tracks: vec![TrackEdit {
+                file: "02 y.flac".into(),
+                track: Some(2),
+                title: Some("Why".into()),
+                ..TrackEdit::default()
+            }],
+            ..Edits::default()
+        };
+        edits.apply(&mut tracks).unwrap();
+        let entries = as_is_tags(&tracks).unwrap();
+        assert!(entries.iter().all(|(_, t)| t.album == "Right"));
+        assert_eq!(entries[1].1.title, "Why");
+
+        // An edit cannot talk its way past the gate: two files made the same
+        // track are still refused.
+        let clash = Edits {
+            tracks: vec![TrackEdit {
+                file: "02 y.flac".into(),
+                track: Some(1),
+                ..TrackEdit::default()
+            }],
+            ..Edits::default()
+        };
+        clash.apply(&mut tracks).unwrap();
+        assert!(
+            matches!(as_is_tags(&tracks), Err(ImportError::Untagged(m)) if m.contains("both track 1"))
+        );
+    }
+
+    #[test]
+    fn edits_refuse_files_that_are_not_there() {
+        let mut tracks = vec![tagged(
+            "a/01 x.flac",
+            Some("A"),
+            Some("A"),
+            Some(1),
+            Some("x"),
+        )];
+        for file in [
+            "missing.flac",
+            "",
+            "../01 x.flac",
+            "a/01 x.flac",
+            "01 X.FLAC",
+        ] {
+            let e = Edits {
+                tracks: vec![TrackEdit {
+                    file: file.into(),
+                    title: Some("t".into()),
+                    ..TrackEdit::default()
+                }],
+                ..Edits::default()
+            };
+            assert!(
+                matches!(e.apply(&mut tracks), Err(ImportError::Untagged(_))),
+                "{file:?} should name no file"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_edited_values_do_not_pass_for_tags() {
+        let mut tracks = vec![tagged(
+            "a/untitled.flac",
+            None,
+            Some("A"),
+            Some(1),
+            Some("x"),
+        )];
+        let e = Edits {
+            album: Some("   ".into()),
+            ..Edits::default()
+        };
+        e.apply(&mut tracks).unwrap();
+        assert!(matches!(as_is_tags(&tracks), Err(ImportError::Untagged(_))));
     }
 
     #[test]

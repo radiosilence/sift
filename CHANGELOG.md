@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- `Importer::compare` lines a folder up against one release track by track: pairs with title and length differences, and release tracks with no file and files with no track, for deciding a review.
+- `Importer::tracks` returns a folder's files and their tags as an import reads them.
+- `import_as_is` takes `Edits`, album-wide and per-file corrections applied before the coherence check, so an edit cannot file what the check would refuse. `Outcome::Imported::release` stays `None` for these.
 - `sift import --as-is` (`-A`, as beets' `--noautotag`) and `Importer::import_as_is` file an album by the files' own tags, for releases MusicBrainz does not have. They refuse, saying why, unless the tags describe one album: an album and artist every file agrees on, and a title and distinct track number per file, taken from the file name where the tag is missing. Several artists and no album artist make a Various Artists compilation.
 - `Outcome::Imported::release` is optional; it is `None` for an import as-is.
 - An album artist of `VA`, `V.A.` or `Various` is searched as "Various Artists", which is how MusicBrainz credits every compilation; the abbreviation found nothing.
