@@ -188,8 +188,20 @@ impl Importer {
             }
         }
         let (artist, album) = self.query_terms(dir, tracks);
-        let _ = writeln!(log, "searching for {artist:?} — {album:?}");
-        for hit in self.mb.search_releases(&artist, &album, 10).await? {
+        // The plain title first: an edition suffix is in the tags far more
+        // often than in MusicBrainz's title. The title as tagged is the
+        // fallback, for the release whose edition really is in its name.
+        let base = matching::base_title(&album);
+        let mut hits = Vec::new();
+        for title in std::iter::once(base.as_str()).chain((base != album).then_some(album.as_str()))
+        {
+            let _ = writeln!(log, "searching for {artist:?} — {title:?}");
+            hits = self.mb.search_releases(&artist, title, 10).await?;
+            if hits.iter().any(|h| h.score >= 50) {
+                break;
+            }
+        }
+        for hit in hits {
             if releases.len() > LOOKUPS || hit.score < 50 {
                 break;
             }

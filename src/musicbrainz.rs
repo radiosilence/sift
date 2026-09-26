@@ -51,15 +51,18 @@ impl MusicBrainz {
         path: &str,
         query: &[(&str, &str)],
     ) -> Result<T, MbError> {
-        for attempt in 0..5 {
-            {
-                let mut last = self.last.lock().await;
-                if let Some(t) = *last {
-                    let wait = SPACING.saturating_sub(t.elapsed());
-                    tokio::time::sleep(wait).await;
-                }
-                *last = Some(Instant::now());
+        // The limit is per address, and anything else on the same network
+        // (a laptop running beets, a player looking up art) spends from the
+        // same budget. So a 503 is waited out patiently — the Retry-After the
+        // service sends, or an exponential backoff to a minute — and the gate
+        // is held meanwhile so no other request from here makes it worse.
+        for attempt in 0..10u32 {
+            let mut last = self.last.lock().await;
+            if let Some(t) = *last {
+                let wait = SPACING.saturating_sub(t.elapsed());
+                tokio::time::sleep(wait).await;
             }
+            *last = Some(Instant::now());
             let resp = self
                 .http
                 .get(format!("{}/{path}", self.base))
@@ -68,9 +71,18 @@ impl MusicBrainz {
                 .send()
                 .await?;
             if resp.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE {
-                tokio::time::sleep(Duration::from_secs(2 << attempt)).await;
+                let wait = resp
+                    .headers()
+                    .get(reqwest::header::RETRY_AFTER)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.trim().parse::<u64>().ok())
+                    .unwrap_or(2u64 << attempt.min(5))
+                    .clamp(1, 60);
+                tokio::time::sleep(Duration::from_secs(wait)).await;
+                *last = Some(Instant::now());
                 continue;
             }
+            drop(last);
             return Ok(resp.error_for_status()?.json().await?);
         }
         Err(MbError::RateLimited)

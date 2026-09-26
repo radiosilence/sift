@@ -45,6 +45,63 @@ pub fn normalise(s: &str) -> String {
     words.join(" ")
 }
 
+/// A title without the edition markers taggers and shops append —
+/// "Monster (25th Anniversary Edition)" is "Monster" on MusicBrainz, which
+/// keeps the edition in a separate disambiguation.
+pub fn base_title(s: &str) -> String {
+    const EDITION: &[&str] = &[
+        "edition",
+        "remaster",
+        "deluxe",
+        "anniversary",
+        "expanded",
+        "bonus",
+        "reissue",
+        "version",
+        "special",
+        "collector",
+        "explicit",
+        "clean",
+        "mono",
+        "stereo",
+        "hi-res",
+        "24-bit",
+        "24bit",
+        "flac",
+        "web",
+        "vinyl",
+        "cd",
+        "lp",
+        "ep",
+    ];
+    let mut out = s.trim().to_string();
+    loop {
+        let trimmed = out.trim_end();
+        let Some(close) = trimmed.chars().last().filter(|c| *c == ')' || *c == ']') else {
+            break;
+        };
+        let open = if close == ')' { '(' } else { '[' };
+        let Some(start) = trimmed.rfind(open) else {
+            break;
+        };
+        let inner = trimmed[start + 1..trimmed.len() - 1].to_lowercase();
+        let is_edition = EDITION.iter().any(|k| {
+            inner
+                .split(|c: char| !c.is_alphanumeric() && c != '-')
+                .any(|w| w == *k || w.starts_with(k))
+        }) || inner.chars().all(|c| c.is_ascii_digit());
+        if start == 0 || !is_edition {
+            break;
+        }
+        out = trimmed[..start]
+            .trim_end()
+            .trim_end_matches(['-', ':', '–'])
+            .trim_end()
+            .to_string();
+    }
+    out
+}
+
 pub fn string_distance(a: &str, b: &str) -> f64 {
     let (a, b) = (normalise(a), normalise(b));
     if a == b {
@@ -104,7 +161,7 @@ pub fn score(local: &[Track], release: &Release) -> Match {
     )
     .unwrap_or_default();
 
-    let d_album = string_distance(&album, &release.title);
+    let d_album = string_distance(&base_title(&album), &base_title(&release.title));
     let d_artist = if release.is_compilation()
         && ["various artists", "various", "va"].contains(&normalise(&artist).as_str())
     {
@@ -238,6 +295,22 @@ mod tests {
             duration: Duration::from_secs(secs),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn edition_markers_come_off_titles() {
+        assert_eq!(base_title("Monster (25th Anniversary Edition)"), "Monster");
+        assert_eq!(base_title("Kill For Love (Deluxe)"), "Kill For Love");
+        assert_eq!(base_title("OK Computer [Remastered] (2017)"), "OK Computer");
+        assert_eq!(
+            base_title("(What's the Story) Morning Glory?"),
+            "(What's the Story) Morning Glory?"
+        );
+        assert_eq!(base_title("Live at Leeds (Live)"), "Live at Leeds (Live)");
+        assert_eq!(
+            base_title("Music Has the Right to Children"),
+            "Music Has the Right to Children"
+        );
     }
 
     #[test]
