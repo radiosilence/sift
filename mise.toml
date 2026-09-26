@@ -1,0 +1,15 @@
+[tools]
+rust = { version = "1", components = "rustfmt,clippy" }
+lefthook = "latest"
+
+[tasks.check]
+description = "What CI checks: format, lint with warnings as errors, tests"
+run = [
+  "cargo fmt --all -- --check",
+  "cargo clippy --all-targets -- -D warnings",
+  "cargo test --locked",
+]
+
+[tasks.hooks]
+description = "Install the git hooks"
+run = "lefthook install"
