@@ -1,6 +1,7 @@
 //! A folder in, an album in the library out — or candidates for a person to
 //! choose from.
 
+use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
@@ -130,6 +131,14 @@ impl Importer {
         let mut log = String::new();
         let tracks = read_dir(dir).await?;
         let _ = writeln!(log, "{} audio files in {}", tracks.len(), dir.display());
+        let (tracks, spare) = one_copy_each(tracks);
+        for t in &spare {
+            let _ = writeln!(
+                log,
+                "left behind (another copy of the same track): {}",
+                t.path.display()
+            );
+        }
 
         let mut matches = match release_id {
             Some(id) => vec![matching::score(&tracks, &self.mb.release(id).await?)],
@@ -468,6 +477,73 @@ fn strip_brackets(s: &str) -> String {
     out.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// One file per track, when a folder holds an album more than once: FLAC
+/// and WAV side by side, or "Track (1).flac" beside "Track.flac". Matching
+/// every copy counts the spares as extra tracks, and filing them splits the
+/// album across formats. The best copy stays in the import; the rest are
+/// returned to be left where they are.
+fn one_copy_each(tracks: Vec<Track>) -> (Vec<Track>, Vec<Track>) {
+    fn key(t: &Track) -> (u32, Option<u32>, String) {
+        let stem = t
+            .path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        // "03. Digital Love (1)": the number and the copy marker are not the
+        // title.
+        let stem = stem.trim_end();
+        let stem = match stem.rsplit_once(" (") {
+            Some((head, tail))
+                if tail.ends_with(')')
+                    && tail[..tail.len() - 1].chars().all(|c| c.is_ascii_digit()) =>
+            {
+                head
+            }
+            _ => stem,
+        };
+        let digits: String = stem.chars().take_while(|c| c.is_ascii_digit()).collect();
+        let from_name = stem[digits.len()..].trim_start_matches(|c: char| !c.is_alphanumeric());
+        let title = t.title.as_deref().unwrap_or(from_name);
+        (
+            t.disc.unwrap_or(1),
+            t.track.or_else(|| digits.parse().ok()),
+            matching::normalise(title),
+        )
+    }
+    fn rank(t: &Track) -> (u8, std::cmp::Reverse<u8>, std::cmp::Reverse<u32>) {
+        let format = match t.format.as_str() {
+            "FLAC" => 0,
+            "WAV" | "AIFF" | "ALAC" | "APE" | "WavPack" => 1,
+            _ => 2,
+        };
+        (
+            format,
+            std::cmp::Reverse(t.bit_depth.unwrap_or(0)),
+            std::cmp::Reverse(t.bitrate.unwrap_or(0)),
+        )
+    }
+    let mut best: HashMap<(u32, Option<u32>, String), Track> = HashMap::new();
+    let mut spare = Vec::new();
+    for t in tracks {
+        match best.entry(key(&t)) {
+            std::collections::hash_map::Entry::Vacant(e) => {
+                e.insert(t);
+            }
+            std::collections::hash_map::Entry::Occupied(mut e) => {
+                if rank(&t) < rank(e.get()) {
+                    spare.push(e.insert(t));
+                } else {
+                    spare.push(t);
+                }
+            }
+        }
+    }
+    let mut kept: Vec<Track> = best.into_values().collect();
+    kept.sort_by(|a, b| a.path.cmp(&b.path));
+    spare.sort_by(|a, b| a.path.cmp(&b.path));
+    (kept, spare)
+}
+
 async fn read_dir(dir: &Path) -> Result<Vec<Track>, ImportError> {
     let dir = dir.to_path_buf();
     tokio::task::spawn_blocking(move || {
@@ -507,6 +583,73 @@ fn walk(dir: &Path) -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn track(path: &str, format: &str, number: Option<u32>, title: Option<&str>) -> Track {
+        Track {
+            path: PathBuf::from(path),
+            title: title.map(str::to_string),
+            artist: None,
+            album: None,
+            album_artist: None,
+            track: number,
+            track_total: None,
+            disc: None,
+            disc_total: None,
+            date: None,
+            mb_recording_id: None,
+            mb_album_id: None,
+            duration: std::time::Duration::from_secs(200),
+            format: format.into(),
+            bitrate: None,
+            sample_rate: None,
+            bit_depth: None,
+        }
+    }
+
+    #[test]
+    fn keeps_one_copy_of_each_track_preferring_flac() {
+        let (kept, spare) = one_copy_each(vec![
+            track("a/1. One More Time.wav", "WAV", None, None),
+            track(
+                "a/1. One More Time.flac",
+                "FLAC",
+                Some(1),
+                Some("One More Time"),
+            ),
+            track("a/3. Digital Love (1).wav", "WAV", None, None),
+            track("a/3. Digital Love.wav", "WAV", None, None),
+            track(
+                "a/3. Digital Love.flac",
+                "FLAC",
+                Some(3),
+                Some("Digital Love"),
+            ),
+            track("a/10. Voyager.wav", "WAV", None, None),
+        ]);
+        let names = |ts: &[Track]| {
+            ts.iter()
+                .map(|t| t.path.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            names(&kept),
+            [
+                "a/1. One More Time.flac",
+                "a/10. Voyager.wav",
+                "a/3. Digital Love.flac"
+            ]
+        );
+        assert_eq!(spare.len(), 3);
+    }
+
+    #[test]
+    fn different_tracks_with_one_title_both_stay() {
+        let (kept, spare) = one_copy_each(vec![
+            track("a/01 Intro.flac", "FLAC", Some(1), Some("Intro")),
+            track("a/09 Intro.flac", "FLAC", Some(9), Some("Intro")),
+        ]);
+        assert_eq!((kept.len(), spare.len()), (2, 0));
+    }
 
     #[test]
     fn folder_names_yield_search_terms() {
