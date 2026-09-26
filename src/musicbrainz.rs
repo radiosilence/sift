@@ -20,13 +20,22 @@ pub enum MbError {
     Http(#[from] reqwest::Error),
     #[error("MusicBrainz is rate limiting and did not recover")]
     RateLimited,
+    #[error("MusicBrainz sent something unreadable: {0}")]
+    Decode(String),
 }
 
 pub struct MusicBrainz {
     http: reqwest::Client,
     base: String,
     last: Mutex<Option<Instant>>,
+    /// Responses kept on disk. Releases barely change and a retried import
+    /// asks for the same ones again, so a cache is most of what stands
+    /// between an import and the rate limit.
+    cache: Option<std::path::PathBuf>,
 }
+
+const RELEASE_TTL: Duration = Duration::from_secs(7 * 24 * 3600);
+const SEARCH_TTL: Duration = Duration::from_secs(24 * 3600);
 
 impl MusicBrainz {
     pub fn new(contact: &str) -> Self {
@@ -43,7 +52,22 @@ impl MusicBrainz {
                 .expect("static client config"),
             base: base.trim_end_matches('/').to_string(),
             last: Mutex::new(None),
+            cache: None,
         }
+    }
+
+    /// Keep responses under `dir`.
+    pub fn with_cache(mut self, dir: std::path::PathBuf) -> Self {
+        self.cache = Some(dir);
+        self
+    }
+
+    fn cache_path(&self, path: &str, query: &[(&str, &str)]) -> Option<std::path::PathBuf> {
+        use std::hash::{Hash, Hasher};
+        let dir = self.cache.as_ref()?;
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        (path, query).hash(&mut h);
+        Some(dir.join(format!("{:016x}.json", h.finish())))
     }
 
     async fn get<T: for<'de> Deserialize<'de>>(
@@ -51,6 +75,38 @@ impl MusicBrainz {
         path: &str,
         query: &[(&str, &str)],
     ) -> Result<T, MbError> {
+        let ttl = if path.starts_with("release/") {
+            RELEASE_TTL
+        } else {
+            SEARCH_TTL
+        };
+        let cached = self.cache_path(path, query);
+        if let Some(file) = &cached {
+            let fresh = tokio::fs::metadata(file)
+                .await
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.elapsed().ok())
+                .is_some_and(|age| age < ttl);
+            if fresh
+                && let Ok(body) = tokio::fs::read(file).await
+                && let Ok(v) = serde_json::from_slice(&body)
+            {
+                return Ok(v);
+            }
+        }
+        let body: bytes::Bytes = self.fetch(path, query).await?;
+        let value = serde_json::from_slice(&body).map_err(|e| MbError::Decode(e.to_string()))?;
+        if let Some(file) = cached {
+            if let Some(dir) = file.parent() {
+                let _ = tokio::fs::create_dir_all(dir).await;
+            }
+            let _ = tokio::fs::write(&file, &body).await;
+        }
+        Ok(value)
+    }
+
+    async fn fetch(&self, path: &str, query: &[(&str, &str)]) -> Result<bytes::Bytes, MbError> {
         // The limit is per address, and anything else on the same network
         // (a laptop running beets, a player looking up art) spends from the
         // same budget. So a 503 is waited out patiently — the Retry-After the
@@ -83,7 +139,7 @@ impl MusicBrainz {
                 continue;
             }
             drop(last);
-            return Ok(resp.error_for_status()?.json().await?);
+            return Ok(resp.error_for_status()?.bytes().await?);
         }
         Err(MbError::RateLimited)
     }

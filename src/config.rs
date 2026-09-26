@@ -51,6 +51,8 @@ pub struct Config {
     /// Below this distance a match is applied without asking.
     pub strong_threshold: f64,
     pub musicbrainz_contact: String,
+    /// Where MusicBrainz responses are kept between imports.
+    pub cache_dir: Option<PathBuf>,
 }
 
 /// The template beets ships with, translated.
@@ -71,6 +73,7 @@ impl Default for Config {
             art_max_width: 1200,
             strong_threshold: 0.04,
             musicbrainz_contact: "https://github.com/radiosilence/sift".into(),
+            cache_dir: dirs::cache_dir().map(|d| d.join("sift")),
         }
     }
 }

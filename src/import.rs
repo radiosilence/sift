@@ -92,7 +92,10 @@ const LOOKUPS: usize = 5;
 
 impl Importer {
     pub fn new(cfg: Config) -> Self {
-        let mb = MusicBrainz::new(&cfg.musicbrainz_contact);
+        let mut mb = MusicBrainz::new(&cfg.musicbrainz_contact);
+        if let Some(dir) = &cfg.cache_dir {
+            mb = mb.with_cache(dir.join("musicbrainz"));
+        }
         Self::with_musicbrainz(cfg, mb)
     }
 
