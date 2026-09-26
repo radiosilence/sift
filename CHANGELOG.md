@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- `sift import --as-is` (`-A`, as beets' `--noautotag`) and `Importer::import_as_is` file an album by the files' own tags, for releases MusicBrainz does not have. They refuse, saying why, unless the tags describe one album: an album and artist every file agrees on, and a title and distinct track number per file, taken from the file name where the tag is missing. Several artists and no album artist make a Various Artists compilation.
+- `Outcome::Imported::release` is optional; it is `None` for an import as-is.
 - An album artist of `VA`, `V.A.` or `Various` is searched as "Various Artists", which is how MusicBrainz credits every compilation; the abbreviation found nothing.
 - Track lengths may differ by 2% of the track (full penalty at 6%) where that exceeds beets' flat 10 s (30 s). Long sides differ by twenty seconds between a trimmed digital release and a vinyl edit, which the flat allowance read as different recordings; tracks under about eight minutes are judged as before.
 - The import log breaks the best match's distance into album, artist, title and length, so a review shows what kept the match from being applied.

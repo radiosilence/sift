@@ -25,6 +25,10 @@ pub enum ImportError {
     Path(#[from] crate::paths::PathError),
     #[error("{0}")]
     Conflict(String),
+    /// The files' own tags do not describe one album well enough to file
+    /// it by them.
+    #[error("the files' tags do not describe one album: {0}")]
+    Untagged(String),
 }
 
 impl ImportError {
@@ -77,7 +81,8 @@ impl From<&Match> for Candidate {
 pub enum Outcome {
     Imported {
         dir: PathBuf,
-        release: Candidate,
+        /// The release applied; none for an import as-is.
+        release: Option<Candidate>,
         log: String,
     },
     /// Nothing was changed. `candidates` is best first; importing again with
@@ -188,7 +193,34 @@ impl Importer {
         let dest = self.apply(&tracks, &best, dir, &mut log).await?;
         Ok(Outcome::Imported {
             dir: dest,
-            release: Candidate::from(&best),
+            release: Some(Candidate::from(&best)),
+            log,
+        })
+    }
+
+    /// File the album by the files' own tags, without MusicBrainz: for a
+    /// release it does not have. Refused, saying why, unless the tags
+    /// describe one album: an album and an artist every file agrees on, and
+    /// a title and a distinct track number for each file (taken from the
+    /// file name where a tag is missing).
+    pub async fn import_as_is(&self, dir: &Path) -> Result<Outcome, ImportError> {
+        let mut log = String::new();
+        let tracks = read_dir(dir).await?;
+        let _ = writeln!(log, "{} audio files in {}", tracks.len(), dir.display());
+        let (tracks, spare) = one_copy_each(tracks);
+        for t in &spare {
+            let _ = writeln!(
+                log,
+                "left behind (another copy of the same track): {}",
+                t.path.display()
+            );
+        }
+        let entries = as_is_tags(&tracks)?;
+        let _ = writeln!(log, "as-is: filed by the files' own tags");
+        let dest = self.file(&tracks, &entries, None, dir, &mut log).await?;
+        Ok(Outcome::Imported {
+            dir: dest,
+            release: None,
             log,
         })
     }
@@ -290,11 +322,32 @@ impl Importer {
     ) -> Result<PathBuf, ImportError> {
         let release = &m.release;
         let remote: Vec<_> = release.tracks().collect();
-        let mut plan = Vec::with_capacity(m.pairs.len());
+        let entries: Vec<(usize, Tags)> = m
+            .pairs
+            .iter()
+            .map(|&(l, r)| {
+                let (medium, rt) = remote[r];
+                (l, self.tags(release, r, medium.position, rt, remote.len()))
+            })
+            .collect();
+        self.file(tracks, &entries, Some(release), source_dir, log)
+            .await
+    }
+
+    /// Tag and move each `(file, tags)` into place, with the release's cover
+    /// when there is one and the files' own otherwise.
+    async fn file(
+        &self,
+        tracks: &[Track],
+        entries: &[(usize, Tags)],
+        release: Option<&Release>,
+        source_dir: &Path,
+        log: &mut String,
+    ) -> Result<PathBuf, ImportError> {
+        let mut plan = Vec::with_capacity(entries.len());
         let mut claimed = std::collections::HashMap::new();
-        for &(l, r) in &m.pairs {
-            let (medium, rt) = remote[r];
-            let tags = self.tags(release, r, medium.position, rt, remote.len());
+        for (l, tags) in entries {
+            let (l, tags) = (*l, tags.clone());
             let local = &tracks[l];
             let rel = paths::render(&self.cfg, &tags, local, release)?;
             // Not `with_extension`: it cuts at the last dot, and titles have dots.
@@ -368,7 +421,7 @@ impl Importer {
             );
         }
         for (i, t) in tracks.iter().enumerate() {
-            if !m.pairs.iter().any(|&(l, _)| l == i) {
+            if !entries.iter().any(|(l, _)| *l == i) {
                 let _ = writeln!(log, "left behind (no matching track): {}", t.path.display());
             }
         }
@@ -431,21 +484,24 @@ impl Importer {
     /// The release's front cover from the Cover Art Archive at the largest
     /// thumbnail within the configured width, then the release group's, then
     /// whatever the files already carry.
-    async fn cover(&self, release: &Release, tracks: &[Track]) -> Option<Vec<u8>> {
+    async fn cover(&self, release: Option<&Release>, tracks: &[Track]) -> Option<Vec<u8>> {
         let size = match self.cfg.art_max_width {
             w if w >= 1200 => "1200",
             w if w >= 500 => "500",
             _ => "250",
         };
-        let mut urls = vec![format!(
-            "https://coverartarchive.org/release/{}/front-{size}",
-            release.id
-        )];
-        if let Some(g) = &release.release_group {
+        let mut urls = Vec::new();
+        if let Some(release) = release {
             urls.push(format!(
-                "https://coverartarchive.org/release-group/{}/front-{size}",
-                g.id
+                "https://coverartarchive.org/release/{}/front-{size}",
+                release.id
             ));
+            if let Some(g) = &release.release_group {
+                urls.push(format!(
+                    "https://coverartarchive.org/release-group/{}/front-{size}",
+                    g.id
+                ));
+            }
         }
         for url in urls {
             if let Ok(resp) = self.http.get(&url).send().await
@@ -476,6 +532,112 @@ fn strip_brackets(s: &str) -> String {
         }
     }
     out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Tags for filing each file as it is, or why its tags cannot be trusted to.
+fn as_is_tags(tracks: &[Track]) -> Result<Vec<(usize, Tags)>, ImportError> {
+    let norm = |s: Option<&str>| s.map(matching::normalise).filter(|s| !s.is_empty());
+    let album = matching::consensus(tracks.iter().map(|t| t.album.as_deref()))
+        .ok_or_else(|| ImportError::Untagged("no album tag".into()))?;
+    let disagree = tracks
+        .iter()
+        .filter(|t| norm(t.album.as_deref()) != Some(matching::normalise(&album)))
+        .count();
+    if disagree > 0 {
+        return Err(ImportError::Untagged(format!(
+            "{disagree} of {} files name a different album, or none",
+            tracks.len()
+        )));
+    }
+    let album_artist = matching::consensus(tracks.iter().map(|t| t.album_artist.as_deref()))
+        .or_else(|| {
+            let artists: std::collections::HashSet<_> = tracks
+                .iter()
+                .filter_map(|t| norm(t.artist.as_deref()))
+                .collect();
+            match artists.len() {
+                0 => None,
+                1 => matching::consensus(tracks.iter().map(|t| t.artist.as_deref())),
+                _ => Some("Various Artists".into()),
+            }
+        })
+        .ok_or_else(|| ImportError::Untagged("no artist tag".into()))?;
+    let date = matching::consensus(tracks.iter().map(|t| t.date.as_deref()));
+
+    let mut problems = Vec::new();
+    let mut seen = HashMap::new();
+    let mut entries = Vec::with_capacity(tracks.len());
+    for (i, t) in tracks.iter().enumerate() {
+        let (number, name) = number_and_title(&t.path);
+        let title = t.title.clone().filter(|s| !s.trim().is_empty()).or(name);
+        let track = t.track.or(number);
+        let disc = t.disc.unwrap_or(1);
+        let (Some(title), Some(track)) = (title, track) else {
+            problems.push(format!(
+                "{} has no title or track number",
+                t.path.file_name().unwrap_or_default().to_string_lossy()
+            ));
+            continue;
+        };
+        if let Some(other) = seen.insert((disc, track), i) {
+            problems.push(format!(
+                "{} and {} are both track {track}",
+                tracks[other]
+                    .path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy(),
+                t.path.file_name().unwrap_or_default().to_string_lossy()
+            ));
+            continue;
+        }
+        entries.push((
+            i,
+            Tags {
+                title,
+                artist: t.artist.clone().unwrap_or_else(|| album_artist.clone()),
+                album: album.clone(),
+                album_artist: album_artist.clone(),
+                track,
+                track_total: 0,
+                disc,
+                disc_total: 0,
+                date: date.clone(),
+                compilation: album_artist == "Various Artists",
+                ..Tags::default()
+            },
+        ));
+    }
+    if !problems.is_empty() {
+        return Err(ImportError::Untagged(problems.join("; ")));
+    }
+    let discs = entries.iter().map(|(_, t)| t.disc).max().unwrap_or(1);
+    let per_disc: HashMap<u32, u32> = entries.iter().fold(HashMap::new(), |mut m, (_, t)| {
+        *m.entry(t.disc).or_default() += 1;
+        m
+    });
+    for (_, t) in &mut entries {
+        t.track_total = per_disc[&t.disc];
+        t.disc_total = discs;
+    }
+    Ok(entries)
+}
+
+/// "03 - Title.flac", "03. Title.flac", "Title.flac": the number and the
+/// title a file name gives, for files whose tags lack them.
+fn number_and_title(path: &Path) -> (Option<u32>, Option<String>) {
+    let stem = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let digits: String = stem.chars().take_while(|c| c.is_ascii_digit()).collect();
+    let rest = stem[digits.len()..]
+        .trim_start_matches(|c: char| !c.is_alphanumeric())
+        .trim();
+    (
+        digits.parse().ok().filter(|n| *n > 0),
+        (!rest.is_empty()).then(|| rest.to_string()),
+    )
 }
 
 /// One file per track, when a folder holds an album more than once: FLAC
@@ -605,6 +767,101 @@ mod tests {
             sample_rate: None,
             bit_depth: None,
         }
+    }
+
+    fn tagged(
+        path: &str,
+        album: Option<&str>,
+        artist: Option<&str>,
+        n: Option<u32>,
+        title: Option<&str>,
+    ) -> Track {
+        Track {
+            album: album.map(str::to_string),
+            artist: artist.map(str::to_string),
+            ..track(path, "FLAC", n, title)
+        }
+    }
+
+    #[test]
+    fn as_is_takes_a_coherent_album_and_fills_gaps_from_file_names() {
+        let entries = as_is_tags(&[
+            tagged(
+                "a/01 Intro.flac",
+                Some("Hidden"),
+                Some("ANNA"),
+                Some(1),
+                Some("Intro"),
+            ),
+            tagged(
+                "a/02 - Second Thing.flac",
+                Some("Hidden"),
+                Some("ANNA"),
+                None,
+                None,
+            ),
+        ])
+        .unwrap();
+        let t: Vec<_> = entries
+            .iter()
+            .map(|(_, t)| (t.track, t.title.as_str(), t.track_total))
+            .collect();
+        assert_eq!(t, [(1, "Intro", 2), (2, "Second Thing", 2)]);
+        assert_eq!(entries[0].1.album_artist, "ANNA");
+    }
+
+    #[test]
+    fn as_is_calls_many_artists_a_compilation() {
+        let entries = as_is_tags(&[
+            tagged("a/01 x.flac", Some("Mix"), Some("One"), Some(1), Some("x")),
+            tagged("a/02 y.flac", Some("Mix"), Some("Two"), Some(2), Some("y")),
+        ])
+        .unwrap();
+        assert_eq!(entries[0].1.album_artist, "Various Artists");
+        assert!(entries[0].1.compilation);
+        assert_eq!(entries[1].1.artist, "Two");
+    }
+
+    #[test]
+    fn as_is_refuses_tags_that_do_not_describe_one_album() {
+        let refuse = |tracks: &[Track], why: &str| match as_is_tags(tracks) {
+            Err(ImportError::Untagged(msg)) => assert!(msg.contains(why), "{msg}"),
+            other => panic!("expected a refusal about {why:?}, got {other:?}"),
+        };
+        refuse(
+            &[tagged("a/01 x.flac", None, Some("A"), Some(1), Some("x"))],
+            "no album",
+        );
+        refuse(
+            &[
+                tagged("a/01 x.flac", Some("One"), Some("A"), Some(1), Some("x")),
+                tagged(
+                    "a/02 y.flac",
+                    Some("Another"),
+                    Some("A"),
+                    Some(2),
+                    Some("y"),
+                ),
+            ],
+            "different album",
+        );
+        refuse(
+            &[
+                tagged("a/01 x.flac", Some("One"), Some("A"), Some(1), Some("x")),
+                tagged("a/01 y.flac", Some("One"), Some("A"), Some(1), Some("y")),
+            ],
+            "both track 1",
+        );
+        refuse(
+            &[tagged(
+                "a/untitled.flac",
+                Some("One"),
+                Some("A"),
+                None,
+                None,
+            )],
+            "no title or track number",
+        );
     }
 
     #[test]

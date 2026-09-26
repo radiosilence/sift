@@ -32,6 +32,10 @@ enum Command {
         /// Apply this MusicBrainz release, whatever the match distance.
         #[arg(long = "search-id")]
         search_id: Option<String>,
+        /// File by the files' own tags without MusicBrainz, as beets' `-A`
+        /// does; refused when the tags do not describe one album.
+        #[arg(short = 'A', long = "as-is", alias = "noautotag")]
+        as_is: bool,
         /// Copy rather than move, whatever the config says.
         #[arg(short = 'c', long)]
         copy: bool,
@@ -79,6 +83,7 @@ async fn run() -> anyhow::Result<ExitCode> {
         Command::Import {
             paths,
             search_id,
+            as_is,
             copy,
             r#move,
             quiet: _,
@@ -93,9 +98,16 @@ async fn run() -> anyhow::Result<ExitCode> {
             let importer = Importer::new(cfg);
             let mut failed = false;
             for dir in paths {
-                let line = match importer.import(&dir, search_id.as_deref()).await {
+                let outcome = if as_is {
+                    importer.import_as_is(&dir).await
+                } else {
+                    importer.import(&dir, search_id.as_deref()).await
+                };
+                let line = match outcome {
                     Ok(Outcome::Imported {
-                        dir: dest, release, ..
+                        dir: dest,
+                        release: Some(release),
+                        ..
                     }) => {
                         println!(
                             "imported  {} — {}  →  {}",
@@ -104,6 +116,14 @@ async fn run() -> anyhow::Result<ExitCode> {
                             dest.display()
                         );
                         format!("import {} {}", release.id, dir.display())
+                    }
+                    Ok(Outcome::Imported {
+                        dir: dest,
+                        release: None,
+                        ..
+                    }) => {
+                        println!("imported  as-is  →  {}", dest.display());
+                        format!("import as-is {}", dir.display())
                     }
                     Ok(Outcome::Review {
                         reason, candidates, ..

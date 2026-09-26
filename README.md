@@ -36,6 +36,10 @@ instead of disambiguated.
   seconds between editions. An album is applied without asking only when it
   is below the threshold *and* complete; otherwise the candidates are
   returned, with what the distance is made of in the log.
+- **As-is imports are gated.** Filing by the files' own tags (`--as-is`)
+  requires one album and one artist across every file and a title and
+  distinct track number for each; otherwise nothing moves and the reason is
+  given, since a library filed from bad tags is worse than an album waiting.
 - **One copy of each track.** A folder holding an album in two formats, or
   with `(1)` duplicates, is imported from the best copy of each track.
 - **Nothing is overwritten.** Every destination is planned and checked before

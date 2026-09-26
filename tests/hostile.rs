@@ -26,7 +26,7 @@ proptest! {
         let cfg = Config { directory: "/lib".into(), path_default: translate("$albumartist/%if{$year,($year) }$album [$format]/$disc$track. $artist - $title"), ..Config::default() };
         let tags = Tags { album_artist: artist.clone(), artist, album, title, track, disc, date: Some(year), ..Default::default() };
         let local = Track { format: "FLAC".into(), ..Default::default() };
-        if let Ok(rel) = paths::render(&cfg, &tags, &local, &release()) {
+        if let Ok(rel) = paths::render(&cfg, &tags, &local, Some(&release())) {
             let dest = paths::under(Path::new("/lib"), &format!("{rel}.flac"));
             if let Ok(p) = dest {
                 prop_assert!(p.starts_with("/lib"));

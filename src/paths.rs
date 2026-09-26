@@ -31,7 +31,7 @@ pub fn render(
     cfg: &Config,
     tags: &Tags,
     local: &Track,
-    release: &Release,
+    release: Option<&Release>,
 ) -> Result<String, PathError> {
     let date_year = year(tags.date.as_deref());
     let original_year = year(tags.original_date.as_deref());
@@ -41,8 +41,7 @@ pub fn render(
         date_year.clone()
     };
     let album_type = release
-        .release_group
-        .as_ref()
+        .and_then(|r| r.release_group.as_ref())
         .and_then(|g| g.primary_type.clone());
     let fields = |name: &str| -> Option<String> {
         let raw = match name {
@@ -259,7 +258,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            render(&cfg, &tags, &local, &release()).unwrap(),
+            render(&cfg, &tags, &local, Some(&release())).unwrap(),
             "AC-DC/Live_ 1991/03 T.N.T_"
         );
     }
@@ -285,7 +284,7 @@ mod tests {
             ..Default::default()
         };
         assert!(matches!(
-            render(&cfg, &tags, &Track::default(), &release()),
+            render(&cfg, &tags, &Track::default(), Some(&release())),
             Err(PathError::Component { .. })
         ));
     }
