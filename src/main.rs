@@ -81,6 +81,20 @@ enum Command {
         #[arg(short, long)]
         pretend: bool,
     },
+    /// Summarise the library, or the part of it a query matches.
+    Stats { query: Vec<String> },
+    /// List tracks and discs that matching albums' own totals say are absent.
+    Missing { query: Vec<String> },
+    /// Move matching albums out of the library into a bin directory, at
+    /// their paths relative to it. Nothing is deleted.
+    Remove {
+        query: Vec<String>,
+        #[arg(long)]
+        bin: PathBuf,
+        /// List the albums, and move nothing.
+        #[arg(short, long)]
+        pretend: bool,
+    },
     /// Find albums held more than once and say which copy to keep.
     #[command(alias = "dup")]
     Duplicates {
@@ -103,6 +117,17 @@ enum Command {
         #[arg(short, long)]
         format: Option<String>,
     },
+}
+
+/// `println!`, except that a reader which stops early (`| head`) ends the
+/// program quietly rather than panicking it.
+macro_rules! say {
+    ($($arg:tt)*) => {{
+        use std::io::Write;
+        if writeln!(std::io::stdout().lock(), $($arg)*).is_err() {
+            std::process::exit(0);
+        }
+    }};
 }
 
 #[tokio::main]
@@ -144,7 +169,7 @@ async fn run() -> anyhow::Result<ExitCode> {
             for (_, e) in &r.failed {
                 eprintln!("unreadable  {e}");
             }
-            println!(
+            say!(
                 "{} added, {} changed, {} removed, {} unchanged, {} unreadable",
                 r.added,
                 r.changed,
@@ -175,10 +200,10 @@ async fn run() -> anyhow::Result<ExitCode> {
                             .and_then(|m| m.to.parent())
                             .unwrap_or(&album.dir)
                             .to_path_buf();
-                        println!("move  {}  →  {}", album.dir.display(), to.display());
+                        say!("move  {}  →  {}", album.dir.display(), to.display());
                         if verbose {
                             for m in &moves {
-                                println!("        {}  →  {}", m.from.display(), m.to.display());
+                                say!("        {}  →  {}", m.from.display(), m.to.display());
                             }
                         }
                         if !pretend {
@@ -189,7 +214,68 @@ async fn run() -> anyhow::Result<ExitCode> {
                 }
             }
             let verb = if pretend { "would move" } else { "moved" };
-            println!("{moved} albums {verb}, {refused} left where they are");
+            say!("{moved} albums {verb}, {refused} left where they are");
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Stats { query } => {
+            let mut lib = Library::open(&index)?;
+            lib.update(&cfg.directory)?;
+            let query = Query::parse(&query)?;
+            let items = lib.items(&query)?;
+            let albums = lib.albums(&query)?;
+            let bytes: u64 = items.iter().map(|i| i.size).sum();
+            let secs: f64 = items.iter().map(|i| i.track.duration.as_secs_f64()).sum();
+            let mut formats: std::collections::BTreeMap<&str, usize> = Default::default();
+            for i in &items {
+                *formats.entry(i.track.format.as_str()).or_default() += 1;
+            }
+            let artists: std::collections::HashSet<_> = albums
+                .iter()
+                .filter_map(|a| a.items.first()?.field("albumartist"))
+                .map(|v| format!("{v:?}"))
+                .collect();
+            say!("Tracks:  {}", items.len());
+            say!("Albums:  {}", albums.len());
+            say!("Artists: {}", artists.len());
+            say!("Size:    {:.1} GB", bytes as f64 / 1e9);
+            say!("Time:    {:.1} days", secs / 86_400.0);
+            let formats: Vec<String> = formats.iter().map(|(f, n)| format!("{f} {n}")).collect();
+            say!("Formats: {}", formats.join(", "));
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Missing { query } => {
+            let mut lib = Library::open(&index)?;
+            lib.update(&cfg.directory)?;
+            let mut count = 0;
+            for album in lib.albums(&Query::parse(&query)?)? {
+                let gaps = manage::missing(&album);
+                if !gaps.is_empty() {
+                    count += 1;
+                    say!("{}: {}", album.dir.display(), gaps.join(", "));
+                }
+            }
+            say!("{count} albums with gaps");
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Remove {
+            query,
+            bin,
+            pretend,
+        } => {
+            anyhow::ensure!(
+                !query.is_empty(),
+                "give a query; removing the whole library takes an explicit \"\""
+            );
+            let mut lib = Library::open(&index)?;
+            lib.update(&cfg.directory)?;
+            for album in lib.albums(&Query::parse(&query)?)? {
+                if pretend {
+                    say!("would bin  {}", album.dir.display());
+                } else {
+                    let to = manage::bin(&mut lib, &cfg.directory, &bin, &album).await?;
+                    say!("binned  {}  →  {}", album.dir.display(), to.display());
+                }
+            }
             Ok(ExitCode::SUCCESS)
         }
         Command::Modify {
@@ -219,15 +305,15 @@ async fn run() -> anyhow::Result<ExitCode> {
             .await?;
             let verb = if pretend { "would change" } else { "changed" };
             for f in &r.files {
-                println!("{verb}  {}", f.display());
+                say!("{verb}  {}", f.display());
             }
             for (from, to) in &r.moved {
-                println!("moved  {}  →  {}", from.display(), to.display());
+                say!("moved  {}  →  {}", from.display(), to.display());
             }
             for (dir, why) in &r.left {
                 eprintln!("left   {}: {why}", dir.display());
             }
-            println!(
+            say!(
                 "{} files {verb}, {} albums re-filed",
                 r.files.len(),
                 r.moved.len()
@@ -240,22 +326,22 @@ async fn run() -> anyhow::Result<ExitCode> {
             let albums = lib.albums(&Query::parse(&query)?)?;
             let dupes = manage::duplicates(&cfg, &albums);
             for d in &dupes {
-                println!("keep  {}", d.keep.dir.display());
+                say!("keep  {}", d.keep.dir.display());
                 for (other, why) in &d.others {
                     match &bin {
                         Some(bin) => {
                             let dest = manage::bin(&mut lib, &cfg.directory, bin, other).await?;
-                            println!(
+                            say!(
                                 "  bin {}  ({why})  →  {}",
                                 other.dir.display(),
                                 dest.display()
                             );
                         }
-                        None => println!("  dup {}  ({why})", other.dir.display()),
+                        None => say!("  dup {}  ({why})", other.dir.display()),
                     }
                 }
             }
-            println!("{} albums held more than once", dupes.len());
+            say!("{} albums held more than once", dupes.len());
             Ok(ExitCode::SUCCESS)
         }
         Command::Ls {
@@ -322,7 +408,7 @@ async fn run() -> anyhow::Result<ExitCode> {
                         release: Some(release),
                         ..
                     }) => {
-                        println!(
+                        say!(
                             "imported  {} — {}  →  {}",
                             release.artist,
                             release.title,
@@ -335,16 +421,16 @@ async fn run() -> anyhow::Result<ExitCode> {
                         release: None,
                         ..
                     }) => {
-                        println!("imported  as-is  →  {}", dest.display());
+                        say!("imported  as-is  →  {}", dest.display());
                         format!("import as-is {}", dir.display())
                     }
                     Ok(Outcome::Review {
                         reason, candidates, ..
                     }) => {
                         failed = true;
-                        println!("skipped   {}: {reason}", dir.display());
+                        say!("skipped   {}: {reason}", dir.display());
                         for c in candidates.iter().take(5) {
-                            println!(
+                            say!(
                                 "          {:.3}  {}  {} — {} ({}{})",
                                 c.distance,
                                 c.id,
@@ -389,7 +475,7 @@ async fn run() -> anyhow::Result<ExitCode> {
                 } => {
                     eprint!("{log}");
                     for c in candidates {
-                        println!(
+                        say!(
                             "{:.3}  {}  {} — {} ({}{}) {} tracks, {} missing, {} extra",
                             c.distance,
                             c.id,

@@ -293,6 +293,63 @@ pub async fn modify(
     Ok(report)
 }
 
+/// Tracks an album's own tags say it should have and it does not: numbers
+/// absent below each disc's track total, and discs absent below the disc
+/// total. Judged from the files alone, so an album with no totals has
+/// nothing missing.
+pub fn missing(album: &Album) -> Vec<String> {
+    let mut discs: std::collections::BTreeMap<u32, (u32, std::collections::BTreeSet<u32>)> =
+        Default::default();
+    let mut disc_total = 0;
+    for i in &album.items {
+        let d = i.track.disc.unwrap_or(1);
+        let entry = discs.entry(d).or_default();
+        entry.0 = entry.0.max(i.track.track_total.unwrap_or(0));
+        if let Some(n) = i.track.track {
+            entry.1.insert(n);
+        }
+        disc_total = disc_total.max(i.track.disc_total.unwrap_or(0));
+    }
+    let mut out = Vec::new();
+    for d in 1..=disc_total {
+        if !discs.contains_key(&d) {
+            out.push(format!("disc {d}"));
+        }
+    }
+    // A later disc not starting at 1 means the album is numbered straight
+    // through: judge it as one sequence.
+    let continuous = discs
+        .iter()
+        .skip(1)
+        .any(|(_, (_, have))| have.first().is_some_and(|&n| n > 1));
+    if continuous {
+        let total = discs.values().map(|(t, _)| *t).max().unwrap_or(0);
+        let have: std::collections::BTreeSet<u32> = discs
+            .values()
+            .flat_map(|(_, h)| h.iter().copied())
+            .collect();
+        out.extend(
+            (1..=total)
+                .filter(|n| !have.contains(n))
+                .map(|n| format!("track {n}")),
+        );
+        return out;
+    }
+    let many = discs.len() > 1 || disc_total > 1;
+    for (d, (total, have)) in &discs {
+        for n in 1..=*total {
+            if !have.contains(&n) {
+                out.push(if many {
+                    format!("{d}-{n}")
+                } else {
+                    format!("track {n}")
+                });
+            }
+        }
+    }
+    out
+}
+
 /// Albums held more than once, and which copy to keep.
 #[derive(Debug)]
 pub struct Duplicate<'a> {
@@ -582,6 +639,37 @@ replace:
         lib.update(&lib_root).unwrap();
         let albums = lib.albums(&Query::default()).unwrap();
         assert!(duplicates(&cfg, &albums).is_empty());
+    }
+
+    #[test]
+    fn missing_reads_gaps_from_the_totals() {
+        let item = |disc, track, dt, tt| Item {
+            track: Track {
+                disc: Some(disc),
+                track: Some(track),
+                disc_total: Some(dt),
+                track_total: Some(tt),
+                ..Default::default()
+            },
+            size: 0,
+            mtime: 0,
+            added: 0,
+        };
+        let album = Album {
+            dir: PathBuf::from("/m/a"),
+            items: vec![item(1, 1, 3, 3), item(1, 3, 3, 3), item(3, 1, 3, 1)],
+        };
+        assert_eq!(missing(&album), ["disc 2", "1-2"]);
+        let whole = Album {
+            dir: PathBuf::from("/m/b"),
+            items: vec![item(1, 1, 1, 2), item(1, 2, 1, 2)],
+        };
+        assert!(missing(&whole).is_empty());
+        let straight_through = Album {
+            dir: PathBuf::from("/m/c"),
+            items: vec![item(1, 1, 2, 3), item(1, 2, 2, 3), item(2, 3, 2, 3)],
+        };
+        assert!(missing(&straight_through).is_empty());
     }
 
     #[test]
