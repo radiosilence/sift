@@ -170,7 +170,7 @@ async fn run() -> anyhow::Result<ExitCode> {
                             }
                         }
                         if !pretend {
-                            manage::execute(&lib, &album, &moves).await?;
+                            manage::execute(&mut lib, &album, &moves).await?;
                         }
                         moved += 1;
                     }
@@ -190,7 +190,7 @@ async fn run() -> anyhow::Result<ExitCode> {
                 for (other, why) in &d.others {
                     match &bin {
                         Some(bin) => {
-                            let dest = manage::bin(&lib, &cfg.directory, bin, other).await?;
+                            let dest = manage::bin(&mut lib, &cfg.directory, bin, other).await?;
                             println!(
                                 "  bin {}  ({why})  →  {}",
                                 other.dir.display(),

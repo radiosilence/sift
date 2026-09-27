@@ -134,7 +134,7 @@ pub fn plan_move(cfg: &Config, album: &Album) -> Plan {
 /// Carry out a plan from [`plan_move`], keeping the index in step, then
 /// remove the directories it emptied (the album's, then its artist's). A
 /// directory is only ever removed empty.
-pub async fn execute(lib: &Library, album: &Album, moves: &[Move]) -> Result<(), LibraryError> {
+pub async fn execute(lib: &mut Library, album: &Album, moves: &[Move]) -> Result<(), LibraryError> {
     for m in moves {
         paths::transfer(&m.from, &m.to, true)
             .await
@@ -152,7 +152,7 @@ pub async fn execute(lib: &Library, album: &Album, moves: &[Move]) -> Result<(),
 /// Move an album into `bin`, at its path relative to the library root, and
 /// drop it from the index. Nothing is deleted: putting it back is a move.
 pub async fn bin(
-    lib: &Library,
+    lib: &mut Library,
     library_root: &Path,
     bin: &Path,
     album: &Album,
@@ -402,7 +402,7 @@ replace:
                 new.join("cover.jpg"),
             ]
         );
-        execute(&lib, &album, &moves).await.unwrap();
+        execute(&mut lib, &album, &moves).await.unwrap();
         assert!(new.join("cover.jpg").exists());
         assert!(!lib_root.join("R.E.M_").exists(), "emptied directories go");
         let moved = album_of(&lib, &new);
