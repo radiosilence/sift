@@ -25,6 +25,11 @@ pub enum ImportError {
     Path(#[from] crate::paths::PathError),
     #[error("{0}")]
     Conflict(String),
+    /// The album is already filed at this directory: its destinations are
+    /// taken, by files not close enough to these to be the same copy. Filed
+    /// by the same rules into the same format's folder, it is the same album.
+    #[error("{} is already in the library", .0.display())]
+    Exists(PathBuf),
     /// The files' own tags do not describe one album well enough to file
     /// it by them.
     #[error("the files' tags do not describe one album: {0}")]
@@ -588,10 +593,13 @@ impl Importer {
             }
         }
         if let Some(i) = present.iter().position(|p| *p) {
-            return Err(ImportError::Conflict(format!(
-                "{} is already in the library",
-                plan[i].2.display()
-            )));
+            return Err(ImportError::Exists(
+                plan[i]
+                    .2
+                    .parent()
+                    .map(Path::to_path_buf)
+                    .unwrap_or_default(),
+            ));
         }
 
         let cover = if self.cfg.fetch_art {

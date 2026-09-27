@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- `ImportError::Exists(dir)` for an album whose destinations are already taken by another copy of it, in place of a `Conflict` message carrying the path, so a caller can treat it as already filed.
 - Title, album and artist comparison is beets' `string_dist`, ported with its test suite: a leading "the", a bracketed or parenthesised part, a featured artist and a "Pt."/"Part" suffix cost a fraction of an unrelated difference; "(EP)" and "Single" cost nothing; "Song Title, The" equals "The Song Title"; accents are transliterated. It had counted "My Song (Remastered)" as far from "My Song" as any four-letter typo.
 - `Importer::enrich(dir)` adds what beets' `replaygain`, `lastgenre` and `lyrics` plugins add after an import: album and track gain, MusicBrainz genres when the album has none, and lyrics for tracks without them. Each writes only its own tags, and a failure in one is reported without stopping the others.
 - `sift genres QUERY` sets genres from MusicBrainz on albums that have none (`-f` for all): the release's, else its release group's, else its artist's, most voted first, at most three, and none with under a third of the top genre's votes. MusicBrainz's genre list is curated, so it serves as the whitelist beets' `lastgenre` keeps by hand; names are title-cased with acronyms kept ("UK Garage", "IDM") and "and" written "&" ("Drum & Bass", as other taggers spell it), and joined with "; ". Only the genre tag is written.
