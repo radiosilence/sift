@@ -13,6 +13,10 @@ $ sift update                                 # index the library
 $ sift ls -a year:1990..1999 format:FLAC      # beets query syntax
 $ sift move --pretend                         # what re-filing would change
 $ sift duplicates --bin ~/music-bin           # spare copies out of the library
+$ sift modify -a album:untru album=Untrue      # fix tags, re-file what moves
+$ sift import -L artist:burial                # match library albums again
+$ sift mbsync year:2020..                     # refresh from MusicBrainz
+$ sift missing ; sift bad ; sift stats         # gaps, damaged audio, totals
 ```
 
 ## What it reads from a beets config

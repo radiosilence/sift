@@ -133,6 +133,27 @@ impl Importer {
         dir: &Path,
         release_id: Option<&str>,
     ) -> Result<Outcome, ImportError> {
+        self.import_with(dir, release_id, false).await
+    }
+
+    /// Match an album already in the library again, as beets' `import -L`
+    /// does: retag it, and move it if the new tags file it elsewhere. A
+    /// file that stays where it is is retagged in place, and the album's
+    /// other files (cover, cue, log) follow it to a new directory.
+    pub async fn reimport(
+        &self,
+        dir: &Path,
+        release_id: Option<&str>,
+    ) -> Result<Outcome, ImportError> {
+        self.import_with(dir, release_id, true).await
+    }
+
+    async fn import_with(
+        &self,
+        dir: &Path,
+        release_id: Option<&str>,
+        in_place: bool,
+    ) -> Result<Outcome, ImportError> {
         let mut log = String::new();
         let tracks = read_dir(dir).await?;
         let _ = writeln!(log, "{} audio files in {}", tracks.len(), dir.display());
@@ -190,7 +211,7 @@ impl Importer {
             }
         }
         let best = best.clone();
-        let dest = self.apply(&tracks, &best, dir, &mut log).await?;
+        let dest = self.apply(&tracks, &best, dir, in_place, &mut log).await?;
         Ok(Outcome::Imported {
             dir: dest,
             release: Some(Candidate::from(&best)),
@@ -218,7 +239,9 @@ impl Importer {
         }
         let entries = as_is_tags(&tracks)?;
         let _ = writeln!(log, "as-is: filed by the files' own tags");
-        let dest = self.file(&tracks, &entries, None, dir, &mut log).await?;
+        let dest = self
+            .file(&tracks, &entries, None, dir, false, &mut log)
+            .await?;
         Ok(Outcome::Imported {
             dir: dest,
             release: None,
@@ -397,6 +420,7 @@ impl Importer {
         tracks: &[Track],
         m: &Match,
         source_dir: &Path,
+        in_place: bool,
         log: &mut String,
     ) -> Result<PathBuf, ImportError> {
         let release = &m.release;
@@ -409,7 +433,7 @@ impl Importer {
                 (l, self.tags(release, r, medium.position, rt, remote.len()))
             })
             .collect();
-        self.file(tracks, &entries, Some(release), source_dir, log)
+        self.file(tracks, &entries, Some(release), source_dir, in_place, log)
             .await
     }
 
@@ -421,8 +445,11 @@ impl Importer {
         entries: &[(usize, Tags)],
         release: Option<&Release>,
         source_dir: &Path,
+        in_place: bool,
         log: &mut String,
     ) -> Result<PathBuf, ImportError> {
+        let itself =
+            |from: &Path, to: &Path| paths::collision_key(from) == paths::collision_key(to);
         let mut plan = Vec::with_capacity(entries.len());
         let mut claimed = std::collections::HashMap::new();
         for (l, tags) in entries {
@@ -452,8 +479,13 @@ impl Importer {
         // retry, a second request queued behind the first) succeeds and
         // moves nothing. Anything short of that is a conflict, and nothing
         // is overwritten either way.
-        let present: Vec<bool> = plan.iter().map(|(_, _, d)| d.exists()).collect();
-        if present.iter().all(|p| *p) && !plan.is_empty() {
+        // In place, a file whose destination is itself is not "already
+        // there": it is the file being retagged.
+        let present: Vec<bool> = plan
+            .iter()
+            .map(|(l, _, d)| d.exists() && !(in_place && itself(&tracks[*l].path, d)))
+            .collect();
+        if !in_place && present.iter().all(|p| *p) && !plan.is_empty() {
             let same = plan.iter().all(|(l, _, d)| {
                 meta::read(d).is_ok_and(|there| {
                     let here = &tracks[*l];
@@ -498,12 +530,14 @@ impl Importer {
             // Moving: the source is ours to change, so tag it and move it.
             // Copying: the source must come out untouched, so copy first and
             // tag the copy, taking it back out if tagging fails.
-            if self.cfg.move_files {
+            if self.cfg.move_files || in_place {
                 let path = local.path.clone();
                 tokio::task::spawn_blocking(move || meta::write(&path, &tags, cover.as_deref()))
                     .await
                     .expect("tag writer panicked")?;
-                paths::transfer(&local.path, dest, true).await?;
+                if !itself(&local.path, dest) {
+                    paths::transfer(&local.path, dest, true).await?;
+                }
             } else {
                 paths::transfer(&local.path, dest, false).await?;
                 let path = dest.clone();
@@ -531,6 +565,30 @@ impl Importer {
         for (i, t) in tracks.iter().enumerate() {
             if !entries.iter().any(|(l, _)| *l == i) {
                 let _ = writeln!(log, "left behind (no matching track): {}", t.path.display());
+            }
+        }
+        // A re-imported album that changed directory takes its other files
+        // along, and leaves no empty directory behind.
+        if in_place
+            && let Some(new_dir) = plan.first().and_then(|(_, _, d)| d.parent())
+            && !itself(source_dir, new_dir)
+        {
+            if let Ok(entries) = std::fs::read_dir(source_dir) {
+                for entry in entries.flatten() {
+                    let from = entry.path();
+                    let to = new_dir.join(entry.file_name());
+                    if entry.file_type().is_ok_and(|t| t.is_file())
+                        && !meta::is_audio(&from)
+                        && !to.exists()
+                    {
+                        paths::transfer(&from, &to, true).await?;
+                    }
+                }
+            }
+            if std::fs::remove_dir(source_dir).is_ok()
+                && let Some(parent) = source_dir.parent()
+            {
+                let _ = std::fs::remove_dir(parent);
             }
         }
         Ok(plan

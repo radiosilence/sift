@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- `sift import -L QUERY` re-imports albums already in the library (`--search-id` to apply a given release), as beets' `import -L` does, and `sift mbsync QUERY` refreshes albums from the release they were tagged with, without matching again. `Importer::reimport` retags files that stay where they are in place, moves those the new tags file elsewhere, and takes the album's other files along when its directory changes.
 - `sift bad` (alias `badfiles`) decodes matching files and lists those whose audio is damaged: truncated, with corrupt packets, or not matching FLAC's stored MD5. Decoding is symphonia's, so no external tool is needed; Opus, which it cannot decode, is reported as unchecked rather than passed. A verdict is kept until the file changes, so a re-run checks only what is new; the first run over a large library takes an hour or more.
 - A file that changes and then cannot be read leaves the index, rather than keeping the row it had before it broke.
 - `sift stats` summarises tracks, albums, artists, size, playing time and formats. `sift missing` lists tracks and discs that an album's own track and disc totals say are absent; an album numbered straight through its discs is judged as one sequence. `sift remove QUERY --bin DIR` moves albums out of the library rather than deleting them, since removing a file from the index alone would be undone by the next scan. Output to a reader that stops early (`| head`) ends quietly.

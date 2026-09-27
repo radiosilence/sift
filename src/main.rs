@@ -34,7 +34,12 @@ struct Cli {
 enum Command {
     /// Import albums: one per directory given.
     Import {
-        paths: Vec<PathBuf>,
+        /// Directories, or with `-L` a query over the library.
+        paths: Vec<String>,
+        /// Re-import albums already in the library that match the query,
+        /// retagging them and re-filing any whose tags move them.
+        #[arg(short = 'L', long)]
+        library: bool,
         /// Apply this MusicBrainz release, whatever the match distance.
         #[arg(long = "search-id")]
         search_id: Option<String>,
@@ -55,6 +60,9 @@ enum Command {
         #[arg(short = 'l', long)]
         log: Option<PathBuf>,
     },
+    /// Refresh albums from the MusicBrainz release they were tagged with,
+    /// without matching again: for corrections made upstream since.
+    Mbsync { query: Vec<String> },
     /// Show the candidates for a directory without changing anything.
     Match { path: PathBuf },
     /// Bring the library index in line with the files in the library.
@@ -412,6 +420,7 @@ async fn run() -> anyhow::Result<ExitCode> {
         }
         Command::Import {
             paths,
+            library,
             search_id,
             as_is,
             copy,
@@ -425,77 +434,37 @@ async fn run() -> anyhow::Result<ExitCode> {
             if r#move {
                 cfg.move_files = true;
             }
-            let importer = Importer::new(cfg);
-            let mut failed = false;
-            for dir in paths {
-                let outcome = if as_is {
-                    importer.import_as_is(&dir, &sift::Edits::default()).await
-                } else {
-                    importer.import(&dir, search_id.as_deref()).await
-                };
-                let line = match outcome {
-                    Ok(Outcome::Imported {
-                        dir: dest,
-                        release: Some(release),
-                        ..
-                    }) => {
-                        say!(
-                            "imported  {} — {}  →  {}",
-                            release.artist,
-                            release.title,
-                            dest.display()
-                        );
-                        format!("import {} {}", release.id, dir.display())
-                    }
-                    Ok(Outcome::Imported {
-                        dir: dest,
-                        release: None,
-                        ..
-                    }) => {
-                        say!("imported  as-is  →  {}", dest.display());
-                        format!("import as-is {}", dir.display())
-                    }
-                    Ok(Outcome::Review {
-                        reason, candidates, ..
-                    }) => {
-                        failed = true;
-                        say!("skipped   {}: {reason}", dir.display());
-                        for c in candidates.iter().take(5) {
-                            say!(
-                                "          {:.3}  {}  {} — {} ({}{})",
-                                c.distance,
-                                c.id,
-                                c.artist,
-                                c.title,
-                                c.date.as_deref().unwrap_or("?"),
-                                c.country
-                                    .as_deref()
-                                    .map(|x| format!(", {x}"))
-                                    .unwrap_or_default()
-                            );
-                        }
-                        format!("skip {}", dir.display())
-                    }
-                    Err(e) => {
-                        failed = true;
-                        eprintln!("failed    {}: {e}", dir.display());
-                        format!("error {} {e}", dir.display())
-                    }
-                };
-                if let Some(log) = &log {
-                    use std::io::Write;
-                    let mut f = std::fs::OpenOptions::new()
-                        .create(true)
-                        .append(true)
-                        .open(log)?;
-                    writeln!(f, "{line}")?;
-                }
-            }
-            Ok(if failed {
-                ExitCode::from(1)
+            let jobs: Vec<(PathBuf, Option<String>)> = if library {
+                anyhow::ensure!(
+                    !as_is,
+                    "-L re-imports against MusicBrainz; it cannot be combined with --as-is"
+                );
+                let mut lib = Library::open(&index)?;
+                lib.update(&cfg.directory)?;
+                lib.albums(&Query::parse(&paths)?)?
+                    .into_iter()
+                    .map(|a| (a.dir, search_id.clone()))
+                    .collect()
             } else {
-                ExitCode::SUCCESS
-            })
+                paths
+                    .iter()
+                    .map(|p| (PathBuf::from(p), search_id.clone()))
+                    .collect()
+            };
+            imports(Importer::new(cfg), jobs, library, as_is, log.as_deref()).await
+        }
+        Command::Mbsync { query } => {
+            let mut lib = Library::open(&index)?;
+            lib.update(&cfg.directory)?;
+            let jobs = lib
+                .albums(&Query::parse(&query)?)?
+                .into_iter()
+                .filter_map(|a| {
+                    let id = a.items.first()?.track.mb_album_id.clone()?;
+                    Some((a.dir, Some(id)))
+                })
+                .collect();
+            imports(Importer::new(cfg), jobs, true, false, None).await
         }
         Command::Match { path } => {
             cfg.strong_threshold = -1.0;
@@ -528,4 +497,87 @@ async fn run() -> anyhow::Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
     }
+}
+
+/// Import (or, `in_place`, re-import) each directory, with its release when
+/// one is given, printing a line per album and appending one to `log`.
+async fn imports(
+    importer: Importer,
+    jobs: Vec<(PathBuf, Option<String>)>,
+    in_place: bool,
+    as_is: bool,
+    log: Option<&std::path::Path>,
+) -> anyhow::Result<ExitCode> {
+    let mut failed = false;
+    for (dir, release) in jobs {
+        let outcome = if as_is {
+            importer.import_as_is(&dir, &sift::Edits::default()).await
+        } else if in_place {
+            importer.reimport(&dir, release.as_deref()).await
+        } else {
+            importer.import(&dir, release.as_deref()).await
+        };
+        let line = match outcome {
+            Ok(Outcome::Imported {
+                dir: dest,
+                release: Some(release),
+                ..
+            }) => {
+                say!(
+                    "imported  {} — {}  →  {}",
+                    release.artist,
+                    release.title,
+                    dest.display()
+                );
+                format!("import {} {}", release.id, dir.display())
+            }
+            Ok(Outcome::Imported {
+                dir: dest,
+                release: None,
+                ..
+            }) => {
+                say!("imported  as-is  →  {}", dest.display());
+                format!("import as-is {}", dir.display())
+            }
+            Ok(Outcome::Review {
+                reason, candidates, ..
+            }) => {
+                failed = true;
+                say!("skipped   {}: {reason}", dir.display());
+                for c in candidates.iter().take(5) {
+                    say!(
+                        "          {:.3}  {}  {} — {} ({}{})",
+                        c.distance,
+                        c.id,
+                        c.artist,
+                        c.title,
+                        c.date.as_deref().unwrap_or("?"),
+                        c.country
+                            .as_deref()
+                            .map(|x| format!(", {x}"))
+                            .unwrap_or_default()
+                    );
+                }
+                format!("skip {}", dir.display())
+            }
+            Err(e) => {
+                failed = true;
+                eprintln!("failed    {}: {e}", dir.display());
+                format!("error {} {e}", dir.display())
+            }
+        };
+        if let Some(log) = &log {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(log)?;
+            writeln!(f, "{line}")?;
+        }
+    }
+    Ok(if failed {
+        ExitCode::from(1)
+    } else {
+        ExitCode::SUCCESS
+    })
 }
