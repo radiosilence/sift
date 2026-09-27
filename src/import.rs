@@ -100,6 +100,16 @@ pub struct Importer {
     http: reqwest::Client,
 }
 
+/// What [`Importer::enrich`] added.
+#[derive(Debug, Default)]
+pub struct Enriched {
+    pub gain_db: Option<f64>,
+    pub genres: Vec<String>,
+    /// Tracks given lyrics.
+    pub lyrics: usize,
+    pub problems: Vec<String>,
+}
+
 /// How many search hits are looked up in full. Each is a rate-limited
 /// request, so this is the time an import spends at MusicBrainz.
 const LOOKUPS: usize = 5;
@@ -134,6 +144,76 @@ impl Importer {
         release_id: Option<&str>,
     ) -> Result<Outcome, ImportError> {
         self.import_with(dir, release_id, false).await
+    }
+
+    /// What beets' `replaygain`, `lastgenre` and `lyrics` plugins add after
+    /// an import: album and track gain, genres from MusicBrainz when the
+    /// album has none, and lyrics for tracks without them. Each is written
+    /// only to its own tags, and each failure is reported rather than
+    /// stopping the rest.
+    pub async fn enrich(&self, dir: &Path) -> Result<Enriched, ImportError> {
+        let tracks = read_dir(dir).await?;
+        let mut out = Enriched::default();
+        let paths: Vec<PathBuf> = tracks.iter().map(|t| t.path.clone()).collect();
+
+        let measured = {
+            let paths = paths.clone();
+            tokio::task::spawn_blocking(move || crate::replaygain::album(&paths, 2))
+                .await
+                .expect("replaygain panicked")
+        };
+        match measured {
+            Ok((gains, album)) => {
+                for (p, g) in paths.iter().zip(gains) {
+                    if let Err(e) = meta::set_replaygain(p, g, album) {
+                        out.problems.push(e.to_string());
+                    }
+                }
+                out.gain_db = Some(album.db);
+            }
+            Err(e) => out.problems.push(format!("replaygain: {e}")),
+        }
+
+        let untagged = tracks
+            .iter()
+            .all(|t| t.genre.as_deref().is_none_or(|g| g.trim().is_empty()));
+        if untagged && let Some(id) = tracks.iter().find_map(|t| t.mb_album_id.clone()) {
+            match self.mb.genres(&id).await {
+                Ok(g) if !g.is_empty() => {
+                    let genre = g.join("; ");
+                    for p in &paths {
+                        if let Err(e) = meta::set(p, &[("genre".into(), Some(genre.clone()))]) {
+                            out.problems.push(e.to_string());
+                        }
+                    }
+                    out.genres = g;
+                }
+                Ok(_) => {}
+                Err(e) => out.problems.push(format!("genres: {e}")),
+            }
+        }
+
+        let lyrics = crate::lyrics::Client::new();
+        for t in &tracks {
+            let (Some(artist), Some(title)) = (&t.artist, &t.title) else {
+                continue;
+            };
+            if meta::has_lyrics(&t.path) {
+                continue;
+            }
+            let album = t.album.as_deref().unwrap_or("");
+            match lyrics.get(artist, title, album, t.duration.as_secs()).await {
+                Ok(crate::lyrics::Lyrics::Synced(l) | crate::lyrics::Lyrics::Plain(l)) => {
+                    match meta::set_lyrics(&t.path, &l) {
+                        Ok(()) => out.lyrics += 1,
+                        Err(e) => out.problems.push(e.to_string()),
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => out.problems.push(format!("lyrics: {e}")),
+            }
+        }
+        Ok(out)
     }
 
     /// Match an album already in the library again, as beets' `import -L`

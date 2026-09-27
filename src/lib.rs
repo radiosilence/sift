@@ -12,4 +12,6 @@ pub mod paths;
 pub mod replaygain;
 
 pub use config::Config;
-pub use import::{Candidate, Comparison, Edits, ImportError, Importer, Outcome, TrackEdit};
+pub use import::{
+    Candidate, Comparison, Edits, Enriched, ImportError, Importer, Outcome, TrackEdit,
+};
