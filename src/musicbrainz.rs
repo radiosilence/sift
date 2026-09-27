@@ -246,12 +246,18 @@ impl MusicBrainz {
 }
 
 /// "future garage" as "Future Garage", keeping the acronyms genre names
-/// use in capitals ("UK Garage", "IDM").
+/// use in capitals ("UK Garage", "IDM"), and "drum and bass" as "Drum &
+/// Bass", the spelling libraries tagged by other tools already use.
 fn title_case(name: &str) -> String {
     const UPPER: &[&str] = &["uk", "us", "idm", "ebm", "edm", "dnb", "r&b", "rnb", "ost"];
     name.split(' ')
-        .map(|w| {
-            if UPPER.contains(&w) {
+        .enumerate()
+        .map(|(i, w)| {
+            if w == "and" {
+                "&".to_string()
+            } else if i > 0 && ["of", "the", "n"].contains(&w) {
+                w.to_string()
+            } else if UPPER.contains(&w) {
                 w.to_uppercase()
             } else {
                 w.split('-')
@@ -489,6 +495,8 @@ mod tests {
         assert_eq!(title_case("uk garage"), "UK Garage");
         assert_eq!(title_case("lo-fi house"), "Lo-Fi House");
         assert_eq!(title_case("idm"), "IDM");
+        assert_eq!(title_case("drum and bass"), "Drum & Bass");
+        assert_eq!(title_case("music of the andes"), "Music of the Andes");
     }
 
     #[test]
