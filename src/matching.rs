@@ -259,13 +259,28 @@ fn pair_by_number(local: &[Track], release: &Release) -> Option<Vec<(usize, usiz
             return None;
         }
     }
-    let pairs: Vec<(usize, usize)> = release
+    let per_disc: Vec<(usize, usize)> = release
         .tracks()
         .enumerate()
         .filter_map(|(r, (m, t))| by_number.get(&(m.position, t.position)).map(|&l| (l, r)))
         .collect();
-    // Numbers that match nothing are a sign they mean something else — a
-    // continuous count across discs, say. Fall back rather than trust them.
+    // Files with no disc number are often counted straight through a
+    // release whose sides or discs restart at 1 (A1–A4, B1–B4 as 1–8).
+    // Numbered per disc, only the first side would pair.
+    let continuous: Vec<(usize, usize)> = if local.iter().all(|t| t.disc.unwrap_or(1) == 1) {
+        (0..release.tracks().count())
+            .filter_map(|r| by_number.get(&(1, r as u32 + 1)).map(|&l| (l, r)))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let pairs = if continuous.len() > per_disc.len() {
+        continuous
+    } else {
+        per_disc
+    };
+    // Numbers that match nothing are a sign they mean something else.
+    // Fall back to pairing on titles and lengths rather than trust them.
     (pairs.len() * 2 >= local.len()).then_some(pairs)
 }
 
@@ -389,6 +404,34 @@ mod tests {
         let m = score(&local, &release());
         assert_eq!(m.pairs, [(0, 1), (1, 0), (2, 2)]);
         assert!(m.distance < 0.05, "{}", m.distance);
+    }
+
+    #[test]
+    fn files_counted_straight_through_pair_with_sides_that_restart() {
+        let two_sides: Release = serde_json::from_value(serde_json::json!({
+            "id": "r", "title": "Geogaddi",
+            "artist-credit": [{"name": "Boards of Canada", "joinphrase": "", "artist": {"id": "a", "name": "Boards of Canada"}}],
+            "media": [
+                {"position": 1, "tracks": [
+                    {"id": "t1", "position": 1, "title": "Ready Lets Go", "length": 59000, "recording": {"id": "r1"}},
+                    {"id": "t2", "position": 2, "title": "Music Is Math", "length": 321000, "recording": {"id": "r2"}}
+                ]},
+                {"position": 2, "tracks": [
+                    {"id": "t3", "position": 1, "title": "Beware the Friendly Stranger", "length": 37000, "recording": {"id": "r3"}},
+                    {"id": "t4", "position": 2, "title": "Gyroscope", "length": 215000, "recording": {"id": "r4"}}
+                ]}
+            ]
+        }))
+        .unwrap();
+        let local = vec![
+            track("Ready Lets Go", Some(1), 59),
+            track("Music Is Math", Some(2), 321),
+            track("Beware the Friendly Stranger", Some(3), 37),
+            track("Gyroscope", Some(4), 215),
+        ];
+        let m = score(&local, &two_sides);
+        assert_eq!(m.pairs, [(0, 0), (1, 1), (2, 2), (3, 3)]);
+        assert!(m.is_complete());
     }
 
     #[test]
