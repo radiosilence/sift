@@ -194,6 +194,105 @@ pub async fn bin(
     Ok(dest)
 }
 
+/// Split beets' `modify` arguments into query terms and changes:
+/// `field=value` sets, `field!` clears, anything else is part of the query.
+pub fn split_modify_args(args: &[String]) -> Result<(Vec<String>, Vec<meta::Change>), String> {
+    let (mut query, mut changes) = (Vec::new(), Vec::new());
+    for a in args {
+        if let Some((f, v)) = a.split_once('=')
+            && !f.is_empty()
+            && f.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            if !meta::EDITABLE.contains(&f) {
+                return Err(format!(
+                    "{f} cannot be modified; editable: {}",
+                    meta::EDITABLE.join(", ")
+                ));
+            }
+            if matches!(f, "track" | "tracktotal" | "disc" | "disctotal")
+                && v.parse::<u32>().is_err()
+            {
+                return Err(format!("{f} takes a number, not {v:?}"));
+            }
+            changes.push((f.to_string(), Some(v.to_string())));
+        } else if let Some(f) = a.strip_suffix('!')
+            && meta::EDITABLE.contains(&f)
+        {
+            changes.push((f.to_string(), None));
+        } else {
+            query.push(a.clone());
+        }
+    }
+    Ok((query, changes))
+}
+
+/// What `modify` did.
+#[derive(Debug, Default)]
+pub struct ModifyReport {
+    pub files: Vec<PathBuf>,
+    pub moved: Vec<(PathBuf, PathBuf)>,
+    /// Albums whose tags changed but whose new place was refused, and why.
+    pub left: Vec<(PathBuf, String)>,
+}
+
+/// Change fields on the files `query` matches (every file of each matching
+/// album with `albums`), then re-file the albums whose path that changes.
+/// With `pretend`, only report which files would change.
+pub async fn modify(
+    cfg: &Config,
+    lib: &mut Library,
+    query: &crate::library::Query,
+    albums: bool,
+    changes: &[meta::Change],
+    pretend: bool,
+) -> Result<ModifyReport, LibraryError> {
+    let files: Vec<PathBuf> = if albums {
+        lib.albums(query)?
+            .into_iter()
+            .flat_map(|a| a.items.into_iter().map(|i| i.track.path))
+            .collect()
+    } else {
+        lib.items(query)?
+            .into_iter()
+            .map(|i| i.track.path)
+            .collect()
+    };
+    let mut report = ModifyReport {
+        files: files.clone(),
+        ..Default::default()
+    };
+    if pretend || changes.is_empty() {
+        return Ok(report);
+    }
+    for f in &files {
+        meta::set(f, changes).map_err(|e| LibraryError::Io(f.clone(), std::io::Error::other(e)))?;
+    }
+    lib.update(&cfg.directory)?;
+    let dirs: std::collections::HashSet<PathBuf> = files
+        .iter()
+        .filter_map(|f| f.parent().map(Path::to_path_buf))
+        .collect();
+    for album in lib.albums(&crate::library::Query::default())? {
+        if !dirs.contains(&album.dir) {
+            continue;
+        }
+        match plan_move(cfg, &album) {
+            Plan::InPlace => {}
+            Plan::Refused(why) => report.left.push((album.dir.clone(), why)),
+            Plan::Moves(moves) => {
+                let to = moves
+                    .first()
+                    .and_then(|m| m.to.parent())
+                    .map(Path::to_path_buf)
+                    .unwrap_or_default();
+                execute(lib, &album, &moves).await?;
+                report.moved.push((album.dir.clone(), to));
+            }
+        }
+    }
+    Ok(report)
+}
+
 /// Albums held more than once, and which copy to keep.
 #[derive(Debug)]
 pub struct Duplicate<'a> {
@@ -483,6 +582,55 @@ replace:
         lib.update(&lib_root).unwrap();
         let albums = lib.albums(&Query::default()).unwrap();
         assert!(duplicates(&cfg, &albums).is_empty());
+    }
+
+    #[test]
+    fn modify_arguments_split_into_query_and_changes() {
+        let args: Vec<String> = ["artist:burial", "album=Untrue", "genre!", "year:2007"]
+            .map(String::from)
+            .into();
+        let (query, changes) = split_modify_args(&args).unwrap();
+        assert_eq!(query, ["artist:burial", "year:2007"]);
+        assert_eq!(
+            changes,
+            [
+                ("album".to_string(), Some("Untrue".to_string())),
+                ("genre".to_string(), None)
+            ]
+        );
+        assert!(split_modify_args(&["path=/etc".to_string()]).is_err());
+        assert!(split_modify_args(&["track=two".to_string()]).is_err());
+    }
+
+    #[tokio::test]
+    async fn modify_changes_only_the_named_field_and_refiles_the_album() {
+        let root = tempfile::tempdir().unwrap();
+        let cfg = config(root.path());
+        let lib_root = root.path().join("lib");
+        let old = lib_root.join("Burial").join("(1994) Untru [WAV]");
+        for (n, title) in [(1, "Archangel"), (2, "Near Dark")] {
+            let path = old.join(format!("010{n}. Burial - {title}.wav"));
+            file(&path, "Burial", "Untru", title, n);
+            meta::set(&path, &[("genre".into(), Some("Garage".into()))]).unwrap();
+        }
+        let mut lib = Library::in_memory().unwrap();
+        lib.update(&lib_root).unwrap();
+        let query = crate::library::Query::parse(&["album:untru"]).unwrap();
+        let changes = [("album".to_string(), Some("Untrue".to_string()))];
+        let r = modify(&cfg, &mut lib, &query, true, &changes, false)
+            .await
+            .unwrap();
+        assert_eq!(r.files.len(), 2);
+        let new = lib_root.join("Burial").join("(1994) Untrue [WAV]");
+        assert_eq!(r.moved, [(old.clone(), new.clone())]);
+        let moved = new.join("0101. Burial - Archangel.wav");
+        let after = meta::read(&moved).unwrap();
+        assert_eq!(after.album.as_deref(), Some("Untrue"));
+        assert_eq!(
+            after.genre.as_deref(),
+            Some("Garage"),
+            "untouched fields survive"
+        );
     }
 
     #[tokio::test]

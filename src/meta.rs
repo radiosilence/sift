@@ -259,6 +259,97 @@ pub fn write(path: &Path, tags: &Tags, cover: Option<&[u8]>) -> Result<(), MetaE
     Ok(())
 }
 
+/// A field to set, by its beets name, or to clear with `None`.
+pub type Change = (String, Option<String>);
+
+/// A field `modify` can change, by its beets name.
+pub const EDITABLE: &[&str] = &[
+    "title",
+    "artist",
+    "album",
+    "albumartist",
+    "track",
+    "tracktotal",
+    "disc",
+    "disctotal",
+    "date",
+    "year",
+    "original_date",
+    "genre",
+    "label",
+    "catalognum",
+    "comp",
+];
+
+/// Set or clear only the named fields in `path`, leaving every other tag as
+/// it is. [`write`] replaces everything sift knows about, which is right for
+/// an import and wrong for correcting one field of a filed album.
+pub fn set(path: &Path, changes: &[Change]) -> Result<(), MetaError> {
+    raise_allocation_limit();
+    let mut file = lofty::probe::Probe::open(path)
+        .map_err(lofty(path))?
+        .read()
+        .map_err(lofty(path))?;
+    let tag_type = file.primary_tag_type();
+    if file.tag(tag_type).is_none() {
+        file.insert_tag(Tag::new(tag_type));
+    }
+    let tag = file
+        .tag_mut(tag_type)
+        .ok_or_else(|| MetaError::NoTag(path.to_path_buf()))?;
+    for (field, value) in changes {
+        let number = || value.as_deref().and_then(|v| v.parse::<u32>().ok());
+        match field.as_str() {
+            "track" => match number() {
+                Some(n) => tag.set_track(n),
+                None => tag.remove_track(),
+            },
+            "tracktotal" => match number() {
+                Some(n) => tag.set_track_total(n),
+                None => tag.remove_track_total(),
+            },
+            "disc" => match number() {
+                Some(n) => tag.set_disk(n),
+                None => tag.remove_disk(),
+            },
+            "disctotal" => match number() {
+                Some(n) => tag.set_disk_total(n),
+                None => tag.remove_disk_total(),
+            },
+            "comp" => {
+                tag.remove_key(ItemKey::FlagCompilation);
+                if value.as_deref().is_some_and(|v| v == "1" || v == "true") {
+                    tag.insert_text(ItemKey::FlagCompilation, "1".into());
+                }
+            }
+            name => {
+                let key = match name {
+                    "title" => ItemKey::TrackTitle,
+                    "artist" => ItemKey::TrackArtist,
+                    "album" => ItemKey::AlbumTitle,
+                    "albumartist" => ItemKey::AlbumArtist,
+                    "date" | "year" => ItemKey::RecordingDate,
+                    "original_date" => ItemKey::OriginalReleaseDate,
+                    "genre" => ItemKey::Genre,
+                    "label" => ItemKey::Label,
+                    "catalognum" => ItemKey::CatalogNumber,
+                    _ => continue,
+                };
+                tag.remove_key(key);
+                if name == "year" {
+                    tag.remove_key(ItemKey::Year);
+                }
+                if let Some(v) = value {
+                    tag.insert_text(key, v.clone());
+                }
+            }
+        }
+    }
+    tag.save_to_path(path, WriteOptions::default())
+        .map_err(lofty(path))?;
+    Ok(())
+}
+
 pub fn embedded_cover(path: &Path) -> Option<Vec<u8>> {
     let file = lofty::read_from_path(path).ok()?;
     let tag = file.primary_tag().or_else(|| file.first_tag())?;

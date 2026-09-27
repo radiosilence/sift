@@ -69,6 +69,18 @@ enum Command {
         #[arg(short, long)]
         verbose: bool,
     },
+    /// Change fields on matching files, beets-style: `sift modify QUERY
+    /// field=value field!`. Albums whose path the change affects are
+    /// re-filed.
+    Modify {
+        args: Vec<String>,
+        /// Every file of each matching album.
+        #[arg(short, long)]
+        album: bool,
+        /// List the files that would change, and change nothing.
+        #[arg(short, long)]
+        pretend: bool,
+    },
     /// Find albums held more than once and say which copy to keep.
     #[command(alias = "dup")]
     Duplicates {
@@ -178,6 +190,48 @@ async fn run() -> anyhow::Result<ExitCode> {
             }
             let verb = if pretend { "would move" } else { "moved" };
             println!("{moved} albums {verb}, {refused} left where they are");
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Modify {
+            args,
+            album,
+            pretend,
+        } => {
+            let (query, changes) = manage::split_modify_args(&args).map_err(anyhow::Error::msg)?;
+            anyhow::ensure!(
+                !changes.is_empty(),
+                "nothing to change: give field=value or field!"
+            );
+            anyhow::ensure!(
+                !query.is_empty(),
+                "give a query; modifying the whole library takes an explicit \"\""
+            );
+            let mut lib = Library::open(&index)?;
+            lib.update(&cfg.directory)?;
+            let r = manage::modify(
+                &cfg,
+                &mut lib,
+                &Query::parse(&query)?,
+                album,
+                &changes,
+                pretend,
+            )
+            .await?;
+            let verb = if pretend { "would change" } else { "changed" };
+            for f in &r.files {
+                println!("{verb}  {}", f.display());
+            }
+            for (from, to) in &r.moved {
+                println!("moved  {}  →  {}", from.display(), to.display());
+            }
+            for (dir, why) in &r.left {
+                eprintln!("left   {}: {why}", dir.display());
+            }
+            println!(
+                "{} files {verb}, {} albums re-filed",
+                r.files.len(),
+                r.moved.len()
+            );
             Ok(ExitCode::SUCCESS)
         }
         Command::Duplicates { query, bin } => {

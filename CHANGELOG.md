@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- `sift modify QUERY field=value field!` changes fields on matching files (`-a` for every file of matching albums, `-p` to list them first) and re-files the albums whose path that changes. Only the named fields are written, so a label, catalogue number or MusicBrainz id the index does not hold survives. Beets' `write` has no counterpart: the index never holds a value the files do not.
 - Files with no disc number that count straight through a release whose sides or discs restart at 1 (A1–A4 and B1–B4 as tracks 1–8) pair with every track, not only the first side's. Such a rip matched a vinyl release with half its tracks "missing" and the other half "extra".
 - `sift update` builds a library index (SQLite, in sift's data directory, never beets' `library.db`) from the files' tags, re-reading only files whose size or modification time changed. `sift ls` queries it with beets' syntax: `field:value`, `field::regex`, `field:=exact`, numeric ranges (`year:1990..1999`), `^`/`-` negation, `,` alternatives, `field+`/`field-` sorting, `-a` for albums, `-p` for paths and `-f` for a `$field` format. The index holds nothing the files do not, so deleting it loses nothing.
 - A file sift cannot read is remembered by size and modification time and not read again until it changes: a broken file can cost tens of MB each time lofty tries it. `Library::with_workers` limits how many files a scan reads at once, for callers short of memory; scans commit in batches of 2,000.
