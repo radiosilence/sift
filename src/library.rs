@@ -307,7 +307,23 @@ pub struct ScanReport {
 
 pub struct Library {
     conn: Connection,
+    workers: usize,
 }
+
+/// Files read and committed together during a scan.
+const BATCH: usize = 2000;
+
+const UPSERT: &str =
+    "INSERT INTO items (path, size, mtime, added, title, artist, album, albumartist,
+    track, tracktotal, disc, disctotal, date, genre, mb_trackid, mb_albumid,
+    format, bitrate, samplerate, bitdepth, length, original_date, compilation)
+ VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
+    ?17, ?18, ?19, ?20, ?21, ?22, ?23)
+ ON CONFLICT(path) DO UPDATE SET size = ?2, mtime = ?3, title = ?5, artist = ?6,
+    album = ?7, albumartist = ?8, track = ?9, tracktotal = ?10, disc = ?11,
+    disctotal = ?12, date = ?13, genre = ?14, mb_trackid = ?15, mb_albumid = ?16,
+    format = ?17, bitrate = ?18, samplerate = ?19, bitdepth = ?20, length = ?21,
+    original_date = ?22, compilation = ?23";
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS items (
@@ -320,6 +336,12 @@ CREATE TABLE IF NOT EXISTS items (
     date TEXT, original_date TEXT, compilation INTEGER NOT NULL DEFAULT 0, genre TEXT, mb_trackid TEXT, mb_albumid TEXT,
     format TEXT NOT NULL, bitrate INTEGER, samplerate INTEGER, bitdepth INTEGER,
     length REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS unreadable (
+    path TEXT PRIMARY KEY,
+    size INTEGER NOT NULL,
+    mtime INTEGER NOT NULL,
+    error TEXT NOT NULL
 );
 ";
 
@@ -368,13 +390,28 @@ impl Library {
         let conn = Connection::open(path)?;
         conn.execute_batch("PRAGMA journal_mode = WAL;")?;
         conn.execute_batch(SCHEMA)?;
-        Ok(Self { conn })
+        Ok(Self::with(conn))
+    }
+
+    fn with(conn: Connection) -> Self {
+        Self {
+            conn,
+            workers: std::thread::available_parallelism().map_or(4, |n| n.get().min(4)),
+        }
+    }
+
+    /// How many files a scan reads at once. A tag read is mostly waiting
+    /// on the disk, but a file lofty cannot parse can cost tens of MB while
+    /// it tries, so a memory-limited caller wants few.
+    pub fn with_workers(mut self, workers: usize) -> Self {
+        self.workers = workers.max(1);
+        self
     }
 
     pub fn in_memory() -> Result<Self, LibraryError> {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch(SCHEMA)?;
-        Ok(Self { conn })
+        Ok(Self::with(conn))
     }
 
     /// Bring the index in line with the files under `root`: read files that
@@ -386,6 +423,20 @@ impl Library {
             let mut stmt = self.conn.prepare("SELECT path, size, mtime FROM items")?;
             stmt.query_map([], |r| {
                 Ok((r.get(0)?, (r.get::<_, i64>(1)? as u64, r.get(2)?)))
+            })?
+            .collect::<Result<_, _>>()?
+        };
+        // Files that failed before are not read again until they change:
+        // a broken file costs a full read each time it is tried.
+        let failed: HashMap<String, ((u64, i64), String)> = {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT path, size, mtime, error FROM unreadable")?;
+            stmt.query_map([], |r| {
+                Ok((
+                    r.get(0)?,
+                    ((r.get::<_, i64>(1)? as u64, r.get(2)?), r.get(3)?),
+                ))
             })?
             .collect::<Result<_, _>>()?
         };
@@ -402,6 +453,13 @@ impl Library {
                 continue;
             };
             let stat = (m.len(), mtime_nanos(&m));
+            if let Some((was, error)) = failed.get(&key)
+                && *was == stat
+            {
+                report.failed.push((path, error.clone()));
+                seen.insert(key);
+                continue;
+            }
             match known.get(&key) {
                 Some(k) if *k == stat => report.unchanged += 1,
                 Some(_) => {
@@ -416,77 +474,87 @@ impl Library {
             seen.insert(key);
         }
 
-        let workers = std::thread::available_parallelism().map_or(4, |n| n.get());
-        let chunk = to_read.len().div_ceil(workers).max(1);
-        let results: Vec<_> = std::thread::scope(|s| {
-            let handles: Vec<_> = to_read
-                .chunks(chunk)
-                .map(|part| {
-                    s.spawn(move || {
-                        part.iter()
-                            .map(|(p, stat)| {
-                                (p.clone(), *stat, meta::read(p).map_err(|e| e.to_string()))
-                            })
-                            .collect::<Vec<_>>()
+        // Read and commit a batch at a time, so memory stays flat however
+        // large the library, and an interrupted first scan keeps what it
+        // had read.
+        let workers = self.workers;
+        let added = now_secs();
+        for batch in to_read.chunks(BATCH) {
+            let chunk = batch.len().div_ceil(workers).max(1);
+            let results: Vec<_> = std::thread::scope(|s| {
+                let handles: Vec<_> = batch
+                    .chunks(chunk)
+                    .map(|part| {
+                        s.spawn(move || {
+                            part.iter()
+                                .map(|(p, stat)| {
+                                    (p, *stat, meta::read(p).map_err(|e| e.to_string()))
+                                })
+                                .collect::<Vec<_>>()
+                        })
                     })
-                })
-                .collect();
-            handles
-                .into_iter()
-                .flat_map(|h| h.join().unwrap_or_default())
-                .collect()
-        });
+                    .collect();
+                handles
+                    .into_iter()
+                    .flat_map(|h| h.join().unwrap_or_default())
+                    .collect()
+            });
+            let tx = self.conn.transaction()?;
+            {
+                let mut upsert = tx.prepare(UPSERT)?;
+                for (path, (size, mtime), track) in results {
+                    let t = match track {
+                        Ok(t) => t,
+                        Err(e) => {
+                            tx.execute(
+                                "INSERT OR REPLACE INTO unreadable (path, size, mtime, error)
+                                 VALUES (?1, ?2, ?3, ?4)",
+                                params![path.to_str(), size as i64, mtime, e],
+                            )?;
+                            report.failed.push((path.clone(), e));
+                            continue;
+                        }
+                    };
+                    tx.execute("DELETE FROM unreadable WHERE path = ?1", [path.to_str()])?;
+                    upsert.execute(params![
+                        path.to_str(),
+                        size as i64,
+                        mtime,
+                        added,
+                        t.title,
+                        t.artist,
+                        t.album,
+                        t.album_artist,
+                        t.track,
+                        t.track_total,
+                        t.disc,
+                        t.disc_total,
+                        t.date,
+                        t.genre,
+                        t.mb_recording_id,
+                        t.mb_album_id,
+                        t.format,
+                        t.bitrate,
+                        t.sample_rate,
+                        t.bit_depth,
+                        t.duration.as_secs_f64(),
+                        t.original_date,
+                        t.compilation,
+                    ])?;
+                }
+            }
+            tx.commit()?;
+        }
 
         let tx = self.conn.transaction()?;
         {
-            let mut upsert = tx.prepare(
-                "INSERT INTO items (path, size, mtime, added, title, artist, album, albumartist,
-                    track, tracktotal, disc, disctotal, date, genre, mb_trackid, mb_albumid,
-                    format, bitrate, samplerate, bitdepth, length, original_date, compilation)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
-                    ?17, ?18, ?19, ?20, ?21, ?22, ?23)
-                 ON CONFLICT(path) DO UPDATE SET size = ?2, mtime = ?3, title = ?5, artist = ?6,
-                    album = ?7, albumartist = ?8, track = ?9, tracktotal = ?10, disc = ?11,
-                    disctotal = ?12, date = ?13, genre = ?14, mb_trackid = ?15, mb_albumid = ?16,
-                    format = ?17, bitrate = ?18, samplerate = ?19, bitdepth = ?20, length = ?21,
-                    original_date = ?22, compilation = ?23",
-            )?;
-            let added = now_secs();
-            for (path, (size, mtime), track) in results {
-                let t = match track {
-                    Ok(t) => t,
-                    Err(e) => {
-                        report.failed.push((path, e));
-                        continue;
-                    }
-                };
-                upsert.execute(params![
-                    path.to_str(),
-                    size as i64,
-                    mtime,
-                    added,
-                    t.title,
-                    t.artist,
-                    t.album,
-                    t.album_artist,
-                    t.track,
-                    t.track_total,
-                    t.disc,
-                    t.disc_total,
-                    t.date,
-                    t.genre,
-                    t.mb_recording_id,
-                    t.mb_album_id,
-                    t.format,
-                    t.bitrate,
-                    t.sample_rate,
-                    t.bit_depth,
-                    t.duration.as_secs_f64(),
-                    t.original_date,
-                    t.compilation,
-                ])?;
-            }
             let root = root.to_string_lossy();
+            let mut forget = tx.prepare("DELETE FROM unreadable WHERE path = ?1")?;
+            for path in failed.keys() {
+                if path.starts_with(root.as_ref()) && !seen.contains(path) {
+                    forget.execute([path])?;
+                }
+            }
             let mut delete = tx.prepare("DELETE FROM items WHERE path = ?1")?;
             for path in known.keys() {
                 if path.starts_with(root.as_ref()) && !seen.contains(path) {
