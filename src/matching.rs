@@ -103,14 +103,70 @@ pub fn base_title(s: &str) -> String {
 }
 
 pub fn string_distance(a: &str, b: &str) -> f64 {
-    let (a, b) = (normalise(a), normalise(b));
-    if a == b {
+    // Beets' `string_dist`, ported with its test suite: parts that differ
+    // between editions of the same thing (a leading "the", a bracketed
+    // version, a featured artist, "Pt. 2") cost a fraction of what the
+    // same number of different letters would.
+    static PATTERNS: std::sync::LazyLock<Vec<(regex::Regex, f64)>> =
+        std::sync::LazyLock::new(|| {
+            [
+                (r"^the ", 0.1),
+                (r"[\[\(]?(ep|single)[\]\)]?", 0.0),
+                (r"[\[\(]?(featuring|feat|ft)[\. :].+", 0.1),
+                (r"\(.*?\)", 0.3),
+                (r"\[.*?\]", 0.3),
+                (r"(, )?(pt\.|part) .+", 0.2),
+            ]
+            .into_iter()
+            .map(|(p, w)| (regex::Regex::new(p).expect("static regex"), w))
+            .collect()
+        });
+    let prepare = |s: &str| {
+        let mut s = s.to_lowercase();
+        for word in ["the", "a", "an"] {
+            if let Some(rest) = s.strip_suffix(&format!(", {word}")) {
+                s = format!("{word} {rest}");
+            }
+        }
+        s.replace('&', "and")
+    };
+    let (mut a, mut b) = (prepare(a), prepare(b));
+    let mut base = basic_distance(&a, &b);
+    let mut penalty = 0.0;
+    for (pattern, weight) in PATTERNS.iter() {
+        let (ca, cb) = (
+            pattern.replace_all(&a, "").into_owned(),
+            pattern.replace_all(&b, "").into_owned(),
+        );
+        if ca == a && cb == b {
+            continue;
+        }
+        let case = basic_distance(&ca, &cb);
+        let delta = (base - case).max(0.0);
+        if delta == 0.0 {
+            continue;
+        }
+        (a, b, base) = (ca, cb, case);
+        penalty += weight * delta;
+    }
+    base + penalty
+}
+
+/// Edit distance over letters and digits only, transliterated to ASCII,
+/// as a fraction of the longer string.
+fn basic_distance(a: &str, b: &str) -> f64 {
+    let clean = |s: &str| -> String {
+        deunicode::deunicode(s)
+            .to_lowercase()
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric())
+            .collect()
+    };
+    let (a, b) = (clean(a), clean(b));
+    if a.is_empty() && b.is_empty() {
         return 0.0;
     }
-    if a.is_empty() || b.is_empty() {
-        return 1.0;
-    }
-    1.0 - strsim::normalized_levenshtein(&a, &b)
+    strsim::levenshtein(&a, &b) as f64 / a.chars().count().max(b.chars().count()) as f64
 }
 
 /// Beets' flat allowance, widened in proportion for long tracks. A trimmed
@@ -380,6 +436,31 @@ mod tests {
             base_title("Music Has the Right to Children"),
             "Music Has the Right to Children"
         );
+    }
+
+    /// Beets' `StringDistanceTest`, case for case.
+    #[test]
+    fn string_distance_matches_beets() {
+        let d = string_distance;
+        assert_eq!(d("Some String", "Some String"), 0.0);
+        assert_ne!(d("Some String", "Totally Different"), 0.0);
+        assert_eq!(d("Some String", "Some.String!"), 0.0);
+        assert_eq!(d("Some String", "sOME sTring"), 0.0);
+        assert!(d("The Band Name", "Band Name") < d("XXX Band Name", "Band Name"));
+        assert!(d("One (Two)", "One") < d("One .Two.", "One"));
+        assert!(d("One [Two]", "One") < d("One .Two.", "One"));
+        assert_eq!(d("My Song (EP)", "My Song"), 0.0);
+        assert!(d("My Song feat. Someone", "My Song") < d("My Song blah Someone", "My Song"));
+        assert_eq!(d("The Song Title", "Song Title, The"), 0.0);
+        assert_eq!(d("A Song Title", "Song Title, A"), 0.0);
+        assert_eq!(d("An Album Title", "Album Title, An"), 0.0);
+        assert_eq!(d("", ""), 0.0);
+        for (a, b) in [("The ", ""), ("(EP)", "(EP)"), (", An", "")] {
+            assert!(d(a, b).is_finite());
+        }
+        assert_eq!(d("Untitled", "[Untitled]"), 0.0);
+        assert_eq!(d("And", "&"), 0.0);
+        assert_eq!(d("\u{e9}\u{e1}\u{f1}", "ean"), 0.0);
     }
 
     #[test]
