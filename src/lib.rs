@@ -1,6 +1,8 @@
 pub mod config;
 pub mod format;
 pub mod import;
+pub mod library;
+pub mod manage;
 pub mod matching;
 pub mod meta;
 pub mod musicbrainz;

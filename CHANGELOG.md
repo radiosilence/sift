@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- `sift update` builds a library index (SQLite, in sift's data directory, never beets' `library.db`) from the files' tags, re-reading only files whose size or modification time changed. `sift ls` queries it with beets' syntax: `field:value`, `field::regex`, `field:=exact`, numeric ranges (`year:1990..1999`), `^`/`-` negation, `,` alternatives, `field+`/`field-` sorting, `-a` for albums, `-p` for paths and `-f` for a `$field` format. The index holds nothing the files do not, so deleting it loses nothing.
+- `sift move` re-files albums where the current path rules put them, with `--pretend` to list the moves first. Every destination is planned before a file moves; an album whose plan collides with anything is left where it is and the reason printed. An album's cover and other files follow it when it changes directory, and directories it empties are removed.
+- `sift duplicates` finds albums held more than once (the same MusicBrainz release, or the same artist, album and track titles) and names the copy to keep: lossless over lossy, then more tracks, then higher resolution, then the one filed under the current rules. `--bin DIR` moves the others there, at their paths relative to the library; nothing is deleted. A copy counts only if the kept one has every track it has, so an album split across folders is not mistaken for a duplicate of itself.
+- Replacements that describe the edges of a name (`^\.`, `\.$`, `\s+$`) apply to each path component, as in beets, rather than to every field value inside it. "The Vertigo E.P. [MP3]" had been filed as "The Vertigo E.P- [MP3]", and "R.E.M." inside file names as "R.E.M-".
+- An original date of `0000`, which beets writes for an unknown date, no longer files an album under "(0000)"; the release year is used instead.
+- ALAC in MP4 is `ALAC` rather than `AAC`, so its folder says `[ALAC]` and it counts as lossless.
+
 - Importing an album that is already filed, every file the same recording in the same place, succeeds and moves nothing. A retry, or a second request queued behind the first, used to fail on the first file already present. A partial overlap is still refused, and nothing is ever overwritten.
 - `Importer::check_as_is` answers whether an import as-is would be accepted, and why not, without filing anything.
 - `Importer::compare` lines a folder up against one release track by track: pairs with title and length differences, and release tracks with no file and files with no track, for deciding a review.

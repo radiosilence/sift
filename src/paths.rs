@@ -14,9 +14,11 @@ use crate::musicbrainz::Release;
 /// `.part` or temporary suffix during a move.
 const COMPONENT_BYTES: usize = 240;
 
+/// The year of a date, if it has one. Beets writes `0000` for an unknown
+/// original date, and means nothing by it.
 fn year(date: Option<&str>) -> Option<String> {
     date.and_then(|d| d.get(..4))
-        .filter(|y| y.chars().all(|c| c.is_ascii_digit()))
+        .filter(|y| y.chars().all(|c| c.is_ascii_digit()) && *y != "0000")
         .map(str::to_string)
 }
 
@@ -73,7 +75,7 @@ pub fn render(
             "samplerate" => local.sample_rate.map(|r| r.to_string()),
             _ => None,
         }?;
-        let v = clean(cfg, &raw);
+        let v = clean_value(cfg, &raw);
         (!v.is_empty()).then_some(v)
     };
     let template = if tags.compilation {
@@ -149,14 +151,22 @@ pub fn collision_key(path: &Path) -> String {
     }
 }
 
-fn clean(cfg: &Config, s: &str) -> String {
+/// A field value before it is substituted: normalised, and with any
+/// separator made safe, since a separator inside a value is never meant as
+/// one. The configured replacements wait for the whole component, as in
+/// beets: `^\.` and `\.$` describe the edges of a name, and "E.P." in the
+/// middle of an album folder's name is not at one.
+fn clean_value(cfg: &Config, s: &str) -> String {
     let mut s: String = s.nfc().collect();
     if cfg.asciify_paths {
         s = deunicode::deunicode(&s);
     }
-    // A separator inside a value is never meant as one, whatever the
-    // configured replacements say.
-    s = s.replace(['/', '\0'], "-");
+    s.replace(['/', '\0'], "-")
+}
+
+/// A rendered path component, with the configured replacements applied.
+fn clean(cfg: &Config, s: &str) -> String {
+    let mut s = clean_value(cfg, s);
     for (re, with) in &cfg.replace {
         s = re.replace_all(&s, with.as_str()).into_owned();
     }
@@ -260,6 +270,49 @@ mod tests {
         assert_eq!(
             render(&cfg, &tags, &local, Some(&release())).unwrap(),
             "AC-DC/Live_ 1991/03 T.N.T_"
+        );
+    }
+
+    #[test]
+    fn edge_replacements_apply_to_the_edges_of_a_component_only() {
+        let cfg = Config {
+            directory: "/m".into(),
+            path_default: "%album artist%/%album% x/%title%".into(),
+            replace: vec![
+                (regex::Regex::new(r"\.$").unwrap(), "-".into()),
+                (regex::Regex::new(r"^\.").unwrap(), "-".into()),
+            ],
+            ..Config::default()
+        };
+        let tags = Tags {
+            album_artist: "R.E.M.".into(),
+            album: "The Vertigo E.P.".into(),
+            title: "...Kill All Your Friends...".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            render(&cfg, &tags, &Track::default(), None).unwrap(),
+            "R.E.M-/The Vertigo E.P. x/-..Kill All Your Friends..-"
+        );
+    }
+
+    #[test]
+    fn a_zero_original_year_falls_back_to_the_release_year() {
+        let cfg = Config {
+            directory: "/m".into(),
+            path_default: "[(%year%) ]%album%".into(),
+            original_date: true,
+            ..Config::default()
+        };
+        let tags = Tags {
+            album: "Swine Flu".into(),
+            date: Some("2009-03-01".into()),
+            original_date: Some("0000".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            render(&cfg, &tags, &Track::default(), None).unwrap(),
+            "(2009) Swine Flu"
         );
     }
 

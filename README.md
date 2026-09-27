@@ -9,6 +9,10 @@ $ brew install radiosilence/sift/sift         # or a static binary from the rele
 $ sift import ~/Downloads/some-album          # uses ~/.config/beets/config.yaml
 $ sift match ~/Downloads/some-album           # show candidates, change nothing
 $ sift import --search-id <mbid> <dir>        # apply a specific release
+$ sift update                                 # index the library
+$ sift ls -a year:1990..1999 format:FLAC      # beets query syntax
+$ sift move --pretend                         # what re-filing would change
+$ sift duplicates --bin ~/music-bin           # spare copies out of the library
 ```
 
 ## What it reads from a beets config
@@ -58,5 +62,16 @@ instead of disambiguated.
   cached on disk so a retried import asks for nothing twice. Cover art comes
   from the Cover Art Archive's own thumbnails, so no image is decoded or
   re-encoded here.
+
+- **The library index is derived, never authoritative.** `sift update`
+  reads the files into SQLite so queries are milliseconds instead of a read
+  of every file; it holds nothing the files do not, and beets' own
+  `library.db` is never read or written, since its schema is beets'
+  internals. Queries are evaluated in Rust rather than translated to SQL, so
+  their semantics are beets' exactly.
+- **Changing the library is album-at-a-time and planned first.** `move` and
+  `duplicates --bin` check every destination before any file moves and leave
+  an album alone rather than move part of it. Duplicates are moved to a bin,
+  not deleted.
 
 Many of these came from koan, where each was a bug first.

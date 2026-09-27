@@ -47,6 +47,10 @@ pub struct Track {
     pub disc: Option<u32>,
     pub disc_total: Option<u32>,
     pub date: Option<String>,
+    pub original_date: Option<String>,
+    /// Filed with the compilation template.
+    pub compilation: bool,
+    pub genre: Option<String>,
     pub mb_recording_id: Option<String>,
     pub mb_album_id: Option<String>,
     pub duration: Duration,
@@ -102,7 +106,13 @@ fn read_inner(path: &Path) -> Result<Track, MetaError> {
     let mut t = Track {
         path: path.to_path_buf(),
         duration: props.duration(),
-        format: format_name(file.file_type()).to_string(),
+        // An MP4 carries AAC or ALAC; lofty reports a bit depth only for
+        // the lossless one, so that is what tells them apart here.
+        format: match (file.file_type(), props.bit_depth()) {
+            (lofty::file::FileType::Mp4, Some(_)) => "ALAC",
+            (ft, _) => format_name(ft),
+        }
+        .to_string(),
         bitrate: props.audio_bitrate(),
         sample_rate: props.sample_rate(),
         bit_depth: props.bit_depth(),
@@ -124,6 +134,9 @@ fn read_inner(path: &Path) -> Result<Track, MetaError> {
         t.disc = tag.disk().filter(|d| *d > 0);
         t.disc_total = tag.disk_total();
         t.date = s(ItemKey::RecordingDate).or_else(|| s(ItemKey::Year));
+        t.original_date = s(ItemKey::OriginalReleaseDate);
+        t.compilation = s(ItemKey::FlagCompilation).is_some_and(|v| v == "1");
+        t.genre = tag.genre().map(|c| c.to_string());
         t.mb_recording_id = s(ItemKey::MusicBrainzRecordingId);
         t.mb_album_id = s(ItemKey::MusicBrainzReleaseId);
     }

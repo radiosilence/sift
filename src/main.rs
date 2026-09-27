@@ -4,6 +4,8 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
+use sift::library::{self, Library, Query};
+use sift::manage;
 use sift::{Config, Importer, Outcome};
 
 #[derive(Parser)]
@@ -20,6 +22,10 @@ struct Cli {
     /// Library directory, overriding the config's `directory`.
     #[arg(short = 'd', long, global = true)]
     directory: Option<PathBuf>,
+    /// Library index. Defaults to sift/library.db in the user data
+    /// directory; never beets' own library.db, whose schema is beets'.
+    #[arg(long, global = true)]
+    index: Option<PathBuf>,
     #[command(subcommand)]
     command: Command,
 }
@@ -51,6 +57,40 @@ enum Command {
     },
     /// Show the candidates for a directory without changing anything.
     Match { path: PathBuf },
+    /// Bring the library index in line with the files in the library.
+    Update,
+    /// Re-file matching albums where the current path rules put them.
+    Move {
+        query: Vec<String>,
+        /// Show what would move, and move nothing.
+        #[arg(short, long)]
+        pretend: bool,
+        /// List every file, not only each album.
+        #[arg(short, long)]
+        verbose: bool,
+    },
+    /// Find albums held more than once and say which copy to keep.
+    #[command(alias = "dup")]
+    Duplicates {
+        query: Vec<String>,
+        /// Move every copy but the best into this directory, at its path
+        /// relative to the library. Nothing is deleted.
+        #[arg(long)]
+        bin: Option<PathBuf>,
+    },
+    /// List items (or albums, with -a) matching a beets query.
+    #[command(alias = "list")]
+    Ls {
+        query: Vec<String>,
+        #[arg(short, long)]
+        album: bool,
+        /// Print paths rather than names.
+        #[arg(short, long)]
+        path: bool,
+        /// Output format, beets-style: `$artist - $title`.
+        #[arg(short, long)]
+        format: Option<String>,
+    },
 }
 
 #[tokio::main]
@@ -79,7 +119,126 @@ async fn run() -> anyhow::Result<ExitCode> {
         "no library directory: pass --directory or set `directory` in the config"
     );
 
+    let index = cli
+        .index
+        .clone()
+        .or_else(|| dirs::data_dir().map(|d| d.join("sift").join("library.db")))
+        .ok_or_else(|| anyhow::anyhow!("no data directory: pass --index"))?;
+
     match cli.command {
+        Command::Update => {
+            let mut lib = Library::open(&index)?;
+            let r = lib.update(&cfg.directory)?;
+            for (_, e) in &r.failed {
+                eprintln!("unreadable  {e}");
+            }
+            println!(
+                "{} added, {} changed, {} removed, {} unchanged, {} unreadable",
+                r.added,
+                r.changed,
+                r.removed,
+                r.unchanged,
+                r.failed.len()
+            );
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Move {
+            query,
+            pretend,
+            verbose,
+        } => {
+            let mut lib = Library::open(&index)?;
+            lib.update(&cfg.directory)?;
+            let (mut moved, mut refused) = (0, 0);
+            for album in lib.albums(&Query::parse(&query)?)? {
+                match manage::plan_move(&cfg, &album) {
+                    manage::Plan::InPlace => {}
+                    manage::Plan::Refused(why) => {
+                        refused += 1;
+                        eprintln!("left  {}: {why}", album.dir.display());
+                    }
+                    manage::Plan::Moves(moves) => {
+                        let to = moves
+                            .first()
+                            .and_then(|m| m.to.parent())
+                            .unwrap_or(&album.dir)
+                            .to_path_buf();
+                        println!("move  {}  →  {}", album.dir.display(), to.display());
+                        if verbose {
+                            for m in &moves {
+                                println!("        {}  →  {}", m.from.display(), m.to.display());
+                            }
+                        }
+                        if !pretend {
+                            manage::execute(&lib, &album, &moves).await?;
+                        }
+                        moved += 1;
+                    }
+                }
+            }
+            let verb = if pretend { "would move" } else { "moved" };
+            println!("{moved} albums {verb}, {refused} left where they are");
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Duplicates { query, bin } => {
+            let mut lib = Library::open(&index)?;
+            lib.update(&cfg.directory)?;
+            let albums = lib.albums(&Query::parse(&query)?)?;
+            let dupes = manage::duplicates(&cfg, &albums);
+            for d in &dupes {
+                println!("keep  {}", d.keep.dir.display());
+                for (other, why) in &d.others {
+                    match &bin {
+                        Some(bin) => {
+                            let dest = manage::bin(&lib, &cfg.directory, bin, other).await?;
+                            println!(
+                                "  bin {}  ({why})  →  {}",
+                                other.dir.display(),
+                                dest.display()
+                            );
+                        }
+                        None => println!("  dup {}  ({why})", other.dir.display()),
+                    }
+                }
+            }
+            println!("{} albums held more than once", dupes.len());
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Ls {
+            query,
+            album,
+            path,
+            format,
+        } => {
+            let lib = Library::open(&index)?;
+            let query = Query::parse(&query)?;
+            let fmt = match (format, path, album) {
+                (Some(f), _, _) => f,
+                (None, true, _) => "$path".to_string(),
+                (None, false, true) => "$albumartist - $album".to_string(),
+                (None, false, false) => "$artist - $album - $title".to_string(),
+            };
+            let lines: Vec<String> = if album {
+                lib.albums(&query)?
+                    .iter()
+                    .map(|a| library::format(&fmt, |f| a.field(f)))
+                    .collect()
+            } else {
+                lib.items(&query)?
+                    .iter()
+                    .map(|i| library::format(&fmt, |f| i.field(f)))
+                    .collect()
+            };
+            // A reader that stops early (`| head`) is not an error.
+            use std::io::Write;
+            let mut out = std::io::stdout().lock();
+            for line in lines {
+                if writeln!(out, "{line}").is_err() {
+                    break;
+                }
+            }
+            Ok(ExitCode::SUCCESS)
+        }
         Command::Import {
             paths,
             search_id,
