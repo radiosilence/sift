@@ -1,3 +1,4 @@
+pub mod check;
 pub mod config;
 pub mod format;
 pub mod import;

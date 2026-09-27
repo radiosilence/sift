@@ -81,6 +81,11 @@ enum Command {
         #[arg(short, long)]
         pretend: bool,
     },
+    /// Decode matching files and list those whose audio is damaged
+    /// (truncated, corrupt packets, FLAC MD5 mismatch). Results are kept
+    /// until a file changes, so a re-run checks only what is new.
+    #[command(alias = "badfiles")]
+    Bad { query: Vec<String> },
     /// Summarise the library, or the part of it a query matches.
     Stats { query: Vec<String> },
     /// List tracks and discs that matching albums' own totals say are absent.
@@ -216,6 +221,32 @@ async fn run() -> anyhow::Result<ExitCode> {
             let verb = if pretend { "would move" } else { "moved" };
             say!("{moved} albums {verb}, {refused} left where they are");
             Ok(ExitCode::SUCCESS)
+        }
+        Command::Bad { query } => {
+            let mut lib = Library::open(&index)?;
+            lib.update(&cfg.directory)?;
+            let items = lib.items(&Query::parse(&query)?)?;
+            let verdicts = lib.check(&items)?;
+            let (mut bad, mut unchecked) = (0, 0);
+            for (path, v) in &verdicts {
+                match v {
+                    sift::check::Verdict::Bad(why) => {
+                        bad += 1;
+                        say!("{}: {why}", path.display());
+                    }
+                    sift::check::Verdict::Unchecked(_) => unchecked += 1,
+                    sift::check::Verdict::Ok => {}
+                }
+            }
+            say!(
+                "{} files checked: {bad} damaged, {unchecked} in formats that cannot be checked here",
+                verdicts.len()
+            );
+            Ok(if bad > 0 {
+                ExitCode::from(1)
+            } else {
+                ExitCode::SUCCESS
+            })
         }
         Command::Stats { query } => {
             let mut lib = Library::open(&index)?;

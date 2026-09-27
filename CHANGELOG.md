@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- `sift bad` (alias `badfiles`) decodes matching files and lists those whose audio is damaged: truncated, with corrupt packets, or not matching FLAC's stored MD5. Decoding is symphonia's, so no external tool is needed; Opus, which it cannot decode, is reported as unchecked rather than passed. A verdict is kept until the file changes, so a re-run checks only what is new; the first run over a large library takes an hour or more.
+- A file that changes and then cannot be read leaves the index, rather than keeping the row it had before it broke.
 - `sift stats` summarises tracks, albums, artists, size, playing time and formats. `sift missing` lists tracks and discs that an album's own track and disc totals say are absent; an album numbered straight through its discs is judged as one sequence. `sift remove QUERY --bin DIR` moves albums out of the library rather than deleting them, since removing a file from the index alone would be undone by the next scan. Output to a reader that stops early (`| head`) ends quietly.
 - `sift modify QUERY field=value field!` changes fields on matching files (`-a` for every file of matching albums, `-p` to list them first) and re-files the albums whose path that changes. Only the named fields are written, so a label, catalogue number or MusicBrainz id the index does not hold survives. Beets' `write` has no counterpart: the index never holds a value the files do not.
 - Files with no disc number that count straight through a release whose sides or discs restart at 1 (A1–A4 and B1–B4 as tracks 1–8) pair with every track, not only the first side's. Such a rip matched a vinyl release with half its tracks "missing" and the other half "extra".

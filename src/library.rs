@@ -337,6 +337,12 @@ CREATE TABLE IF NOT EXISTS items (
     format TEXT NOT NULL, bitrate INTEGER, samplerate INTEGER, bitdepth INTEGER,
     length REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS checks (
+    path TEXT PRIMARY KEY,
+    size INTEGER NOT NULL,
+    mtime INTEGER NOT NULL,
+    verdict TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS unreadable (
     path TEXT PRIMARY KEY,
     size INTEGER NOT NULL,
@@ -511,6 +517,8 @@ impl Library {
                                  VALUES (?1, ?2, ?3, ?4)",
                                 params![path.to_str(), size as i64, mtime, e],
                             )?;
+                            // What it was before it broke is not what it is.
+                            tx.execute("DELETE FROM items WHERE path = ?1", [path.to_str()])?;
                             report.failed.push((path.clone(), e));
                             continue;
                         }
@@ -565,6 +573,80 @@ impl Library {
         }
         tx.commit()?;
         Ok(report)
+    }
+
+    /// Check the audio of `items` that have not been checked since they
+    /// last changed, record the results, and return every item's verdict.
+    /// A full decode is slow (a large library takes hours), so each result
+    /// is kept until the file's size or modification time changes.
+    pub fn check(
+        &mut self,
+        items: &[Item],
+    ) -> Result<Vec<(PathBuf, crate::check::Verdict)>, LibraryError> {
+        use crate::check::Verdict;
+        let known: HashMap<String, ((u64, i64), String)> = {
+            let mut stmt = self
+                .conn
+                .prepare("SELECT path, size, mtime, verdict FROM checks")?;
+            stmt.query_map([], |r| {
+                Ok((
+                    r.get(0)?,
+                    ((r.get::<_, i64>(1)? as u64, r.get(2)?), r.get(3)?),
+                ))
+            })?
+            .collect::<Result<_, _>>()?
+        };
+        let decode = |s: &str| match s.split_once(':') {
+            Some(("bad", why)) => Verdict::Bad(why.to_string()),
+            Some(("unchecked", why)) => Verdict::Unchecked(why.to_string()),
+            _ => Verdict::Ok,
+        };
+        let encode = |v: &Verdict| match v {
+            Verdict::Ok => "ok".to_string(),
+            Verdict::Bad(why) => format!("bad:{why}"),
+            Verdict::Unchecked(why) => format!("unchecked:{why}"),
+        };
+        let mut out = Vec::new();
+        let mut todo = Vec::new();
+        for i in items {
+            let key = i.track.path.to_string_lossy().into_owned();
+            match known.get(&key) {
+                Some((stat, v)) if *stat == (i.size, i.mtime) => {
+                    out.push((i.track.path.clone(), decode(v)))
+                }
+                _ => todo.push(i),
+            }
+        }
+        let workers = self.workers;
+        for batch in todo.chunks(BATCH / 10) {
+            let chunk = batch.len().div_ceil(workers).max(1);
+            let results: Vec<_> = std::thread::scope(|s| {
+                let handles: Vec<_> = batch
+                    .chunks(chunk)
+                    .map(|part| {
+                        s.spawn(move || {
+                            part.iter()
+                                .map(|i| (*i, crate::check::check(&i.track.path)))
+                                .collect::<Vec<_>>()
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .flat_map(|h| h.join().unwrap_or_default())
+                    .collect()
+            });
+            let tx = self.conn.transaction()?;
+            for (i, v) in results {
+                tx.execute(
+                    "INSERT OR REPLACE INTO checks (path, size, mtime, verdict) VALUES (?1, ?2, ?3, ?4)",
+                    params![i.track.path.to_string_lossy(), i.size as i64, i.mtime, encode(&v)],
+                )?;
+                out.push((i.track.path.clone(), v));
+            }
+            tx.commit()?;
+        }
+        Ok(out)
     }
 
     /// Drop a file that left the library.
