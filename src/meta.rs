@@ -382,6 +382,37 @@ pub fn set_replaygain(
     Ok(())
 }
 
+/// Write lyrics, leaving every other tag alone.
+pub fn set_lyrics(path: &Path, lyrics: &str) -> Result<(), MetaError> {
+    raise_allocation_limit();
+    let mut file = lofty::probe::Probe::open(path)
+        .map_err(lofty(path))?
+        .read()
+        .map_err(lofty(path))?;
+    let tag_type = file.primary_tag_type();
+    if file.tag(tag_type).is_none() {
+        file.insert_tag(Tag::new(tag_type));
+    }
+    let tag = file
+        .tag_mut(tag_type)
+        .ok_or_else(|| MetaError::NoTag(path.to_path_buf()))?;
+    tag.remove_key(ItemKey::Lyrics);
+    tag.insert_text(ItemKey::Lyrics, lyrics.to_string());
+    tag.save_to_path(path, WriteOptions::default())
+        .map_err(lofty(path))?;
+    Ok(())
+}
+
+/// Whether `path` already carries lyrics.
+pub fn has_lyrics(path: &Path) -> bool {
+    lofty::read_from_path(path).is_ok_and(|f| {
+        f.primary_tag().or_else(|| f.first_tag()).is_some_and(|t| {
+            t.get_string(ItemKey::Lyrics)
+                .is_some_and(|l| !l.trim().is_empty())
+        })
+    })
+}
+
 /// Whether `path` already carries an album gain.
 pub fn has_album_gain(path: &Path) -> bool {
     lofty::read_from_path(path).is_ok_and(|f| {

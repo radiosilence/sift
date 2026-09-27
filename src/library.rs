@@ -337,6 +337,11 @@ CREATE TABLE IF NOT EXISTS items (
     format TEXT NOT NULL, bitrate INTEGER, samplerate INTEGER, bitdepth INTEGER,
     length REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS lyrics_misses (
+    path TEXT PRIMARY KEY,
+    size INTEGER NOT NULL,
+    mtime INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS checks (
     path TEXT PRIMARY KEY,
     size INTEGER NOT NULL,
@@ -647,6 +652,30 @@ impl Library {
             tx.commit()?;
         }
         Ok(out)
+    }
+
+    /// Items lyrics were looked for and not found, unchanged since.
+    pub fn lyrics_misses(&self) -> Result<HashMap<String, (u64, i64)>, LibraryError> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT path, size, mtime FROM lyrics_misses")?;
+        Ok(stmt
+            .query_map([], |r| {
+                Ok((r.get(0)?, (r.get::<_, i64>(1)? as u64, r.get(2)?)))
+            })?
+            .collect::<Result<_, _>>()?)
+    }
+
+    pub fn record_lyrics_miss(&self, item: &Item) -> Result<(), LibraryError> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO lyrics_misses (path, size, mtime) VALUES (?1, ?2, ?3)",
+            params![
+                item.track.path.to_string_lossy(),
+                item.size as i64,
+                item.mtime
+            ],
+        )?;
+        Ok(())
     }
 
     /// Drop a file that left the library.

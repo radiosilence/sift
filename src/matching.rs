@@ -264,12 +264,19 @@ fn pair_by_number(local: &[Track], release: &Release) -> Option<Vec<(usize, usiz
         .enumerate()
         .filter_map(|(r, (m, t))| by_number.get(&(m.position, t.position)).map(|&l| (l, r)))
         .collect();
-    // Files with no disc number are often counted straight through a
-    // release whose sides or discs restart at 1 (A1–A4, B1–B4 as 1–8).
-    // Numbered per disc, only the first side would pair.
-    let continuous: Vec<(usize, usize)> = if local.iter().all(|t| t.disc.unwrap_or(1) == 1) {
+    // Track numbers are often counted straight through the album while
+    // one side or the other splits it differently: files numbered 1–8 with
+    // no disc (or with B-side tracks 5–8 on "disc 2") against a release on
+    // one medium, or on two that each restart at 1. When no two files share
+    // a number, try the numbers as positions in the whole release.
+    let mut overall = HashMap::new();
+    let unique = local
+        .iter()
+        .enumerate()
+        .all(|(i, t)| t.track.is_some_and(|n| overall.insert(n, i).is_none()));
+    let continuous: Vec<(usize, usize)> = if unique {
         (0..release.tracks().count())
-            .filter_map(|r| by_number.get(&(1, r as u32 + 1)).map(|&l| (l, r)))
+            .filter_map(|r| overall.get(&(r as u32 + 1)).map(|&l| (l, r)))
             .collect()
     } else {
         Vec::new()
@@ -404,6 +411,19 @@ mod tests {
         let m = score(&local, &release());
         assert_eq!(m.pairs, [(0, 1), (1, 0), (2, 2)]);
         assert!(m.distance < 0.05, "{}", m.distance);
+    }
+
+    #[test]
+    fn a_second_disc_numbered_on_from_the_first_pairs_with_one_medium() {
+        let mut local = vec![
+            track("Ready Lets Go", Some(1), 59),
+            track("Music Is Math", Some(2), 321),
+            track("Beware the Friendly Stranger", Some(3), 37),
+        ];
+        local[2].disc = Some(2);
+        let m = score(&local, &release());
+        assert_eq!(m.pairs, [(0, 0), (1, 1), (2, 2)]);
+        assert!(m.is_complete());
     }
 
     #[test]

@@ -94,6 +94,15 @@ enum Command {
     /// until a file changes, so a re-run checks only what is new.
     #[command(alias = "badfiles")]
     Bad { query: Vec<String> },
+    /// Fetch lyrics from LRCLIB for matching tracks that have none: synced
+    /// where available, plain otherwise. Tracks already looked up and not
+    /// found are not asked for again until they change; -f asks again and
+    /// replaces lyrics already present.
+    Lyrics {
+        query: Vec<String>,
+        #[arg(short, long)]
+        force: bool,
+    },
     /// Measure and write ReplayGain 2.0 track and album gain for matching
     /// albums. Albums already carrying album gain are skipped unless -f.
     Replaygain {
@@ -262,6 +271,56 @@ async fn run() -> anyhow::Result<ExitCode> {
             } else {
                 ExitCode::SUCCESS
             })
+        }
+        Command::Lyrics { query, force } => {
+            use sift::lyrics::Lyrics;
+            let mut lib = Library::open(&index)?;
+            lib.update(&cfg.directory)?;
+            let misses = if force {
+                Default::default()
+            } else {
+                lib.lyrics_misses()?
+            };
+            let client = sift::lyrics::Client::new();
+            let (mut synced, mut plain, mut none) = (0, 0, 0);
+            for item in lib.items(&Query::parse(&query)?)? {
+                let t = &item.track;
+                let key = t.path.to_string_lossy().into_owned();
+                if misses.get(&key) == Some(&(item.size, item.mtime))
+                    || (!force && sift::meta::has_lyrics(&t.path))
+                {
+                    continue;
+                }
+                let (Some(artist), Some(title)) = (&t.artist, &t.title) else {
+                    continue;
+                };
+                let found = client
+                    .get(
+                        artist,
+                        title,
+                        t.album.as_deref().unwrap_or(""),
+                        t.duration.as_secs(),
+                    )
+                    .await;
+                match found {
+                    Ok(Lyrics::Synced(l)) => {
+                        sift::meta::set_lyrics(&t.path, &l)?;
+                        synced += 1;
+                    }
+                    Ok(Lyrics::Plain(l)) => {
+                        sift::meta::set_lyrics(&t.path, &l)?;
+                        plain += 1;
+                    }
+                    Ok(Lyrics::Instrumental | Lyrics::NotFound) => {
+                        lib.record_lyrics_miss(&item)?;
+                        none += 1;
+                    }
+                    Err(e) => eprintln!("{}: {e}", t.path.display()),
+                }
+            }
+            lib.update(&cfg.directory)?;
+            say!("{synced} synced, {plain} plain, {none} without lyrics");
+            Ok(ExitCode::SUCCESS)
         }
         Command::Replaygain { query, force } => {
             let mut lib = Library::open(&index)?;
