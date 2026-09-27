@@ -8,6 +8,7 @@ pub mod matching;
 pub mod meta;
 pub mod musicbrainz;
 pub mod paths;
+pub mod replaygain;
 
 pub use config::Config;
 pub use import::{Candidate, Comparison, Edits, ImportError, Importer, Outcome, TrackEdit};

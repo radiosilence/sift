@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- `sift replaygain QUERY` writes ReplayGain 2.0 track and album gain and sample peak: EBU R128 loudness against -18 LUFS, measured on symphonia's decode with the `ebur128` crate, so no external tool is needed. Albums already carrying album gain are skipped unless `-f`. Only the four ReplayGain fields are written.
 - `sift import -L QUERY` re-imports albums already in the library (`--search-id` to apply a given release), as beets' `import -L` does, and `sift mbsync QUERY` refreshes albums from the release they were tagged with, without matching again. `Importer::reimport` retags files that stay where they are in place, moves those the new tags file elsewhere, and takes the album's other files along when its directory changes.
 - `sift bad` (alias `badfiles`) decodes matching files and lists those whose audio is damaged: truncated, with corrupt packets, or not matching FLAC's stored MD5. Decoding is symphonia's, so no external tool is needed; Opus, which it cannot decode, is reported as unchecked rather than passed. A verdict is kept until the file changes, so a re-run checks only what is new; the first run over a large library takes an hour or more.
 - A file that changes and then cannot be read leaves the index, rather than keeping the row it had before it broke.

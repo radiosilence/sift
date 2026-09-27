@@ -350,6 +350,47 @@ pub fn set(path: &Path, changes: &[Change]) -> Result<(), MetaError> {
     Ok(())
 }
 
+/// Write ReplayGain track and album gain, leaving every other tag alone.
+pub fn set_replaygain(
+    path: &Path,
+    track: crate::replaygain::Gain,
+    album: crate::replaygain::Gain,
+) -> Result<(), MetaError> {
+    raise_allocation_limit();
+    let mut file = lofty::probe::Probe::open(path)
+        .map_err(lofty(path))?
+        .read()
+        .map_err(lofty(path))?;
+    let tag_type = file.primary_tag_type();
+    if file.tag(tag_type).is_none() {
+        file.insert_tag(Tag::new(tag_type));
+    }
+    let tag = file
+        .tag_mut(tag_type)
+        .ok_or_else(|| MetaError::NoTag(path.to_path_buf()))?;
+    for (key, value) in [
+        (ItemKey::ReplayGainTrackGain, format!("{:.2} dB", track.db)),
+        (ItemKey::ReplayGainTrackPeak, format!("{:.6}", track.peak)),
+        (ItemKey::ReplayGainAlbumGain, format!("{:.2} dB", album.db)),
+        (ItemKey::ReplayGainAlbumPeak, format!("{:.6}", album.peak)),
+    ] {
+        tag.remove_key(key);
+        tag.insert_text(key, value);
+    }
+    tag.save_to_path(path, WriteOptions::default())
+        .map_err(lofty(path))?;
+    Ok(())
+}
+
+/// Whether `path` already carries an album gain.
+pub fn has_album_gain(path: &Path) -> bool {
+    lofty::read_from_path(path).is_ok_and(|f| {
+        f.primary_tag()
+            .or_else(|| f.first_tag())
+            .is_some_and(|t| t.get_string(ItemKey::ReplayGainAlbumGain).is_some())
+    })
+}
+
 pub fn embedded_cover(path: &Path) -> Option<Vec<u8>> {
     let file = lofty::read_from_path(path).ok()?;
     let tag = file.primary_tag().or_else(|| file.first_tag())?;

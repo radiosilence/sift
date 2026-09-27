@@ -94,6 +94,13 @@ enum Command {
     /// until a file changes, so a re-run checks only what is new.
     #[command(alias = "badfiles")]
     Bad { query: Vec<String> },
+    /// Measure and write ReplayGain 2.0 track and album gain for matching
+    /// albums. Albums already carrying album gain are skipped unless -f.
+    Replaygain {
+        query: Vec<String>,
+        #[arg(short, long)]
+        force: bool,
+    },
     /// Summarise the library, or the part of it a query matches.
     Stats { query: Vec<String> },
     /// List tracks and discs that matching albums' own totals say are absent.
@@ -255,6 +262,38 @@ async fn run() -> anyhow::Result<ExitCode> {
             } else {
                 ExitCode::SUCCESS
             })
+        }
+        Command::Replaygain { query, force } => {
+            let mut lib = Library::open(&index)?;
+            lib.update(&cfg.directory)?;
+            let workers = std::thread::available_parallelism().map_or(4, |n| n.get().min(4));
+            let (mut done, mut skipped, mut failed) = (0, 0, 0);
+            for album in lib.albums(&Query::parse(&query)?)? {
+                let paths: Vec<PathBuf> =
+                    album.items.iter().map(|i| i.track.path.clone()).collect();
+                if !force && paths.iter().all(|p| sift::meta::has_album_gain(p)) {
+                    skipped += 1;
+                    continue;
+                }
+                match sift::replaygain::album(&paths, workers) {
+                    Ok((tracks, album_gain)) => {
+                        for (p, g) in paths.iter().zip(tracks) {
+                            sift::meta::set_replaygain(p, g, album_gain)?;
+                        }
+                        done += 1;
+                        say!("{:+.2} dB  {}", album_gain.db, album.dir.display());
+                    }
+                    Err(e) => {
+                        failed += 1;
+                        eprintln!("skipped  {}: {e}", album.dir.display());
+                    }
+                }
+            }
+            lib.update(&cfg.directory)?;
+            say!(
+                "{done} albums measured, {skipped} already had gain, {failed} could not be measured"
+            );
+            Ok(ExitCode::SUCCESS)
         }
         Command::Stats { query } => {
             let mut lib = Library::open(&index)?;
