@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- `sift genres QUERY` sets genres from MusicBrainz on albums that have none (`-f` for all): the release's, else its release group's, else its artist's, most voted first, at most three, and none with under a third of the top genre's votes. MusicBrainz's genre list is curated, so it serves as the whitelist beets' `lastgenre` keeps by hand; names are title-cased with acronyms kept ("UK Garage", "IDM") and joined with "; ". Only the genre tag is written.
 - `sift lyrics QUERY` fetches lyrics from LRCLIB (no key needed) for tracks without them, preferring time-synced LRC and writing only the lyrics tag. Tracks looked up without success are not asked for again until they change; `-f` asks again and replaces existing lyrics.
 - `sift replaygain QUERY` writes ReplayGain 2.0 track and album gain and sample peak: EBU R128 loudness against -18 LUFS, measured on symphonia's decode with the `ebur128` crate, so no external tool is needed. Albums already carrying album gain are skipped unless `-f`. Only the four ReplayGain fields are written.
 - `sift import -L QUERY` re-imports albums already in the library (`--search-id` to apply a given release), as beets' `import -L` does, and `sift mbsync QUERY` refreshes albums from the release they were tagged with, without matching again. `Importer::reimport` retags files that stay where they are in place, moves those the new tags file elsewhere, and takes the album's other files along when its directory changes.

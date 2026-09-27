@@ -94,6 +94,14 @@ enum Command {
     /// until a file changes, so a re-run checks only what is new.
     #[command(alias = "badfiles")]
     Bad { query: Vec<String> },
+    /// Set genres from MusicBrainz on matching albums that have none (all
+    /// matching albums with -f): the release's, its release group's or its
+    /// artist's genres, most voted first, at most three.
+    Genres {
+        query: Vec<String>,
+        #[arg(short, long)]
+        force: bool,
+    },
     /// Fetch lyrics from LRCLIB for matching tracks that have none: synced
     /// where available, plain otherwise. Tracks already looked up and not
     /// found are not asked for again until they change; -f asks again and
@@ -271,6 +279,52 @@ async fn run() -> anyhow::Result<ExitCode> {
             } else {
                 ExitCode::SUCCESS
             })
+        }
+        Command::Genres { query, force } => {
+            let mut lib = Library::open(&index)?;
+            lib.update(&cfg.directory)?;
+            let mut mb = sift::musicbrainz::MusicBrainz::new(&cfg.musicbrainz_contact);
+            if let Some(dir) = &cfg.cache_dir {
+                mb = mb.with_cache(dir.join("musicbrainz"));
+            }
+            let (mut set, mut none) = (0, 0);
+            for album in lib.albums(&Query::parse(&query)?)? {
+                let Some(id) = album
+                    .items
+                    .first()
+                    .and_then(|i| i.track.mb_album_id.clone())
+                else {
+                    continue;
+                };
+                if !force
+                    && album.items.iter().all(|i| {
+                        i.track
+                            .genre
+                            .as_deref()
+                            .is_some_and(|g| !g.trim().is_empty())
+                    })
+                {
+                    continue;
+                }
+                match mb.genres(&id).await {
+                    Ok(g) if g.is_empty() => none += 1,
+                    Ok(g) => {
+                        let genre = g.join("; ");
+                        for i in &album.items {
+                            sift::meta::set(
+                                &i.track.path,
+                                &[("genre".into(), Some(genre.clone()))],
+                            )?;
+                        }
+                        set += 1;
+                        say!("{genre}  {}", album.dir.display());
+                    }
+                    Err(e) => eprintln!("{}: {e}", album.dir.display()),
+                }
+            }
+            lib.update(&cfg.directory)?;
+            say!("{set} albums given genres, {none} with none on MusicBrainz");
+            Ok(ExitCode::SUCCESS)
         }
         Command::Lyrics { query, force } => {
             use sift::lyrics::Lyrics;

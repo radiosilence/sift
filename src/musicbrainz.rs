@@ -176,6 +176,63 @@ impl MusicBrainz {
         Ok(found.releases)
     }
 
+    /// Genres for a release, most voted first: the release's own, else its
+    /// release group's (where MusicBrainz users mostly tag albums), else
+    /// the credited artist's. At most three, and none with under a third of
+    /// the top genre's votes, so one stray tag does not make the list.
+    pub async fn genres(&self, release_id: &str) -> Result<Vec<String>, MbError> {
+        #[derive(serde::Deserialize, Default)]
+        struct Genre {
+            name: String,
+            #[serde(default)]
+            count: u32,
+        }
+        #[derive(serde::Deserialize, Default)]
+        struct Tagged {
+            #[serde(default)]
+            genres: Vec<Genre>,
+        }
+        #[derive(serde::Deserialize)]
+        struct Credit {
+            artist: Tagged,
+        }
+        #[derive(serde::Deserialize)]
+        struct R {
+            #[serde(default)]
+            genres: Vec<Genre>,
+            #[serde(rename = "release-group", default)]
+            release_group: Tagged,
+            #[serde(rename = "artist-credit", default)]
+            artist_credit: Vec<Credit>,
+        }
+        let r: R = self
+            .get(
+                &format!("release/{release_id}"),
+                &[("inc", "genres+release-groups+artist-credits")],
+            )
+            .await?;
+        let mut genres = [
+            r.genres,
+            r.release_group.genres,
+            r.artist_credit
+                .into_iter()
+                .next()
+                .map(|c| c.artist.genres)
+                .unwrap_or_default(),
+        ]
+        .into_iter()
+        .find(|g| !g.is_empty())
+        .unwrap_or_default();
+        genres.sort_by(|a, b| b.count.cmp(&a.count).then(a.name.cmp(&b.name)));
+        let top = genres.first().map_or(0, |g| g.count);
+        Ok(genres
+            .into_iter()
+            .filter(|g| g.count * 3 >= top)
+            .take(3)
+            .map(|g| title_case(&g.name))
+            .collect())
+    }
+
     pub async fn release(&self, id: &str) -> Result<Release, MbError> {
         self.get(
             &format!("release/{id}"),
@@ -186,6 +243,30 @@ impl MusicBrainz {
         )
         .await
     }
+}
+
+/// "future garage" as "Future Garage", keeping the acronyms genre names
+/// use in capitals ("UK Garage", "IDM").
+fn title_case(name: &str) -> String {
+    const UPPER: &[&str] = &["uk", "us", "idm", "ebm", "edm", "dnb", "r&b", "rnb", "ost"];
+    name.split(' ')
+        .map(|w| {
+            if UPPER.contains(&w) {
+                w.to_uppercase()
+            } else {
+                w.split('-')
+                    .map(|p| {
+                        let mut c = p.chars();
+                        c.next()
+                            .map(|f| f.to_uppercase().chain(c).collect())
+                            .unwrap_or_default()
+                    })
+                    .collect::<Vec<String>>()
+                    .join("-")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Escape the characters Lucene gives meaning to, so a title like
@@ -401,6 +482,14 @@ pub struct Recording {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn genre_names_are_title_cased_with_acronyms_kept() {
+        assert_eq!(title_case("future garage"), "Future Garage");
+        assert_eq!(title_case("uk garage"), "UK Garage");
+        assert_eq!(title_case("lo-fi house"), "Lo-Fi House");
+        assert_eq!(title_case("idm"), "IDM");
+    }
 
     #[test]
     fn a_nearly_spent_budget_is_waited_out() {

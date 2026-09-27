@@ -91,3 +91,17 @@ async fn an_unreachable_service_is_transient() {
     // out, not reported.
     assert!(err.is_err());
 }
+
+#[tokio::test]
+async fn genres_come_from_the_release_group_when_the_release_has_none() {
+    let body = r#"{"genres":[],
+        "release-group":{"genres":[{"name":"dubstep","count":5},{"name":"future garage","count":4},{"name":"electronic","count":2},{"name":"hauntology","count":1}]},
+        "artist-credit":[{"artist":{"genres":[{"name":"ambient","count":9}]}}]}"#;
+    let (base, _) = serve(vec![(200, "", body)]).await;
+    let mb = MusicBrainz::with_base(&base, "test");
+    assert_eq!(
+        mb.genres("rel").await.unwrap(),
+        ["Dubstep", "Future Garage", "Electronic"],
+        "top three, none under a third of the top's votes"
+    );
+}
