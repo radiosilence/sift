@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.3
+
+- **`duplicates` pairs one album tagged two ways.** It matched on the MusicBrainz release id, or on album artist, album and every track title exactly, so an album filed under two artist spellings ("Black Sun Empire" and "Black Sun Empire, State Of Mind, …") or with titles spelled differently ("Dark Thing" / "Dark Ting") went unpaired. Albums with the same title and track count now also pair when each track, in order, is within 3 seconds in length and closely titled; a spare paired this way is reported as "the same album, tagged differently" when the copies are otherwise equal. Two editions with different track lists still do not pair.
+
 ## 0.3.2
 
 - **An import files under the folder already there when the names differ only in case.** Tags spell an act "The Squire Of Gothos" on one record and "of" on the next; each spelling made its own artist folder (or, on a case-insensitive disk, a collision). Each directory of the destination now takes the spelling of one already on disk that matches it ignoring case, preferring an exact match, so an artist stays in one folder under the name it was first filed as. Applies to imports and to re-filing alike.

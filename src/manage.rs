@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 
 use crate::config::Config;
 use crate::library::{Album, Item, Library, LibraryError};
+use crate::matching;
 use crate::meta::{self, Tags, Track};
 use crate::paths;
 
@@ -398,21 +399,52 @@ fn why(keep: (bool, usize, u32, u8, bool), other: (bool, usize, u32, u8, bool)) 
 }
 
 /// Whether `album` has the recording `item` is: by MusicBrainz recording id
-/// when both have one, by title otherwise.
+/// when both have one, by a close title otherwise.
 fn contains(album: &Album, item: &Item) -> bool {
-    let norm = |s: &Option<String>| s.as_deref().unwrap_or("").trim().to_lowercase();
     album.items.iter().any(
         |k| match (&k.track.mb_recording_id, &item.track.mb_recording_id) {
             (Some(a), Some(b)) => a == b,
-            _ => norm(&k.track.title) == norm(&item.track.title),
+            _ => close_titles(&k.track.title, &item.track.title),
         },
     )
+}
+
+/// How far apart two track titles may be and still name one recording:
+/// "Dark Thing" and "Dark Ting", "VIP" and "V.I.P".
+const TITLE_DISTANCE: f64 = 0.3;
+
+/// How far apart two copies of one track may be in length.
+const LENGTH_SLACK: std::time::Duration = std::time::Duration::from_secs(3);
+
+fn close_titles(a: &Option<String>, b: &Option<String>) -> bool {
+    let (a, b) = (a.as_deref().unwrap_or(""), b.as_deref().unwrap_or(""));
+    a.trim().eq_ignore_ascii_case(b.trim()) || matching::string_distance(a, b) <= TITLE_DISTANCE
+}
+
+fn in_order(a: &Album) -> Vec<&Item> {
+    let mut items: Vec<&Item> = a.items.iter().collect();
+    items.sort_by_key(|i| (i.track.disc.unwrap_or(1), i.track.track.unwrap_or(0)));
+    items
+}
+
+/// The same music tagged differently: the same album title and number of
+/// tracks, each track the same length and closely titled, in order. What
+/// pairs two copies whose album artist is spelled differently, or whose
+/// track titles are, which the exact key cannot.
+fn same_music(a: &Album, b: &Album) -> bool {
+    let (a, b) = (in_order(a), in_order(b));
+    a.len() == b.len()
+        && a.iter().zip(&b).all(|(x, y)| {
+            x.track.duration.abs_diff(y.track.duration) <= LENGTH_SLACK
+                && close_titles(&x.track.title, &y.track.title)
+        })
 }
 
 /// Albums that are the same release. With MusicBrainz ids, the same release
 /// id; without, the same album artist, album and track titles, compared
 /// case-insensitively, so two editions with different track lists are not
-/// called duplicates.
+/// called duplicates. Beyond those exact matches, albums with the same title
+/// that are [`same_music`] are one album under two spellings.
 pub fn duplicates<'a>(cfg: &Config, albums: &'a [Album]) -> Vec<Duplicate<'a>> {
     let key = |a: &Album| -> Option<String> {
         let first: &Item = a.items.first()?;
@@ -434,11 +466,55 @@ pub fn duplicates<'a>(cfg: &Config, albums: &'a [Album]) -> Vec<Duplicate<'a>> {
             titles.join("\u{1f}")
         ))
     };
-    let mut groups: HashMap<String, Vec<&Album>> = HashMap::new();
-    for a in albums {
-        if let Some(k) = key(a) {
-            groups.entry(k).or_default().push(a);
+    // Groups are joined by index: first by the exact key, then pairwise
+    // within albums sharing a title and a track count.
+    let mut parent: Vec<usize> = (0..albums.len()).collect();
+    fn root(parent: &mut [usize], mut i: usize) -> usize {
+        while parent[i] != i {
+            parent[i] = parent[parent[i]];
+            i = parent[i];
         }
+        i
+    }
+    fn join(parent: &mut [usize], a: usize, b: usize) {
+        let (a, b) = (root(parent, a), root(parent, b));
+        parent[a] = b;
+    }
+    let mut exact: HashMap<String, usize> = HashMap::new();
+    let mut titled: HashMap<(String, usize), Vec<usize>> = HashMap::new();
+    for (i, a) in albums.iter().enumerate() {
+        let Some(k) = key(a) else { continue };
+        if let Some(&j) = exact.get(&k) {
+            join(&mut parent, i, j);
+        } else {
+            exact.insert(k, i);
+        }
+        let title = a.items[0].track.album.as_deref().unwrap_or("");
+        titled
+            .entry((
+                matching::normalise(&matching::base_title(title)),
+                a.items.len(),
+            ))
+            .or_default()
+            .push(i);
+    }
+    for ((title, _), members) in &titled {
+        if title.is_empty() {
+            continue;
+        }
+        for (n, &i) in members.iter().enumerate() {
+            for &j in &members[n + 1..] {
+                if root(&mut parent, i) != root(&mut parent, j)
+                    && same_music(&albums[i], &albums[j])
+                {
+                    join(&mut parent, i, j);
+                }
+            }
+        }
+    }
+    let mut groups: HashMap<usize, Vec<&Album>> = HashMap::new();
+    for (i, a) in albums.iter().enumerate() {
+        groups.entry(root(&mut parent, i)).or_default().push(a);
     }
     let mut out: Vec<Duplicate> = groups
         .into_values()
@@ -454,7 +530,15 @@ pub fn duplicates<'a>(cfg: &Config, albums: &'a [Album]) -> Vec<Duplicate<'a>> {
             let others: Vec<_> = g[1..]
                 .iter()
                 .filter(|a| a.items.iter().all(|i| contains(keep, i)))
-                .map(|a| (*a, why(k, rank(cfg, a))))
+                .map(|a| {
+                    let reason = match why(k, rank(cfg, a)) {
+                        "identical copy" if key(a) != key(keep) => {
+                            "the same album, tagged differently"
+                        }
+                        reason => reason,
+                    };
+                    (*a, reason)
+                })
                 .collect();
             (!others.is_empty()).then_some(Duplicate { keep, others })
         })
@@ -735,5 +819,70 @@ replace:
         lib.update(&lib_root).unwrap();
         let albums = lib.albums(&Query::default()).unwrap();
         assert!(duplicates(&cfg, &albums).is_empty());
+    }
+
+    fn dupes_of(files: &[(&str, &str, &str, &str, u32)]) -> usize {
+        let root = tempfile::tempdir().unwrap();
+        let cfg = config(root.path());
+        let lib_root = root.path().join("lib");
+        for (path, artist, album, title, n) in files {
+            file(&lib_root.join(path), artist, album, title, *n);
+        }
+        let mut lib = Library::in_memory().unwrap();
+        lib.update(&lib_root).unwrap();
+        let albums = lib.albums(&Query::default()).unwrap();
+        duplicates(&cfg, &albums).len()
+    }
+
+    #[tokio::test]
+    async fn one_album_under_two_artist_spellings_is_a_duplicate() {
+        let group = "Black Sun Empire, State Of Mind";
+        assert_eq!(
+            dupes_of(&[
+                (
+                    "x/1.wav",
+                    "Black Sun Empire",
+                    "Consume The Power",
+                    "Arrakis",
+                    1
+                ),
+                (
+                    "x/2.wav",
+                    "Black Sun Empire",
+                    "Consume The Power",
+                    "Dawn",
+                    2
+                ),
+                ("y/1.wav", group, "Consume The Power", "Arrakis", 1),
+                ("y/2.wav", group, "Consume The Power", "Dawn", 2),
+            ]),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn track_titles_spelled_differently_are_a_duplicate() {
+        assert_eq!(
+            dupes_of(&[
+                ("x/1.wav", "A", "We Do Scorpion Things", "Dark Thing", 1),
+                ("x/2.wav", "A", "We Do Scorpion Things", "Til da Mornin", 2),
+                ("y/1.wav", "A", "We Do Scorpion Things", "Dark Ting", 1),
+                ("y/2.wav", "A", "We Do Scorpion Things", "Til Da Morning", 2),
+            ]),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn same_title_and_length_with_other_tracks_is_not_a_duplicate() {
+        assert_eq!(
+            dupes_of(&[
+                ("x/1.wav", "A", "B", "One", 1),
+                ("x/2.wav", "A", "B", "Two", 2),
+                ("y/1.wav", "C", "B", "Something Else", 1),
+                ("y/2.wav", "C", "B", "Entirely", 2),
+            ]),
+            0
+        );
     }
 }
