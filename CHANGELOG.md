@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.0
 
 - A release with no date of its own (MusicBrainz's placeholder "0000" counts as none) takes its release group's first release date instead, as beets' `yearfixer` plugin does; a release group with no date leaves the release's own date standing in for it. An as-is import whose files carry no date at all now looks the album up by artist and title and uses the release group's date on an exact match, so it is never filed with a year missing that MusicBrainz has.
 - beets' `ftintitle` plugin: when the `ftintitle` plugin is listed and `ftintitle.auto` is not `false`, a track artist naming a featured artist beyond the album artist (`"Burial feat. Four Tet"` under album artist `"Burial"`) is filed under the album artist alone, with the featured artist folded into the title. `ftintitle.drop` discards the featured artist instead, and `ftintitle.format` (default `"feat. {0}"`) controls how it is added; a title already crediting a featured artist is left alone.
