@@ -40,7 +40,8 @@ enum Command {
         /// retagging them and re-filing any whose tags move them.
         #[arg(short = 'L', long)]
         library: bool,
-        /// Apply this MusicBrainz release, whatever the match distance.
+        /// Apply this release, whatever the match distance: a MusicBrainz
+        /// id, or `discogs:<id>` for one from Discogs.
         #[arg(long = "search-id")]
         search_id: Option<String>,
         /// File by the files' own tags without MusicBrainz, as beets' `-A`

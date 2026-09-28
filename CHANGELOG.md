@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.0
+
+- Discogs is consulted as a second metadata source, as beets' `discogs` plugin does: when MusicBrainz's best match is not close enough to apply, and the `discogs` plugin is enabled with a token (`discogs.user_token` or `DISCOGS_TOKEN`), the same artist and album are searched on Discogs and its releases compete with MusicBrainz's on match distance. A Discogs release id is namespaced `discogs:<number>` (`--search-id discogs:<number>` applies one directly) and carries no MusicBrainz identifiers of its own; its cover art comes from Discogs rather than the Cover Art Archive.
+
 ## 0.2.0
 
 - A release with no date of its own (MusicBrainz's placeholder "0000" counts as none) takes its release group's first release date instead, as beets' `yearfixer` plugin does; a release group with no date leaves the release's own date standing in for it. An as-is import whose files carry no date at all now looks the album up by artist and title and uses the release group's date on an exact match, so it is never filed with a year missing that MusicBrainz has.

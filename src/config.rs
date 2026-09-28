@@ -73,6 +73,9 @@ pub struct Config {
     /// beets' `ftintitle` plugin: fold a featured artist out of the track
     /// artist and into the title. `None` when the plugin isn't enabled.
     pub ft_in_title: Option<FtInTitle>,
+    /// Set only when the `discogs` plugin is listed and a token is
+    /// available, from `discogs.user_token` or `DISCOGS_TOKEN`.
+    pub discogs: Option<DiscogsConf>,
 }
 
 #[derive(Debug, Clone)]
@@ -81,6 +84,13 @@ pub struct FtInTitle {
     pub drop: bool,
     /// Where `{0}` is the featured artist, e.g. `"feat. {0}"`.
     pub format: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct DiscogsConf {
+    pub token: String,
+    /// Prefix a medley's sub-tracks with the enclosing index track's title.
+    pub index_tracks: bool,
 }
 
 /// The template beets ships with, translated.
@@ -108,6 +118,7 @@ impl Default for Config {
             cache_dir: dirs::cache_dir().map(|d| d.join("sift")),
             import_added: false,
             ft_in_title: None,
+            discogs: None,
         }
     }
 }
@@ -183,6 +194,8 @@ struct Raw {
     embedart: RawArt,
     #[serde(rename = "match", default)]
     matching: RawMatch,
+    #[serde(default)]
+    discogs: RawDiscogs,
     ftintitle: Option<RawFtInTitle>,
 }
 
@@ -212,6 +225,12 @@ struct RawArt {
 #[derive(Debug, Default, Deserialize)]
 struct RawMatch {
     strong_rec_thresh: Option<f64>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawDiscogs {
+    user_token: Option<String>,
+    index_tracks: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -251,6 +270,9 @@ impl Config {
         let mut ft_auto = None;
         let mut ft_drop = None;
         let mut ft_format = None;
+        let mut discogs_enabled = false;
+        let mut discogs_token = None;
+        let mut discogs_index_tracks = false;
         for raw in layers {
             if let Some(d) = raw.directory {
                 cfg.directory = expand(&d);
@@ -324,6 +346,9 @@ impl Config {
                 ft_drop = ft.drop.or(ft_drop);
                 ft_format = ft.format.or(ft_format);
             }
+            discogs_enabled |= raw.plugins.contains("discogs");
+            discogs_token = raw.discogs.user_token.or(discogs_token);
+            discogs_index_tracks = raw.discogs.index_tracks.unwrap_or(discogs_index_tracks);
         }
         cfg.fetch_art = fetchart;
         if let Some(w) = art_width {
@@ -347,6 +372,14 @@ impl Config {
         if let Some(h) = art_high_resolution {
             cfg.art_high_resolution = h;
         }
+        let token = std::env::var("DISCOGS_TOKEN").ok().or(discogs_token);
+        cfg.discogs = discogs_enabled
+            .then_some(token)
+            .flatten()
+            .map(|token| DiscogsConf {
+                token,
+                index_tracks: discogs_index_tracks,
+            });
         // No `directory` is allowed: a shared base config often leaves it to
         // a per-machine file, and a caller may set it after loading. Whoever
         // imports checks it is set.

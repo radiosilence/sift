@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 
 use crate::art::{self, ArtRules};
 use crate::config::Config;
+use crate::discogs::{Discogs, DiscogsError};
 use crate::matching::{self, Match};
 use crate::meta::{self, Tags, Track};
 use crate::musicbrainz::{MbError, MusicBrainz, Release};
@@ -20,6 +21,8 @@ pub enum ImportError {
     Meta(#[from] meta::MetaError),
     #[error(transparent)]
     MusicBrainz(#[from] MbError),
+    #[error(transparent)]
+    Discogs(#[from] DiscogsError),
     #[error("{0}")]
     Io(#[from] std::io::Error),
     #[error(transparent)]
@@ -42,6 +45,7 @@ impl ImportError {
     /// changing here.
     pub fn is_transient(&self) -> bool {
         matches!(self, Self::MusicBrainz(e) if e.is_transient())
+            || matches!(self, Self::Discogs(e) if e.is_transient())
     }
 }
 
@@ -100,9 +104,26 @@ pub enum Outcome {
     },
 }
 
+/// Which service a release id belongs to. `discogs:<number>` ids are
+/// namespaced; a MusicBrainz id is a UUID and never contains a colon.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Source {
+    MusicBrainz,
+    Discogs,
+}
+
+pub fn source_of(id: &str) -> Source {
+    if id.starts_with("discogs:") {
+        Source::Discogs
+    } else {
+        Source::MusicBrainz
+    }
+}
+
 pub struct Importer {
     pub cfg: Config,
     mb: MusicBrainz,
+    discogs: Option<Discogs>,
     http: reqwest::Client,
 }
 
@@ -126,10 +147,25 @@ impl Importer {
         if let Some(dir) = &cfg.cache_dir {
             mb = mb.with_cache(dir.join("musicbrainz"));
         }
-        Self::with_musicbrainz(cfg, mb)
+        let discogs = cfg.discogs.as_ref().map(|d| {
+            let mut discogs = Discogs::new(&d.token, &cfg.musicbrainz_contact);
+            if let Some(dir) = &cfg.cache_dir {
+                discogs = discogs.with_cache(dir.clone());
+            }
+            discogs
+        });
+        Self::with_clients(cfg, mb, discogs)
     }
 
     pub fn with_musicbrainz(cfg: Config, mb: MusicBrainz) -> Self {
+        let discogs = cfg
+            .discogs
+            .as_ref()
+            .map(|d| Discogs::new(&d.token, &cfg.musicbrainz_contact));
+        Self::with_clients(cfg, mb, discogs)
+    }
+
+    fn with_clients(cfg: Config, mb: MusicBrainz, discogs: Option<Discogs>) -> Self {
         let http = reqwest::Client::builder()
             .user_agent(format!(
                 "sift/{} ( {} )",
@@ -139,7 +175,12 @@ impl Importer {
             .timeout(std::time::Duration::from_secs(60))
             .build()
             .expect("static client config");
-        Self { cfg, mb, http }
+        Self {
+            cfg,
+            mb,
+            discogs,
+            http,
+        }
     }
 
     /// Match and import `dir`. With `release_id`, that release is applied
@@ -253,7 +294,7 @@ impl Importer {
         }
 
         let mut matches = match release_id {
-            Some(id) => vec![matching::score(&tracks, &self.mb.release(id).await?)],
+            Some(id) => vec![matching::score(&tracks, &self.release(id).await?)],
             None => self.candidates(dir, &tracks, &mut log).await?,
         };
         matches.sort_by(|a, b| a.distance.total_cmp(&b.distance));
@@ -377,7 +418,7 @@ impl Importer {
     /// what differs if it nearly is.
     pub async fn compare(&self, dir: &Path, release_id: &str) -> Result<Comparison, ImportError> {
         let (tracks, _) = one_copy_each(read_dir(dir).await?);
-        let release = self.mb.release(release_id).await?;
+        let release = self.release(release_id).await?;
         let m = matching::score(&tracks, &release);
         let remote: Vec<_> = release.tracks().collect();
         let name = |t: &Track| {
@@ -437,6 +478,25 @@ impl Importer {
         })
     }
 
+    /// A release by id, dispatched to whichever service it names.
+    async fn release(&self, id: &str) -> Result<Release, ImportError> {
+        match source_of(id) {
+            Source::MusicBrainz => Ok(self.mb.release(id).await?),
+            Source::Discogs => {
+                let num: u64 = id
+                    .trim_start_matches("discogs:")
+                    .parse()
+                    .map_err(|_| ImportError::Conflict(format!("{id:?} is not a valid id")))?;
+                let discogs = self
+                    .discogs
+                    .as_ref()
+                    .ok_or_else(|| ImportError::Conflict("discogs is not configured".into()))?;
+                let index_tracks = self.cfg.discogs.as_ref().is_some_and(|d| d.index_tracks);
+                Ok(discogs.release(num, index_tracks).await?)
+            }
+        }
+    }
+
     async fn candidates(
         &self,
         dir: &Path,
@@ -480,10 +540,39 @@ impl Importer {
             }
             releases.push(self.mb.release(&hit.id).await?);
         }
-        Ok(releases
+        let mut matches: Vec<Match> = releases
             .iter()
             .map(|r| matching::score(tracks, r))
-            .collect())
+            .collect();
+
+        // MusicBrainz found nothing worth applying on its own: ask Discogs
+        // for the same artist and album, and let the two compete on distance.
+        let best = matches
+            .iter()
+            .map(|m| m.distance)
+            .fold(f64::INFINITY, f64::min);
+        if let Some(discogs) = &self.discogs
+            && best > self.cfg.strong_threshold
+        {
+            let _ = writeln!(log, "searching discogs for {artist:?} — {album:?}");
+            match discogs.search(&artist, &album).await {
+                Ok(ids) => {
+                    let index_tracks = self.cfg.discogs.as_ref().is_some_and(|d| d.index_tracks);
+                    for id in ids.into_iter().take(5) {
+                        match discogs.release(id, index_tracks).await {
+                            Ok(r) => matches.push(matching::score(tracks, &r)),
+                            Err(e) => {
+                                let _ = writeln!(log, "discogs release {id}: {e}");
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    let _ = writeln!(log, "discogs search failed: {e}");
+                }
+            }
+        }
+        Ok(matches)
     }
 
     /// Artist and album from the tags, or from the folder name when the
@@ -756,6 +845,8 @@ impl Importer {
             &album_artist,
             rt.title.clone(),
         );
+        // A Discogs release carries none of MusicBrainz's own identifiers.
+        let mb_ids = source_of(&release.id) == Source::MusicBrainz;
         Tags {
             title,
             artist,
@@ -772,16 +863,23 @@ impl Importer {
             country: release.country.clone(),
             media: medium.and_then(|m| m.format.clone()),
             compilation: release.is_compilation(),
-            mb_recording_id: Some(rt.recording.id.clone()),
-            mb_track_id: Some(rt.id.clone()),
-            mb_album_id: Some(release.id.clone()),
-            mb_artist_id: rt
-                .artist_credit
-                .first()
-                .or(release.artist_credit.first())
-                .map(|c| c.artist.id.clone()),
-            mb_album_artist_id: release.artist_credit.first().map(|c| c.artist.id.clone()),
-            mb_release_group_id: release.release_group.as_ref().map(|g| g.id.clone()),
+            mb_recording_id: mb_ids.then(|| rt.recording.id.clone()),
+            mb_track_id: mb_ids.then(|| rt.id.clone()),
+            mb_album_id: mb_ids.then(|| release.id.clone()),
+            mb_artist_id: mb_ids
+                .then(|| {
+                    rt.artist_credit
+                        .first()
+                        .or(release.artist_credit.first())
+                        .map(|c| c.artist.id.clone())
+                })
+                .flatten(),
+            mb_album_artist_id: mb_ids
+                .then(|| release.artist_credit.first().map(|c| c.artist.id.clone()))
+                .flatten(),
+            mb_release_group_id: mb_ids
+                .then(|| release.release_group.as_ref().map(|g| g.id.clone()))
+                .flatten(),
         }
     }
 
@@ -803,14 +901,36 @@ impl Importer {
         }
     }
 
-    /// The release's front cover from the Cover Art Archive, then the
-    /// release group's, then whatever the files already carry. When
+    /// The release's front cover: for a Discogs release, its primary image;
+    /// otherwise the Cover Art Archive's, then the release group's. When
     /// `art_high_resolution` is set, each source's full-size original is
-    /// tried before its thumbnail. A candidate narrower than `art_min_width`
-    /// or failing `art_ratio` is skipped for the next one; one wider than
-    /// `art_max_width` is resized down and re-encoded as JPEG at
-    /// `art_quality`.
+    /// tried before its thumbnail. Whatever the files already carry comes
+    /// last. A candidate narrower than `art_min_width` or failing `art_ratio`
+    /// is skipped for the next one; one wider than `art_max_width` is resized
+    /// down and re-encoded as JPEG at `art_quality`.
     async fn cover(&self, release: Option<&Release>, tracks: &[Track]) -> Option<CoverArt> {
+        let rules = ArtRules {
+            min_width: self.cfg.art_min_width,
+            max_width: self.cfg.art_max_width,
+            quality: self.cfg.art_quality,
+            ratio: self.cfg.art_ratio,
+        };
+        if let Some(release) = release
+            && source_of(&release.id) == Source::Discogs
+        {
+            if let (Some(url), Some(discogs)) = (&release.cover_url, &self.discogs)
+                && let Ok(bytes) = discogs.image(url).await
+                && !bytes.is_empty()
+                && let Some(prepared) = prepare(bytes.to_vec(), rules).await
+            {
+                return Some(CoverArt {
+                    bytes: prepared.bytes,
+                    source: "discogs",
+                    resized: prepared.resized,
+                });
+            }
+            return Self::embedded_cover(tracks, rules).await;
+        }
         let size = match self.cfg.art_max_width {
             w if w >= 1200 => "1200",
             w if w >= 500 => "500",
@@ -847,12 +967,6 @@ impl Importer {
                 ));
             }
         }
-        let rules = ArtRules {
-            min_width: self.cfg.art_min_width,
-            max_width: self.cfg.art_max_width,
-            quality: self.cfg.art_quality,
-            ratio: self.cfg.art_ratio,
-        };
         for (url, source) in candidates {
             if let Ok(resp) = self.http.get(&url).send().await
                 && resp.status().is_success()
@@ -867,6 +981,11 @@ impl Importer {
                 });
             }
         }
+        Self::embedded_cover(tracks, rules).await
+    }
+
+    /// Whatever the files already carry, under the same rules as fetched art.
+    async fn embedded_cover(tracks: &[Track], rules: ArtRules) -> Option<CoverArt> {
         let first = tracks.first()?.path.clone();
         let embedded = tokio::task::spawn_blocking(move || meta::embedded_cover(&first))
             .await
@@ -1521,6 +1640,15 @@ mod tests {
         assert_eq!(
             q("/s/Boards of Canada/(2002) Geogaddi [FLAC 24-96]"),
             ("Boards of Canada".into(), "Geogaddi".into())
+        );
+    }
+
+    #[test]
+    fn a_discogs_prefixed_id_is_dispatched_to_discogs() {
+        assert_eq!(source_of("discogs:123"), Source::Discogs);
+        assert_eq!(
+            source_of("f2f5b8f4-8c1f-4e6b-9d6a-1234567890ab"),
+            Source::MusicBrainz
         );
     }
 }

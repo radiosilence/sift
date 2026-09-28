@@ -28,6 +28,14 @@ $ sift missing ; sift bad ; sift stats         # gaps, damaged audio, totals
 the `plugins`, and `embedart`/`fetchart` `maxwidth`. Everything else is
 ignored rather than rejected.
 
+Discogs is consulted as a second source, as beets' `discogs` plugin does,
+when MusicBrainz has no match under `match.strong_rec_thresh` and the
+`plugins` list includes `discogs`. It needs a personal access token, from
+`discogs.user_token` or the `DISCOGS_TOKEN` environment variable, generated
+at <https://www.discogs.com/settings/developers>; `discogs.index_tracks`
+(default off) prefixes a medley's sub-tracks with the enclosing index
+track's title, as beets' option of the same name does.
+
 Path templates are fb2k-style — the template language koan uses, whose engine
 this crate carries. A beets template (`$albumartist/%if{$year,($year) }$album`)
 is translated on load, so an existing config files albums where beets would
