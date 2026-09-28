@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- beets' `importadded` plugin: a file's own modification time, not the moment it is scanned, becomes its library `added` time, and moves, copies and tag writes during import preserve a file's mtime instead of resetting it. A re-import or re-file no longer makes an old album look newly added.
 - `ImportError::Exists(dir)` for an album whose destinations are already taken by another copy of it, in place of a `Conflict` message carrying the path, so a caller can treat it as already filed.
 - Title, album and artist comparison is beets' `string_dist`, ported with its test suite: a leading "the", a bracketed or parenthesised part, a featured artist and a "Pt."/"Part" suffix cost a fraction of an unrelated difference; "(EP)" and "Single" cost nothing; "Song Title, The" equals "The Song Title"; accents are transliterated. It had counted "My Song (Remastered)" as far from "My Song" as any four-letter typo.
 - `Importer::enrich(dir)` adds what beets' `replaygain`, `lastgenre` and `lyrics` plugins add after an import: album and track gain, MusicBrainz genres when the album has none, and lyrics for tracks without them. Each writes only its own tags, and a failure in one is reported without stopping the others.
