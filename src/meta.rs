@@ -187,9 +187,21 @@ pub struct Tags {
 }
 
 /// Write `tags` (and a front cover, if given) into `path`, replacing
-/// whatever was there.
-pub fn write(path: &Path, tags: &Tags, cover: Option<&[u8]>) -> Result<(), MetaError> {
+/// whatever was there. With `preserve_mtime`, the file's modification time
+/// is restored afterwards, as beets' `importadded` plugin: retagging on
+/// import should not make an old file look newly changed.
+pub fn write(
+    path: &Path,
+    tags: &Tags,
+    cover: Option<&[u8]>,
+    preserve_mtime: bool,
+) -> Result<(), MetaError> {
     raise_allocation_limit();
+    let original_mtime = if preserve_mtime {
+        path.metadata().ok().and_then(|m| m.modified().ok())
+    } else {
+        None
+    };
     let mut file = lofty::probe::Probe::open(path)
         .map_err(lofty(path))?
         .read()
@@ -256,6 +268,13 @@ pub fn write(path: &Path, tags: &Tags, cover: Option<&[u8]>) -> Result<(), MetaE
     }
     tag.save_to_path(path, WriteOptions::default())
         .map_err(lofty(path))?;
+    if let Some(modified) = original_mtime {
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .and_then(|f| f.set_modified(modified))
+            .map_err(lofty(path))?;
+    }
     Ok(())
 }
 

@@ -201,7 +201,7 @@ async fn run() -> anyhow::Result<ExitCode> {
 
     match cli.command {
         Command::Update => {
-            let mut lib = Library::open(&index)?;
+            let mut lib = Library::open(&index)?.with_import_added(cfg.import_added);
             let r = lib.update(&cfg.directory)?;
             for (_, e) in &r.failed {
                 eprintln!("unreadable  {e}");
@@ -221,7 +221,7 @@ async fn run() -> anyhow::Result<ExitCode> {
             pretend,
             verbose,
         } => {
-            let mut lib = Library::open(&index)?;
+            let mut lib = Library::open(&index)?.with_import_added(cfg.import_added);
             lib.update(&cfg.directory)?;
             let (mut moved, mut refused) = (0, 0);
             for album in lib.albums(&Query::parse(&query)?)? {
@@ -255,7 +255,7 @@ async fn run() -> anyhow::Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         Command::Bad { query } => {
-            let mut lib = Library::open(&index)?;
+            let mut lib = Library::open(&index)?.with_import_added(cfg.import_added);
             lib.update(&cfg.directory)?;
             let items = lib.items(&Query::parse(&query)?)?;
             let verdicts = lib.check(&items)?;
@@ -281,7 +281,7 @@ async fn run() -> anyhow::Result<ExitCode> {
             })
         }
         Command::Genres { query, force } => {
-            let mut lib = Library::open(&index)?;
+            let mut lib = Library::open(&index)?.with_import_added(cfg.import_added);
             lib.update(&cfg.directory)?;
             let mut mb = sift::musicbrainz::MusicBrainz::new(&cfg.musicbrainz_contact);
             if let Some(dir) = &cfg.cache_dir {
@@ -328,7 +328,7 @@ async fn run() -> anyhow::Result<ExitCode> {
         }
         Command::Lyrics { query, force } => {
             use sift::lyrics::Lyrics;
-            let mut lib = Library::open(&index)?;
+            let mut lib = Library::open(&index)?.with_import_added(cfg.import_added);
             lib.update(&cfg.directory)?;
             let misses = if force {
                 Default::default()
@@ -377,7 +377,7 @@ async fn run() -> anyhow::Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         Command::Replaygain { query, force } => {
-            let mut lib = Library::open(&index)?;
+            let mut lib = Library::open(&index)?.with_import_added(cfg.import_added);
             lib.update(&cfg.directory)?;
             let workers = std::thread::available_parallelism().map_or(4, |n| n.get().min(4));
             let (mut done, mut skipped, mut failed) = (0, 0, 0);
@@ -409,7 +409,7 @@ async fn run() -> anyhow::Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         Command::Stats { query } => {
-            let mut lib = Library::open(&index)?;
+            let mut lib = Library::open(&index)?.with_import_added(cfg.import_added);
             lib.update(&cfg.directory)?;
             let query = Query::parse(&query)?;
             let items = lib.items(&query)?;
@@ -435,7 +435,7 @@ async fn run() -> anyhow::Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         Command::Missing { query } => {
-            let mut lib = Library::open(&index)?;
+            let mut lib = Library::open(&index)?.with_import_added(cfg.import_added);
             lib.update(&cfg.directory)?;
             let mut count = 0;
             for album in lib.albums(&Query::parse(&query)?)? {
@@ -457,7 +457,7 @@ async fn run() -> anyhow::Result<ExitCode> {
                 !query.is_empty(),
                 "give a query; removing the whole library takes an explicit \"\""
             );
-            let mut lib = Library::open(&index)?;
+            let mut lib = Library::open(&index)?.with_import_added(cfg.import_added);
             lib.update(&cfg.directory)?;
             for album in lib.albums(&Query::parse(&query)?)? {
                 if pretend {
@@ -483,7 +483,7 @@ async fn run() -> anyhow::Result<ExitCode> {
                 !query.is_empty(),
                 "give a query; modifying the whole library takes an explicit \"\""
             );
-            let mut lib = Library::open(&index)?;
+            let mut lib = Library::open(&index)?.with_import_added(cfg.import_added);
             lib.update(&cfg.directory)?;
             let r = manage::modify(
                 &cfg,
@@ -512,7 +512,7 @@ async fn run() -> anyhow::Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         Command::Duplicates { query, bin } => {
-            let mut lib = Library::open(&index)?;
+            let mut lib = Library::open(&index)?.with_import_added(cfg.import_added);
             lib.update(&cfg.directory)?;
             let albums = lib.albums(&Query::parse(&query)?)?;
             let dupes = manage::duplicates(&cfg, &albums);
@@ -541,7 +541,7 @@ async fn run() -> anyhow::Result<ExitCode> {
             path,
             format,
         } => {
-            let lib = Library::open(&index)?;
+            let lib = Library::open(&index)?.with_import_added(cfg.import_added);
             let query = Query::parse(&query)?;
             let fmt = match (format, path, album) {
                 (Some(f), _, _) => f,
@@ -591,7 +591,7 @@ async fn run() -> anyhow::Result<ExitCode> {
                     !as_is,
                     "-L re-imports against MusicBrainz; it cannot be combined with --as-is"
                 );
-                let mut lib = Library::open(&index)?;
+                let mut lib = Library::open(&index)?.with_import_added(cfg.import_added);
                 lib.update(&cfg.directory)?;
                 lib.albums(&Query::parse(&paths)?)?
                     .into_iter()
@@ -606,7 +606,7 @@ async fn run() -> anyhow::Result<ExitCode> {
             imports(Importer::new(cfg), jobs, library, as_is, log.as_deref()).await
         }
         Command::Mbsync { query } => {
-            let mut lib = Library::open(&index)?;
+            let mut lib = Library::open(&index)?.with_import_added(cfg.import_added);
             lib.update(&cfg.directory)?;
             let jobs = lib
                 .albums(&Query::parse(&query)?)?

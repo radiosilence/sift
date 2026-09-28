@@ -648,11 +648,14 @@ impl Importer {
             // Moving: the source is ours to change, so tag it and move it.
             // Copying: the source must come out untouched, so copy first and
             // tag the copy, taking it back out if tagging fails.
+            let preserve_mtime = self.cfg.import_added;
             if self.cfg.move_files || in_place {
                 let path = local.path.clone();
-                tokio::task::spawn_blocking(move || meta::write(&path, &tags, cover.as_deref()))
-                    .await
-                    .expect("tag writer panicked")?;
+                tokio::task::spawn_blocking(move || {
+                    meta::write(&path, &tags, cover.as_deref(), preserve_mtime)
+                })
+                .await
+                .expect("tag writer panicked")?;
                 if !itself(&local.path, dest) {
                     paths::transfer(&local.path, dest, true).await?;
                 }
@@ -660,7 +663,7 @@ impl Importer {
                 paths::transfer(&local.path, dest, false).await?;
                 let path = dest.clone();
                 let written = tokio::task::spawn_blocking(move || {
-                    meta::write(&path, &tags, cover.as_deref())
+                    meta::write(&path, &tags, cover.as_deref(), preserve_mtime)
                 })
                 .await
                 .expect("tag writer panicked");

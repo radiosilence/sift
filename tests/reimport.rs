@@ -85,6 +85,7 @@ fn tag(path: &Path, album: &str, title: &str, n: u32) {
             ..Default::default()
         },
         None,
+        false,
     )
     .unwrap();
 }

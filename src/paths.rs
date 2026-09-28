@@ -215,10 +215,11 @@ pub async fn transfer(from: &Path, to: &Path, move_file: bool) -> std::io::Resul
             to.file_name().unwrap_or_default().to_string_lossy(),
             std::process::id()
         ));
+        let from_meta = tokio::fs::metadata(from).await?;
         let copied = tokio::fs::copy(from, &tmp).await?;
         let file = tokio::fs::File::open(&tmp).await?;
         file.sync_all().await?;
-        let expected = tokio::fs::metadata(from).await?.len();
+        let expected = from_meta.len();
         if copied != expected || file.metadata().await?.len() != expected {
             let _ = tokio::fs::remove_file(&tmp).await;
             return Err(std::io::Error::other(format!(
@@ -227,6 +228,19 @@ pub async fn transfer(from: &Path, to: &Path, move_file: bool) -> std::io::Resul
             )));
         }
         tokio::fs::rename(&tmp, to).await?;
+        // A copy gets a fresh mtime; a move of the same file should never
+        // look newer than the original just because it crossed filesystems.
+        if let Ok(modified) = from_meta.modified() {
+            let to = to.to_path_buf();
+            tokio::task::spawn_blocking(move || {
+                std::fs::File::options()
+                    .write(true)
+                    .open(&to)?
+                    .set_modified(modified)
+            })
+            .await
+            .expect("mtime setter panicked")?;
+        }
         if move_file {
             tokio::fs::remove_file(from).await?;
         }
@@ -369,5 +383,32 @@ mod tests {
         transfer(&from, &to, true).await.unwrap();
         assert!(!from.exists());
         assert_eq!(std::fs::read(&to).unwrap(), b"x");
+    }
+
+    /// A copy takes the destination through a temporary file, which would
+    /// otherwise leave it with a fresh mtime; `transfer` restores the
+    /// source's. `move_file: false` always goes through the copy path, so a
+    /// same-filesystem temp dir exercises it without needing two devices.
+    #[tokio::test]
+    async fn a_copy_keeps_the_source_mtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let from = dir.path().join("a.flac");
+        std::fs::write(&from, b"x").unwrap();
+        let past = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        std::fs::File::options()
+            .write(true)
+            .open(&from)
+            .unwrap()
+            .set_modified(past)
+            .unwrap();
+        let to = dir.path().join("lib/Artist/Album/01 a.flac");
+        transfer(&from, &to, false).await.unwrap();
+        let got = std::fs::metadata(&to).unwrap().modified().unwrap();
+        assert_eq!(
+            got.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs(),
+            past.duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs()
+        );
     }
 }

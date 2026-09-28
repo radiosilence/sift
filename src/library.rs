@@ -308,6 +308,9 @@ pub struct ScanReport {
 pub struct Library {
     conn: Connection,
     workers: usize,
+    /// Stamp a newly seen file's `added` with its own modification time
+    /// rather than the scan time, as beets' `importadded` plugin.
+    import_added: bool,
 }
 
 /// Files read and committed together during a scan.
@@ -408,6 +411,7 @@ impl Library {
         Self {
             conn,
             workers: std::thread::available_parallelism().map_or(4, |n| n.get().min(4)),
+            import_added: false,
         }
     }
 
@@ -416,6 +420,13 @@ impl Library {
     /// it tries, so a memory-limited caller wants few.
     pub fn with_workers(mut self, workers: usize) -> Self {
         self.workers = workers.max(1);
+        self
+    }
+
+    /// When set, a file's `added` is its own modification time rather than
+    /// the moment the scan found it, as beets' `importadded` plugin.
+    pub fn with_import_added(mut self, on: bool) -> Self {
+        self.import_added = on;
         self
     }
 
@@ -475,11 +486,11 @@ impl Library {
                 Some(k) if *k == stat => report.unchanged += 1,
                 Some(_) => {
                     report.changed += 1;
-                    to_read.push((path, stat));
+                    to_read.push((path, stat, false));
                 }
                 None => {
                     report.added += 1;
-                    to_read.push((path, stat));
+                    to_read.push((path, stat, true));
                 }
             }
             seen.insert(key);
@@ -498,8 +509,8 @@ impl Library {
                     .map(|part| {
                         s.spawn(move || {
                             part.iter()
-                                .map(|(p, stat)| {
-                                    (p, *stat, meta::read(p).map_err(|e| e.to_string()))
+                                .map(|(p, stat, is_new)| {
+                                    (p, *stat, *is_new, meta::read(p).map_err(|e| e.to_string()))
                                 })
                                 .collect::<Vec<_>>()
                         })
@@ -513,7 +524,7 @@ impl Library {
             let tx = self.conn.transaction()?;
             {
                 let mut upsert = tx.prepare(UPSERT)?;
-                for (path, (size, mtime), track) in results {
+                for (path, (size, mtime), is_new, track) in results {
                     let t = match track {
                         Ok(t) => t,
                         Err(e) => {
@@ -529,11 +540,16 @@ impl Library {
                         }
                     };
                     tx.execute("DELETE FROM unreadable WHERE path = ?1", [path.to_str()])?;
+                    let row_added = if is_new && self.import_added {
+                        mtime / 1_000_000_000
+                    } else {
+                        added
+                    };
                     upsert.execute(params![
                         path.to_str(),
                         size as i64,
                         mtime,
-                        added,
+                        row_added,
                         t.title,
                         t.artist,
                         t.album,
@@ -930,6 +946,7 @@ pub(crate) mod tests {
                 ..Default::default()
             },
             None,
+            false,
         )
         .unwrap();
     }
@@ -969,5 +986,56 @@ pub(crate) mod tests {
         let items = lib.items(&q(&["title:edit"])).unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(lib.items(&Query::default()).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn writing_tags_with_preserve_mtime_keeps_the_mtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.wav");
+        wav(&path, 44_100);
+        let past = SystemTime::now() - Duration::from_secs(3600);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(past)
+            .unwrap();
+        meta::write(
+            &path,
+            &meta::Tags {
+                title: "T".into(),
+                ..Default::default()
+            },
+            None,
+            true,
+        )
+        .unwrap();
+        let got = std::fs::metadata(&path).unwrap().modified().unwrap();
+        assert_eq!(
+            got.duration_since(UNIX_EPOCH).unwrap().as_secs(),
+            past.duration_since(UNIX_EPOCH).unwrap().as_secs()
+        );
+    }
+
+    #[test]
+    fn import_added_stamps_a_new_row_with_the_files_mtime() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("a.wav");
+        tagged_wav(&path, "A", "B", "T", 1);
+        let past = SystemTime::now() - Duration::from_secs(86_400);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(past)
+            .unwrap();
+
+        let mut lib = Library::in_memory().unwrap().with_import_added(true);
+        lib.update(root.path()).unwrap();
+        let item = &lib.items(&Query::default()).unwrap()[0];
+        assert_eq!(
+            item.added,
+            past.duration_since(UNIX_EPOCH).unwrap().as_secs() as i64
+        );
     }
 }

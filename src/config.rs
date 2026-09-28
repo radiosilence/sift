@@ -62,6 +62,14 @@ pub struct Config {
     pub musicbrainz_contact: String,
     /// Where MusicBrainz responses are kept between imports.
     pub cache_dir: Option<PathBuf>,
+    /// Keep a file's own modification time as its library `added` time, and
+    /// preserve mtimes across moves, copies and tag writes, so a re-import
+    /// or re-file never makes an old album look newly added. True when
+    /// beets' `importadded` plugin is enabled. beets also has
+    /// `importadded.preserve_mtimes` and `importadded.preserve_write_mtimes`
+    /// options, both true by default; sift does not read them and always
+    /// behaves as if both are on once the plugin is listed.
+    pub import_added: bool,
     /// beets' `ftintitle` plugin: fold a featured artist out of the track
     /// artist and into the title. `None` when the plugin isn't enabled.
     pub ft_in_title: Option<FtInTitle>,
@@ -98,6 +106,7 @@ impl Default for Config {
             strong_threshold: 0.04,
             musicbrainz_contact: "https://github.com/radiosilence/sift".into(),
             cache_dir: dirs::cache_dir().map(|d| d.join("sift")),
+            import_added: false,
             ft_in_title: None,
         }
     }
@@ -277,6 +286,7 @@ impl Config {
             cfg.asciify_paths = raw.asciify_paths.unwrap_or(cfg.asciify_paths);
             cfg.original_date = raw.original_date.unwrap_or(cfg.original_date);
             cfg.per_disc_numbering = raw.per_disc_numbering.unwrap_or(cfg.per_disc_numbering);
+            cfg.import_added |= raw.plugins.contains("importadded");
             fetchart |= raw.plugins.contains("fetchart");
             art_width = raw
                 .embedart
