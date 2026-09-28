@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.2
+
+- **An import files under the folder already there when the names differ only in case.** Tags spell an act "The Squire Of Gothos" on one record and "of" on the next; each spelling made its own artist folder (or, on a case-insensitive disk, a collision). Each directory of the destination now takes the spelling of one already on disk that matches it ignoring case, preferring an exact match, so an artist stays in one folder under the name it was first filed as. Applies to imports and to re-filing alike.
+
 ## 0.3.1
 
 - `sift completions <shell>` prints completions for zsh, bash, fish, elvish or PowerShell, without needing a config.

@@ -136,7 +136,54 @@ pub fn under(root: &Path, rel: &str) -> Result<std::path::PathBuf, PathError> {
     if !clean || !path.starts_with(root) {
         return Err(PathError::Escapes(path));
     }
-    Ok(path)
+    Ok(existing_case(root, &path))
+}
+
+/// `path` with each directory below `root` spelled as one already on disk
+/// when the two differ only in case.
+///
+/// Tags spell an act "The Squire Of Gothos" on one record and "of" on the
+/// next. On a case-sensitive disk that files them in two folders; on a
+/// case-insensitive one it makes the second import collide with the first.
+/// Reusing the folder that is already there keeps an artist in one place, in
+/// the spelling it was first filed under.
+fn existing_case(root: &Path, path: &Path) -> std::path::PathBuf {
+    let Ok(rel) = path.strip_prefix(root) else {
+        return path.to_path_buf();
+    };
+    let parts: Vec<_> = rel.components().collect();
+    let mut out = root.to_path_buf();
+    for (i, part) in parts.iter().enumerate() {
+        let name = part.as_os_str();
+        let last = i + 1 == parts.len();
+        if last {
+            out.push(name);
+            continue;
+        }
+        // Read the directory rather than ask whether the name exists: on a
+        // case-insensitive disk it "exists" in any case, and the question is
+        // how it is spelled.
+        let fold =
+            |n: &std::ffi::OsStr| n.to_string_lossy().nfc().collect::<String>().to_lowercase();
+        let want = fold(name);
+        let dirs: Vec<std::ffi::OsString> = std::fs::read_dir(&out)
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .filter(|e| e.path().is_dir() && fold(&e.file_name()) == want)
+                    .map(|e| e.file_name())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let spelled = dirs
+            .iter()
+            .find(|d| d.as_os_str() == name)
+            .or_else(|| dirs.first())
+            .cloned()
+            .unwrap_or_else(|| name.to_os_string());
+        out.push(spelled);
+    }
+    out
 }
 
 /// How two destination names compare on the filesystem they land on:
@@ -258,6 +305,32 @@ pub async fn transfer(from: &Path, to: &Path, move_file: bool) -> std::io::Resul
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_folder_already_filed_in_another_case_is_reused() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("The Squire of Gothos").join("(2010) Old [MP3]"))
+            .unwrap();
+        let got = under(
+            root,
+            "The Squire Of Gothos/(2010) New [FLAC]/0101. Track.flac",
+        )
+        .unwrap();
+        assert_eq!(
+            got,
+            root.join("The Squire of Gothos")
+                .join("(2010) New [FLAC]")
+                .join("0101. Track.flac")
+        );
+        // Nothing to match: filed as the tags spell it.
+        let fresh = under(root, "Someone Else/Album/01. T.flac").unwrap();
+        assert_eq!(
+            fresh,
+            root.join("Someone Else").join("Album").join("01. T.flac")
+        );
+    }
+
     use super::*;
 
     fn release() -> Release {
