@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Cover art now honours `fetchart`/`embedart`'s `minwidth`, `quality`, `enforce_ratio` and `high_resolution` options. A candidate narrower than `minwidth` or too far from square for `enforce_ratio` (a percentage of the longer side, or a pixel count) is skipped for the next source; one wider than `maxwidth` is resized down and re-encoded as JPEG at `quality`, and `high_resolution` tries the Cover Art Archive's full-size original before its thumbnails. Previously sift ignored these settings and could embed a small, non-square or oversized image unchanged.
 - `ImportError::Exists(dir)` for an album whose destinations are already taken by another copy of it, in place of a `Conflict` message carrying the path, so a caller can treat it as already filed.
 - Title, album and artist comparison is beets' `string_dist`, ported with its test suite: a leading "the", a bracketed or parenthesised part, a featured artist and a "Pt."/"Part" suffix cost a fraction of an unrelated difference; "(EP)" and "Single" cost nothing; "Song Title, The" equals "The Song Title"; accents are transliterated. It had counted "My Song (Remastered)" as far from "My Song" as any four-letter typo.
 - `Importer::enrich(dir)` adds what beets' `replaygain`, `lastgenre` and `lyrics` plugins add after an import: album and track gain, MusicBrainz genres when the album has none, and lyrics for tracks without them. Each writes only its own tags, and a failure in one is reported without stopping the others.

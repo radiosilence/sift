@@ -48,6 +48,15 @@ pub struct Config {
     /// Largest cover width to embed; Cover Art Archive serves 250, 500 and
     /// 1200 thumbnails, and the nearest one at or below this is used.
     pub art_max_width: u32,
+    /// Smallest cover width accepted; a smaller candidate is skipped.
+    pub art_min_width: u32,
+    /// JPEG quality used when a cover is resized and re-encoded.
+    pub art_quality: u8,
+    /// How far from square a cover may be before it is rejected.
+    pub art_ratio: Option<Ratio>,
+    /// Prefer the Cover Art Archive's full-size original over its
+    /// thumbnails.
+    pub art_high_resolution: bool,
     /// Below this distance a match is applied without asking.
     pub strong_threshold: f64,
     pub musicbrainz_contact: String,
@@ -71,6 +80,10 @@ impl Default for Config {
             move_files: false,
             fetch_art: true,
             art_max_width: 1200,
+            art_min_width: 0,
+            art_quality: 90,
+            art_ratio: None,
+            art_high_resolution: false,
             strong_threshold: 0.04,
             musicbrainz_contact: "https://github.com/radiosilence/sift".into(),
             cache_dir: dirs::cache_dir().map(|d| d.join("sift")),
@@ -92,6 +105,39 @@ fn beets_default_replace() -> Vec<(regex::Regex, String)> {
     .into_iter()
     .map(|(p, r)| (regex::Regex::new(p).expect("static pattern"), r.to_string()))
     .collect()
+}
+
+/// How far from square a cover may be, as beets' fetchart `enforce_ratio`
+/// reads it: a percentage of the longer side, or a fixed number of pixels.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Ratio {
+    Percent(f32),
+    Pixels(u32),
+}
+
+impl Ratio {
+    /// Parses "10%", "10px" or a bare "10" (pixels), as beets does.
+    fn parse(s: &str) -> Option<Self> {
+        let s = s.trim();
+        if let Some(pct) = s.strip_suffix('%') {
+            return pct.trim().parse().ok().map(Ratio::Percent);
+        }
+        s.strip_suffix("px")
+            .unwrap_or(s)
+            .trim()
+            .parse()
+            .ok()
+            .map(Ratio::Pixels)
+    }
+
+    /// Whether `width`x`height` is close enough to square.
+    pub fn allows(self, width: u32, height: u32) -> bool {
+        let tolerance = match self {
+            Ratio::Percent(p) => p / 100.0 * width.max(height) as f32,
+            Ratio::Pixels(px) => px as f32,
+        };
+        (width as i64 - height as i64).unsigned_abs() as f32 <= tolerance
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -128,6 +174,10 @@ struct RawImport {
 #[derive(Debug, Default, Deserialize)]
 struct RawArt {
     maxwidth: Option<u32>,
+    minwidth: Option<u32>,
+    quality: Option<u8>,
+    enforce_ratio: Option<String>,
+    high_resolution: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -163,6 +213,10 @@ impl Config {
         collect(path, &mut layers, 0)?;
         let mut cfg = Self::default();
         let mut art_width = None;
+        let mut art_min_width = None;
+        let mut art_quality = None;
+        let mut art_ratio = None;
+        let mut art_high_resolution = None;
         let mut fetchart = false;
         for raw in layers {
             if let Some(d) = raw.directory {
@@ -205,6 +259,28 @@ impl Config {
                 .maxwidth
                 .or(raw.fetchart.maxwidth)
                 .or(art_width);
+            art_min_width = raw
+                .embedart
+                .minwidth
+                .or(raw.fetchart.minwidth)
+                .or(art_min_width);
+            art_quality = raw
+                .embedart
+                .quality
+                .or(raw.fetchart.quality)
+                .or(art_quality);
+            art_high_resolution = raw
+                .embedart
+                .high_resolution
+                .or(raw.fetchart.high_resolution)
+                .or(art_high_resolution);
+            art_ratio = raw
+                .embedart
+                .enforce_ratio
+                .as_deref()
+                .or(raw.fetchart.enforce_ratio.as_deref())
+                .and_then(Ratio::parse)
+                .or(art_ratio);
             if let Some(t) = raw.matching.strong_rec_thresh {
                 cfg.strong_threshold = t;
             }
@@ -212,6 +288,18 @@ impl Config {
         cfg.fetch_art = fetchart;
         if let Some(w) = art_width {
             cfg.art_max_width = w;
+        }
+        if let Some(w) = art_min_width {
+            cfg.art_min_width = w;
+        }
+        if let Some(q) = art_quality {
+            cfg.art_quality = q;
+        }
+        if let Some(r) = art_ratio {
+            cfg.art_ratio = Some(r);
+        }
+        if let Some(h) = art_high_resolution {
+            cfg.art_high_resolution = h;
         }
         // No `directory` is allowed: a shared base config often leaves it to
         // a per-machine file, and a caller may set it after loading. Whoever
@@ -447,6 +535,7 @@ mod tests {
         assert_eq!(cfg.directory, PathBuf::from("/music"));
         assert!(cfg.original_date && cfg.per_disc_numbering && cfg.move_files && cfg.fetch_art);
         assert_eq!(cfg.art_max_width, 1200);
+        assert_eq!(cfg.art_min_width, 500);
         assert_eq!(
             cfg.path_default,
             "%album artist%/%album%/$num(%tracknumber%,2) %title%"
@@ -458,5 +547,30 @@ mod tests {
                 .replace_all("a:b", cfg.replace[1].1.as_str()),
             "a-b"
         );
+    }
+
+    #[test]
+    fn loads_fetchart_quality_and_ratio() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.yaml"),
+            "directory: /music\nfetchart:\n  quality: 95\n  enforce_ratio: 10%\n  high_resolution: true\n",
+        )
+        .unwrap();
+        let cfg = Config::load(&dir.path().join("config.yaml")).unwrap();
+        assert_eq!(cfg.art_quality, 95);
+        assert_eq!(cfg.art_ratio, Some(Ratio::Percent(10.0)));
+        assert!(cfg.art_high_resolution);
+    }
+
+    #[test]
+    fn ratio_tolerance() {
+        assert_eq!(Ratio::parse("10%"), Some(Ratio::Percent(10.0)));
+        assert_eq!(Ratio::parse("10px"), Some(Ratio::Pixels(10)));
+        assert_eq!(Ratio::parse("10"), Some(Ratio::Pixels(10)));
+
+        assert!(Ratio::Percent(10.0).allows(1000, 950));
+        assert!(!Ratio::Percent(10.0).allows(1000, 800));
+        assert!(!Ratio::Pixels(10).allows(1000, 980));
     }
 }
