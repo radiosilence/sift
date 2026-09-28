@@ -322,7 +322,31 @@ impl Importer {
                 t.path.display()
             );
         }
-        let entries = as_is_tags(&tracks)?;
+        let mut entries = as_is_tags(&tracks)?;
+        // The files carry no date the tagger trusts: MusicBrainz may still
+        // have a year for this album and artist, even without a matching
+        // release, as beets' `yearfixer` plugin looks one up.
+        if let Some(first) = entries.first().map(|(_, t)| t.clone())
+            && first.date.is_none()
+        {
+            match self
+                .mb
+                .release_group_year(&first.album_artist, &first.album)
+                .await
+            {
+                Ok(Some(year)) => {
+                    let _ = writeln!(log, "year {year} found on MusicBrainz for {}", first.album);
+                    for (_, t) in &mut entries {
+                        t.date = Some(year.clone());
+                        t.original_date = Some(year.clone());
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    let _ = writeln!(log, "musicbrainz year lookup failed: {e}");
+                }
+            }
+        }
         let _ = writeln!(log, "as-is: filed by the files' own tags");
         let dest = self
             .file(&tracks, &entries, None, dir, false, &mut log)
@@ -695,11 +719,22 @@ impl Importer {
         total: usize,
     ) -> Tags {
         let medium = release.media.iter().find(|m| m.position == disc);
-        let original = release
+        // A release with no date of its own (or MusicBrainz's placeholder
+        // "0000") takes its release group's first release date instead, as
+        // beets' `yearfixer` plugin does; a release group with none leaves
+        // the release's own date standing in for it, so one missing side
+        // never blanks the other.
+        let release_date = release
+            .date
+            .clone()
+            .filter(|d| !d.is_empty() && d != "0000");
+        let group_date = release
             .release_group
             .as_ref()
             .and_then(|g| g.first_release_date.clone())
             .filter(|d| !d.is_empty());
+        let date = release_date.clone().or_else(|| group_date.clone());
+        let original = group_date.or_else(|| release_date.clone());
         let label = release.label_info.first();
         let (track, track_total) = if self.cfg.per_disc_numbering {
             (rt.position, medium.map_or(0, |m| m.tracks.len()) as u32)
@@ -715,7 +750,7 @@ impl Importer {
             track_total,
             disc,
             disc_total: release.media.len() as u32,
-            date: release.date.clone().filter(|d| !d.is_empty()),
+            date,
             original_date: original,
             label: label.and_then(|l| l.label.as_ref()).map(|l| l.name.clone()),
             catalog_number: label.and_then(|l| l.catalog_number.clone()),
@@ -1298,6 +1333,24 @@ mod tests {
             )],
             "no title or track number",
         );
+    }
+
+    #[test]
+    fn tags_take_the_release_groups_year_when_the_release_has_none() {
+        let release: Release = serde_json::from_value(serde_json::json!({
+            "id": "r", "title": "Geogaddi",
+            "artist-credit": [{"name": "Boards of Canada", "joinphrase": "", "artist": {"id": "a", "name": "Boards of Canada"}}],
+            "release-group": {"id": "g", "first-release-date": "2002-02-18"},
+            "media": [{"position": 1, "tracks": [
+                {"id": "t1", "position": 1, "title": "Ready Lets Go", "recording": {"id": "r1"}}
+            ]}]
+        }))
+        .unwrap();
+        let importer = Importer::with_musicbrainz(Config::default(), MusicBrainz::new("test"));
+        let rt = &release.media[0].tracks[0];
+        let tags = importer.tags(&release, 0, 1, rt, 1);
+        assert_eq!(tags.date.as_deref(), Some("2002-02-18"));
+        assert_eq!(tags.original_date.as_deref(), Some("2002-02-18"));
     }
 
     #[test]

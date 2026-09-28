@@ -93,6 +93,38 @@ async fn an_unreachable_service_is_transient() {
 }
 
 #[tokio::test]
+async fn release_group_year_matches_an_exact_title_and_artist() {
+    let body = r#"{"release-groups":[
+        {"title":"Geogaddi","first-release-date":"2002-02-18",
+         "artist-credit":[{"name":"Boards of Canada","joinphrase":"","artist":{"id":"a","name":"Boards of Canada"}}]}
+    ]}"#;
+    let (base, _) = serve(vec![(200, "", body)]).await;
+    let mb = MusicBrainz::with_base(&base, "test");
+    assert_eq!(
+        mb.release_group_year("Boards of Canada", "Geogaddi")
+            .await
+            .unwrap(),
+        Some("2002-02-18".into())
+    );
+}
+
+#[tokio::test]
+async fn release_group_year_is_none_without_a_title_match() {
+    let body = r#"{"release-groups":[
+        {"title":"Geogaddi Remixes","first-release-date":"2010-01-01",
+         "artist-credit":[{"name":"Boards of Canada","joinphrase":"","artist":{"id":"a","name":"Boards of Canada"}}]}
+    ]}"#;
+    let (base, _) = serve(vec![(200, "", body)]).await;
+    let mb = MusicBrainz::with_base(&base, "test");
+    assert_eq!(
+        mb.release_group_year("Boards of Canada", "Geogaddi")
+            .await
+            .unwrap(),
+        None
+    );
+}
+
+#[tokio::test]
 async fn genres_come_from_the_release_group_when_the_release_has_none() {
     let body = r#"{"genres":[],
         "release-group":{"genres":[{"name":"dubstep","count":5},{"name":"future garage","count":4},{"name":"electronic","count":2},{"name":"hauntology","count":1}]},

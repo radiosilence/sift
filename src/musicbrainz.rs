@@ -243,6 +243,33 @@ impl MusicBrainz {
         )
         .await
     }
+
+    /// The year of the release group MusicBrainz has for an artist and
+    /// album, for an as-is import whose own files carry no date: the first
+    /// result whose title and artist credit match exactly, else none.
+    pub async fn release_group_year(
+        &self,
+        artist: &str,
+        album: &str,
+    ) -> Result<Option<String>, MbError> {
+        let query = format!(
+            "releasegroup:\"{}\" AND artist:\"{}\"",
+            lucene(album),
+            lucene(artist)
+        );
+        let found: ReleaseGroupSearchResults = self
+            .get("release-group", &[("query", &query), ("limit", "5")])
+            .await?;
+        let norm = |s: &str| s.trim().to_lowercase();
+        Ok(found
+            .release_groups
+            .into_iter()
+            .find(|g| {
+                norm(&g.title) == norm(album)
+                    && norm(&credit_name(&g.artist_credit)) == norm(artist)
+            })
+            .and_then(|g| g.first_release_date))
+    }
 }
 
 /// "future garage" as "Future Garage", keeping the acronyms genre names
@@ -372,6 +399,21 @@ pub struct ReleaseHit {
     pub title: String,
     #[serde(default, rename = "track-count")]
     pub track_count: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct ReleaseGroupSearchResults {
+    #[serde(default, rename = "release-groups")]
+    release_groups: Vec<ReleaseGroupHit>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ReleaseGroupHit {
+    title: String,
+    #[serde(rename = "first-release-date")]
+    first_release_date: Option<String>,
+    #[serde(rename = "artist-credit", default)]
+    artist_credit: Vec<ArtistCredit>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
