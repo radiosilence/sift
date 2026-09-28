@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 use sift::library::{self, Library, Query};
 use sift::manage;
 use sift::{Config, Importer, Outcome};
@@ -16,8 +16,9 @@ use sift::{Config, Importer, Outcome};
 )]
 struct Cli {
     /// Config file. Defaults to the beets config: $BEETSDIR/config.yaml or
-    /// ~/.config/beets/config.yaml.
-    #[arg(short, long, global = true)]
+    /// ~/.config/beets/config.yaml. Given before the command, as in beets:
+    /// after it, `-c` is `import`'s `--copy`.
+    #[arg(short, long)]
     config: Option<PathBuf>,
     /// Library directory, overriding the config's `directory`.
     #[arg(short = 'd', long, global = true)]
@@ -32,6 +33,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Print shell completions: `sift completions zsh`.
+    Completions {
+        /// The shell to complete for.
+        shell: clap_complete::Shell,
+    },
     /// Import albums: one per directory given.
     Import {
         /// Directories, or with `-L` a query over the library.
@@ -181,6 +187,11 @@ async fn main() -> ExitCode {
 
 async fn run() -> anyhow::Result<ExitCode> {
     let cli = Cli::parse();
+    // Before the config: completions are generated where there may be none.
+    if let Command::Completions { shell } = cli.command {
+        clap_complete::generate(shell, &mut Cli::command(), "sift", &mut std::io::stdout());
+        return Ok(ExitCode::SUCCESS);
+    }
     let path = cli.config.clone().or_else(Config::default_path);
     let mut cfg = match &path {
         Some(p) => Config::load(p)?,
@@ -201,6 +212,7 @@ async fn run() -> anyhow::Result<ExitCode> {
         .ok_or_else(|| anyhow::anyhow!("no data directory: pass --index"))?;
 
     match cli.command {
+        Command::Completions { .. } => unreachable!("handled before the config is read"),
         Command::Update => {
             let mut lib = Library::open(&index)?.with_import_added(cfg.import_added);
             let r = lib.update(&cfg.directory)?;
@@ -733,4 +745,16 @@ async fn imports(
     } else {
         ExitCode::SUCCESS
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::CommandFactory;
+
+    /// clap checks the whole command tree only when it is built in full, as
+    /// generating completions does; a clash found there panics at runtime.
+    #[test]
+    fn the_command_line_is_consistent() {
+        super::Cli::command().debug_assert();
+    }
 }

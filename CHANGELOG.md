@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.3.1
+
+- `sift completions <shell>` prints completions for zsh, bash, fish, elvish or PowerShell, without needing a config.
+- `-c`/`--config` is given before the command, as in beets. It was global, and after `import` it collided with `-c`/`--copy`.
+
 ## 0.3.0
 
 - Discogs is consulted as a second metadata source, as beets' `discogs` plugin does: when MusicBrainz's best match is not close enough to apply, and the `discogs` plugin is enabled with a token (`discogs.user_token` or `DISCOGS_TOKEN`), the same artist and album are searched on Discogs and its releases compete with MusicBrainz's on match distance. A Discogs release id is namespaced `discogs:<number>` (`--search-id discogs:<number>` applies one directly) and carries no MusicBrainz identifiers of its own; its cover art comes from Discogs rather than the Cover Art Archive.

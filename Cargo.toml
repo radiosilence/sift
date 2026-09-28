@@ -1,12 +1,13 @@
 [package]
 name = "sift"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2024"
 
 [dependencies]
 anyhow = "1.0.104"
 bytes = "1.12.1"
 clap = { version = "4.6.7", features = ["derive"] }
+clap_complete = "4.6"
 deunicode = "1.6.2"
 dirs = "7.0.0"
 ebur128 = "0.1.10"
