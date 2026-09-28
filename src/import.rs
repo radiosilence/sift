@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
+use crate::art::{self, ArtRules};
 use crate::config::Config;
 use crate::matching::{self, Match};
 use crate::meta::{self, Tags, Track};
@@ -626,7 +627,7 @@ impl Importer {
             ));
         }
 
-        let cover = if self.cfg.fetch_art {
+        let cover_art = if self.cfg.fetch_art {
             self.cover(release, tracks).await
         } else {
             None
@@ -634,8 +635,13 @@ impl Importer {
         let _ = writeln!(
             log,
             "cover art: {}",
-            if cover.is_some() { "yes" } else { "none" }
+            match &cover_art {
+                Some(c) if c.resized => format!("{}, resized", c.source),
+                Some(c) => c.source.to_string(),
+                None => "none".to_string(),
+            }
         );
+        let cover = cover_art.map(|c| c.bytes);
         for (l, tags, dest) in &plan {
             let local = &tracks[*l];
             let (cover, tags) = (cover.clone(), tags.clone());
@@ -794,43 +800,97 @@ impl Importer {
         }
     }
 
-    /// The release's front cover from the Cover Art Archive at the largest
-    /// thumbnail within the configured width, then the release group's, then
-    /// whatever the files already carry.
-    async fn cover(&self, release: Option<&Release>, tracks: &[Track]) -> Option<Vec<u8>> {
+    /// The release's front cover from the Cover Art Archive, then the
+    /// release group's, then whatever the files already carry. When
+    /// `art_high_resolution` is set, each source's full-size original is
+    /// tried before its thumbnail. A candidate narrower than `art_min_width`
+    /// or failing `art_ratio` is skipped for the next one; one wider than
+    /// `art_max_width` is resized down and re-encoded as JPEG at
+    /// `art_quality`.
+    async fn cover(&self, release: Option<&Release>, tracks: &[Track]) -> Option<CoverArt> {
         let size = match self.cfg.art_max_width {
             w if w >= 1200 => "1200",
             w if w >= 500 => "500",
             _ => "250",
         };
-        let mut urls = Vec::new();
+        let mut candidates: Vec<(String, &'static str)> = Vec::new();
         if let Some(release) = release {
-            urls.push(format!(
-                "https://coverartarchive.org/release/{}/front-{size}",
-                release.id
+            if self.cfg.art_high_resolution {
+                candidates.push((
+                    format!("https://coverartarchive.org/release/{}/front", release.id),
+                    "release (original)",
+                ));
+                if let Some(g) = &release.release_group {
+                    candidates.push((
+                        format!("https://coverartarchive.org/release-group/{}/front", g.id),
+                        "release group (original)",
+                    ));
+                }
+            }
+            candidates.push((
+                format!(
+                    "https://coverartarchive.org/release/{}/front-{size}",
+                    release.id
+                ),
+                "release",
             ));
             if let Some(g) = &release.release_group {
-                urls.push(format!(
-                    "https://coverartarchive.org/release-group/{}/front-{size}",
-                    g.id
+                candidates.push((
+                    format!(
+                        "https://coverartarchive.org/release-group/{}/front-{size}",
+                        g.id
+                    ),
+                    "release group",
                 ));
             }
         }
-        for url in urls {
+        let rules = ArtRules {
+            min_width: self.cfg.art_min_width,
+            max_width: self.cfg.art_max_width,
+            quality: self.cfg.art_quality,
+            ratio: self.cfg.art_ratio,
+        };
+        for (url, source) in candidates {
             if let Ok(resp) = self.http.get(&url).send().await
                 && resp.status().is_success()
                 && let Ok(bytes) = resp.bytes().await
                 && !bytes.is_empty()
+                && let Some(prepared) = prepare(bytes.to_vec(), rules).await
             {
-                return Some(bytes.to_vec());
+                return Some(CoverArt {
+                    bytes: prepared.bytes,
+                    source,
+                    resized: prepared.resized,
+                });
             }
         }
         let first = tracks.first()?.path.clone();
-        tokio::task::spawn_blocking(move || meta::embedded_cover(&first))
+        let embedded = tokio::task::spawn_blocking(move || meta::embedded_cover(&first))
             .await
             .ok()
-            .flatten()
+            .flatten()?;
+        let prepared = prepare(embedded, rules).await?;
+        Some(CoverArt {
+            bytes: prepared.bytes,
+            source: "embedded",
+            resized: prepared.resized,
+        })
     }
+}
+
+/// A cover ready to embed, with what the import log should say about it.
+struct CoverArt {
+    bytes: Vec<u8>,
+    source: &'static str,
+    resized: bool,
+}
+
+/// Runs [`art::prepare`] off the async runtime.
+async fn prepare(bytes: Vec<u8>, rules: ArtRules) -> Option<art::Prepared> {
+    tokio::task::spawn_blocking(move || art::prepare(&bytes, &rules))
+        .await
+        .ok()
+        .flatten()
 }
 
 fn strip_brackets(s: &str) -> String {
