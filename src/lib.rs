@@ -1,6 +1,7 @@
 pub mod check;
 pub mod config;
 pub mod format;
+pub mod ftintitle;
 pub mod import;
 pub mod library;
 pub mod lyrics;

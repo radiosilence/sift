@@ -53,6 +53,17 @@ pub struct Config {
     pub musicbrainz_contact: String,
     /// Where MusicBrainz responses are kept between imports.
     pub cache_dir: Option<PathBuf>,
+    /// beets' `ftintitle` plugin: fold a featured artist out of the track
+    /// artist and into the title. `None` when the plugin isn't enabled.
+    pub ft_in_title: Option<FtInTitle>,
+}
+
+#[derive(Debug, Clone)]
+pub struct FtInTitle {
+    /// Drop the featured artist instead of adding it to the title.
+    pub drop: bool,
+    /// Where `{0}` is the featured artist, e.g. `"feat. {0}"`.
+    pub format: String,
 }
 
 /// The template beets ships with, translated.
@@ -74,6 +85,7 @@ impl Default for Config {
             strong_threshold: 0.04,
             musicbrainz_contact: "https://github.com/radiosilence/sift".into(),
             cache_dir: dirs::cache_dir().map(|d| d.join("sift")),
+            ft_in_title: None,
         }
     }
 }
@@ -116,6 +128,14 @@ struct Raw {
     embedart: RawArt,
     #[serde(rename = "match", default)]
     matching: RawMatch,
+    ftintitle: Option<RawFtInTitle>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawFtInTitle {
+    auto: Option<bool>,
+    drop: Option<bool>,
+    format: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -164,6 +184,10 @@ impl Config {
         let mut cfg = Self::default();
         let mut art_width = None;
         let mut fetchart = false;
+        let mut ftintitle_enabled = false;
+        let mut ft_auto = None;
+        let mut ft_drop = None;
+        let mut ft_format = None;
         for raw in layers {
             if let Some(d) = raw.directory {
                 cfg.directory = expand(&d);
@@ -208,10 +232,22 @@ impl Config {
             if let Some(t) = raw.matching.strong_rec_thresh {
                 cfg.strong_threshold = t;
             }
+            ftintitle_enabled |= raw.plugins.contains("ftintitle");
+            if let Some(ft) = raw.ftintitle {
+                ft_auto = ft.auto.or(ft_auto);
+                ft_drop = ft.drop.or(ft_drop);
+                ft_format = ft.format.or(ft_format);
+            }
         }
         cfg.fetch_art = fetchart;
         if let Some(w) = art_width {
             cfg.art_max_width = w;
+        }
+        if ftintitle_enabled && ft_auto != Some(false) {
+            cfg.ft_in_title = Some(FtInTitle {
+                drop: ft_drop.unwrap_or(false),
+                format: ft_format.unwrap_or_else(|| "feat. {0}".into()),
+            });
         }
         // No `directory` is allowed: a shared base config often leaves it to
         // a per-machine file, and a caller may set it after loading. Whoever
@@ -458,5 +494,19 @@ mod tests {
                 .replace_all("a:b", cfg.replace[1].1.as_str()),
             "a-b"
         );
+    }
+
+    #[test]
+    fn ftintitle_plugin_enables_it_with_options() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("config.yaml"),
+            "directory: /music\nplugins: [ftintitle]\nftintitle:\n  drop: true\n",
+        )
+        .unwrap();
+        let cfg = Config::load(&dir.path().join("config.yaml")).unwrap();
+        let ft = cfg.ft_in_title.expect("ftintitle should be enabled");
+        assert!(ft.drop);
+        assert_eq!(ft.format, "feat. {0}");
     }
 }

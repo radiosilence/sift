@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- beets' `ftintitle` plugin: when the `ftintitle` plugin is listed and `ftintitle.auto` is not `false`, a track artist naming a featured artist beyond the album artist (`"Burial feat. Four Tet"` under album artist `"Burial"`) is filed under the album artist alone, with the featured artist folded into the title. `ftintitle.drop` discards the featured artist instead, and `ftintitle.format` (default `"feat. {0}"`) controls how it is added; a title already crediting a featured artist is left alone.
 - `ImportError::Exists(dir)` for an album whose destinations are already taken by another copy of it, in place of a `Conflict` message carrying the path, so a caller can treat it as already filed.
 - Title, album and artist comparison is beets' `string_dist`, ported with its test suite: a leading "the", a bracketed or parenthesised part, a featured artist and a "Pt."/"Part" suffix cost a fraction of an unrelated difference; "(EP)" and "Single" cost nothing; "Song Title, The" equals "The Song Title"; accents are transliterated. It had counted "My Song (Remastered)" as far from "My Song" as any four-letter typo.
 - `Importer::enrich(dir)` adds what beets' `replaygain`, `lastgenre` and `lyrics` plugins add after an import: album and track gain, MusicBrainz genres when the album has none, and lyrics for tracks without them. Each writes only its own tags, and a failure in one is reported without stopping the others.
