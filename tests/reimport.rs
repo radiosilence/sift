@@ -161,3 +161,51 @@ async fn an_album_already_in_place_is_retagged_where_it_is() {
         "tags were rewritten in place"
     );
 }
+
+#[tokio::test]
+async fn a_replacing_import_sets_the_filed_copy_aside() {
+    let root = tempfile::tempdir().unwrap();
+    let (lib, bin) = (root.path().join("lib"), root.path().join("bin"));
+    let fetched = |name: &str| {
+        let dir = root.path().join(name);
+        for (n, title) in [(1, "Kenneth"), (2, "Crush")] {
+            let f = dir.join(format!("{n}.wav"));
+            wav(&f);
+            tag(&f, "Monster", title, n);
+        }
+        dir
+    };
+    let importer = importer(&lib).await;
+    let Outcome::Imported { dir: filed, .. } = importer
+        .import(&fetched("first"), Some("rel"))
+        .await
+        .unwrap()
+    else {
+        panic!("the first copy should import");
+    };
+    // Stands for whatever marks the filed copy as the damaged one.
+    std::fs::write(filed.join("old.txt"), b"old").unwrap();
+
+    let Outcome::Imported { dir, log, .. } = importer
+        .import_replacing(&fetched("second"), Some("rel"), &bin)
+        .await
+        .unwrap()
+    else {
+        panic!("the second copy should import");
+    };
+    assert_eq!(dir, filed);
+    assert!(
+        !dir.join("old.txt").exists(),
+        "the old copy left the library"
+    );
+    assert!(
+        dir.join("02 Crush With Eyeliner.wav").exists(),
+        "the new copy is filed"
+    );
+    let aside = bin.join(filed.strip_prefix(&lib).unwrap());
+    assert!(
+        aside.join("old.txt").exists(),
+        "the old copy is in the bin: {log}"
+    );
+    assert!(aside.join("02 Crush With Eyeliner.wav").exists());
+}

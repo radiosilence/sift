@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.4
+
+- **`Importer::import_replacing` files a new copy over one already there.** A plain import takes files landing on an existing copy of the same format and length for a repeat and moves nothing, which is right for a retry and wrong for a copy fetched because the filed one is damaged: damage does not change a file's format or stated length. With a bin directory, any folder the new files would land in is moved into the bin first, at its path relative to the library (renamed "… (replaced N)" if the bin already holds one), and the new copy is filed.
+
 ## 0.3.3
 
 - **`duplicates` pairs one album tagged two ways.** It matched on the MusicBrainz release id, or on album artist, album and every track title exactly, so an album filed under two artist spellings ("Black Sun Empire" and "Black Sun Empire, State Of Mind, …") or with titles spelled differently ("Dark Thing" / "Dark Ting") went unpaired. Albums with the same title and track count now also pair when each track, in order, is within 3 seconds in length and closely titled; a spare paired this way is reported as "the same album, tagged differently" when the copies are otherwise equal. Two editions with different track lists still do not pair.

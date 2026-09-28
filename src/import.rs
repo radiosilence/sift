@@ -87,6 +87,51 @@ impl From<&Match> for Candidate {
     }
 }
 
+/// Where an import's files go relative to what is already filed.
+#[derive(Clone, Copy)]
+enum Filing<'a> {
+    /// Into the library, refusing a destination another copy holds.
+    New,
+    /// Retagged, and moved only if their path changes: the album is
+    /// already in the library.
+    InPlace,
+    /// Into the library, a copy already there moved into this bin first.
+    Replacing(&'a Path),
+}
+
+/// Move an album folder out of the library into `bin`, at its path relative
+/// to the library root, under a new name if the bin already holds one by
+/// that name. Nothing is deleted: putting it back is a move.
+async fn set_aside(dir: &Path, root: &Path, bin: &Path) -> Result<PathBuf, ImportError> {
+    let rel = dir
+        .strip_prefix(root)
+        .ok()
+        .filter(|r| r.components().count() > 0)
+        .ok_or_else(|| {
+            ImportError::Conflict(format!(
+                "{} is not an album folder in the library",
+                dir.display()
+            ))
+        })?;
+    let mut dest = bin.join(rel);
+    let mut n = 1;
+    while dest.exists() {
+        n += 1;
+        let name = format!(
+            "{} (replaced {n})",
+            rel.file_name().unwrap_or_default().to_string_lossy()
+        );
+        dest = bin.join(rel).with_file_name(name);
+    }
+    for entry in std::fs::read_dir(dir)?.flatten() {
+        if entry.file_type().is_ok_and(|t| t.is_file()) {
+            paths::transfer(&entry.path(), &dest.join(entry.file_name()), true).await?;
+        }
+    }
+    let _ = std::fs::remove_dir(dir);
+    Ok(dest)
+}
+
 #[derive(Debug)]
 pub enum Outcome {
     Imported {
@@ -190,7 +235,22 @@ impl Importer {
         dir: &Path,
         release_id: Option<&str>,
     ) -> Result<Outcome, ImportError> {
-        self.import_with(dir, release_id, false).await
+        self.import_with(dir, release_id, Filing::New).await
+    }
+
+    /// [`Importer::import`], replacing a copy already filed: a folder these
+    /// files would land in is moved into `bin` first, at its path relative
+    /// to the library, rather than refusing the import or taking the files
+    /// for a repeat of it. For a new copy fetched because the filed one is
+    /// damaged, which looks the same as a repeat by format and length.
+    pub async fn import_replacing(
+        &self,
+        dir: &Path,
+        release_id: Option<&str>,
+        bin: &Path,
+    ) -> Result<Outcome, ImportError> {
+        self.import_with(dir, release_id, Filing::Replacing(bin))
+            .await
     }
 
     /// What beets' `replaygain`, `lastgenre` and `lyrics` plugins add after
@@ -272,14 +332,14 @@ impl Importer {
         dir: &Path,
         release_id: Option<&str>,
     ) -> Result<Outcome, ImportError> {
-        self.import_with(dir, release_id, true).await
+        self.import_with(dir, release_id, Filing::InPlace).await
     }
 
     async fn import_with(
         &self,
         dir: &Path,
         release_id: Option<&str>,
-        in_place: bool,
+        filing: Filing<'_>,
     ) -> Result<Outcome, ImportError> {
         let mut log = String::new();
         let tracks = read_dir(dir).await?;
@@ -338,7 +398,7 @@ impl Importer {
             }
         }
         let best = best.clone();
-        let dest = self.apply(&tracks, &best, dir, in_place, &mut log).await?;
+        let dest = self.apply(&tracks, &best, dir, filing, &mut log).await?;
         Ok(Outcome::Imported {
             dir: dest,
             release: Some(Candidate::from(&best)),
@@ -391,7 +451,7 @@ impl Importer {
         }
         let _ = writeln!(log, "as-is: filed by the files' own tags");
         let dest = self
-            .file(&tracks, &entries, None, dir, false, &mut log)
+            .file(&tracks, &entries, None, dir, Filing::New, &mut log)
             .await?;
         Ok(Outcome::Imported {
             dir: dest,
@@ -619,7 +679,7 @@ impl Importer {
         tracks: &[Track],
         m: &Match,
         source_dir: &Path,
-        in_place: bool,
+        filing: Filing<'_>,
         log: &mut String,
     ) -> Result<PathBuf, ImportError> {
         let release = &m.release;
@@ -632,7 +692,7 @@ impl Importer {
                 (l, self.tags(release, r, medium.position, rt, remote.len()))
             })
             .collect();
-        self.file(tracks, &entries, Some(release), source_dir, in_place, log)
+        self.file(tracks, &entries, Some(release), source_dir, filing, log)
             .await
     }
 
@@ -644,9 +704,10 @@ impl Importer {
         entries: &[(usize, Tags)],
         release: Option<&Release>,
         source_dir: &Path,
-        in_place: bool,
+        filing: Filing<'_>,
         log: &mut String,
     ) -> Result<PathBuf, ImportError> {
+        let in_place = matches!(filing, Filing::InPlace);
         let itself =
             |from: &Path, to: &Path| paths::collision_key(from) == paths::collision_key(to);
         let mut plan = Vec::with_capacity(entries.len());
@@ -680,10 +741,25 @@ impl Importer {
         // is overwritten either way.
         // In place, a file whose destination is itself is not "already
         // there": it is the file being retagged.
-        let present: Vec<bool> = plan
+        let mut present: Vec<bool> = plan
             .iter()
             .map(|(l, _, d)| d.exists() && !(in_place && itself(&tracks[*l].path, d)))
             .collect();
+        if let Filing::Replacing(bin) = filing {
+            let mut taken: Vec<PathBuf> = plan
+                .iter()
+                .zip(&present)
+                .filter(|(_, p)| **p)
+                .filter_map(|((_, _, d), _)| d.parent().map(Path::to_path_buf))
+                .collect();
+            taken.sort();
+            taken.dedup();
+            for dir in taken {
+                let to = set_aside(&dir, &self.cfg.directory, bin).await?;
+                let _ = writeln!(log, "replaced: {} moved to {}", dir.display(), to.display());
+            }
+            present = plan.iter().map(|(_, _, d)| d.exists()).collect();
+        }
         if !in_place && present.iter().all(|p| *p) && !plan.is_empty() {
             let same = plan.iter().all(|(l, _, d)| {
                 meta::read(d).is_ok_and(|there| {
