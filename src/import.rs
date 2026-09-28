@@ -322,7 +322,7 @@ impl Importer {
                 t.path.display()
             );
         }
-        let mut entries = as_is_tags(&tracks)?;
+        let mut entries = as_is_tags(&tracks, self.cfg.ft_in_title.as_ref())?;
         // The files carry no date the tagger trusts: MusicBrainz may still
         // have a year for this album and artist, even without a matching
         // release, as beets' `yearfixer` plugin looks one up.
@@ -362,7 +362,7 @@ impl Importer {
     /// and if not, why: the same check, without filing anything.
     pub async fn check_as_is(&self, dir: &Path) -> Result<(), ImportError> {
         let (tracks, _) = one_copy_each(read_dir(dir).await?);
-        as_is_tags(&tracks).map(|_| ())
+        as_is_tags(&tracks, self.cfg.ft_in_title.as_ref()).map(|_| ())
     }
 
     /// The folder's files and the tags they carry, as an import would read
@@ -741,11 +741,17 @@ impl Importer {
         } else {
             (index as u32 + 1, total as u32)
         };
+        let album_artist = release.artist();
+        let (artist, title) = self.fold_featuring(
+            matching::track_artist(release, index),
+            &album_artist,
+            rt.title.clone(),
+        );
         Tags {
-            title: rt.title.clone(),
-            artist: matching::track_artist(release, index),
+            title,
+            artist,
             album: release.title.clone(),
-            album_artist: release.artist(),
+            album_artist,
             track,
             track_total,
             disc,
@@ -767,6 +773,24 @@ impl Importer {
                 .map(|c| c.artist.id.clone()),
             mb_album_artist_id: release.artist_credit.first().map(|c| c.artist.id.clone()),
             mb_release_group_id: release.release_group.as_ref().map(|g| g.id.clone()),
+        }
+    }
+
+    /// Folds a featured artist out of `artist` and into `title`, per the
+    /// `ftintitle` plugin config; unchanged when it isn't configured or
+    /// doesn't apply.
+    fn fold_featuring(
+        &self,
+        artist: String,
+        album_artist: &str,
+        title: String,
+    ) -> (String, String) {
+        let Some(ft) = &self.cfg.ft_in_title else {
+            return (artist, title);
+        };
+        match crate::ftintitle::apply(&artist, album_artist, &title, ft.drop, &ft.format) {
+            Some((new_artist, new_title)) => (new_artist, new_title),
+            None => (artist, title),
         }
     }
 
@@ -918,7 +942,10 @@ pub struct ReleaseTrackView {
 }
 
 /// Tags for filing each file as it is, or why its tags cannot be trusted to.
-fn as_is_tags(tracks: &[Track]) -> Result<Vec<(usize, Tags)>, ImportError> {
+fn as_is_tags(
+    tracks: &[Track],
+    ft: Option<&crate::config::FtInTitle>,
+) -> Result<Vec<(usize, Tags)>, ImportError> {
     let norm = |s: Option<&str>| s.map(matching::normalise).filter(|s| !s.is_empty());
     let album = matching::consensus(tracks.iter().map(|t| t.album.as_deref()))
         .ok_or_else(|| ImportError::Untagged("no album tag".into()))?;
@@ -974,11 +1001,21 @@ fn as_is_tags(tracks: &[Track]) -> Result<Vec<(usize, Tags)>, ImportError> {
             ));
             continue;
         }
+        let artist = t.artist.clone().unwrap_or_else(|| album_artist.clone());
+        let (artist, title) = match ft {
+            Some(ft) => {
+                match crate::ftintitle::apply(&artist, &album_artist, &title, ft.drop, &ft.format) {
+                    Some((new_artist, new_title)) => (new_artist, new_title),
+                    None => (artist, title),
+                }
+            }
+            None => (artist, title),
+        };
         entries.push((
             i,
             Tags {
                 title,
-                artist: t.artist.clone().unwrap_or_else(|| album_artist.clone()),
+                artist,
                 album: album.clone(),
                 album_artist: album_artist.clone(),
                 track,
@@ -1186,7 +1223,7 @@ mod tests {
             ..Edits::default()
         };
         edits.apply(&mut tracks).unwrap();
-        let entries = as_is_tags(&tracks).unwrap();
+        let entries = as_is_tags(&tracks, None).unwrap();
         assert!(entries.iter().all(|(_, t)| t.album == "Right"));
         assert_eq!(entries[1].1.title, "Why");
 
@@ -1202,7 +1239,7 @@ mod tests {
         };
         clash.apply(&mut tracks).unwrap();
         assert!(
-            matches!(as_is_tags(&tracks), Err(ImportError::Untagged(m)) if m.contains("both track 1"))
+            matches!(as_is_tags(&tracks, None), Err(ImportError::Untagged(m)) if m.contains("both track 1"))
         );
     }
 
@@ -1251,27 +1288,33 @@ mod tests {
             ..Edits::default()
         };
         e.apply(&mut tracks).unwrap();
-        assert!(matches!(as_is_tags(&tracks), Err(ImportError::Untagged(_))));
+        assert!(matches!(
+            as_is_tags(&tracks, None),
+            Err(ImportError::Untagged(_))
+        ));
     }
 
     #[test]
     fn as_is_takes_a_coherent_album_and_fills_gaps_from_file_names() {
-        let entries = as_is_tags(&[
-            tagged(
-                "a/01 Intro.flac",
-                Some("Hidden"),
-                Some("ANNA"),
-                Some(1),
-                Some("Intro"),
-            ),
-            tagged(
-                "a/02 - Second Thing.flac",
-                Some("Hidden"),
-                Some("ANNA"),
-                None,
-                None,
-            ),
-        ])
+        let entries = as_is_tags(
+            &[
+                tagged(
+                    "a/01 Intro.flac",
+                    Some("Hidden"),
+                    Some("ANNA"),
+                    Some(1),
+                    Some("Intro"),
+                ),
+                tagged(
+                    "a/02 - Second Thing.flac",
+                    Some("Hidden"),
+                    Some("ANNA"),
+                    None,
+                    None,
+                ),
+            ],
+            None,
+        )
         .unwrap();
         let t: Vec<_> = entries
             .iter()
@@ -1283,10 +1326,13 @@ mod tests {
 
     #[test]
     fn as_is_calls_many_artists_a_compilation() {
-        let entries = as_is_tags(&[
-            tagged("a/01 x.flac", Some("Mix"), Some("One"), Some(1), Some("x")),
-            tagged("a/02 y.flac", Some("Mix"), Some("Two"), Some(2), Some("y")),
-        ])
+        let entries = as_is_tags(
+            &[
+                tagged("a/01 x.flac", Some("Mix"), Some("One"), Some(1), Some("x")),
+                tagged("a/02 y.flac", Some("Mix"), Some("Two"), Some(2), Some("y")),
+            ],
+            None,
+        )
         .unwrap();
         assert_eq!(entries[0].1.album_artist, "Various Artists");
         assert!(entries[0].1.compilation);
@@ -1295,7 +1341,7 @@ mod tests {
 
     #[test]
     fn as_is_refuses_tags_that_do_not_describe_one_album() {
-        let refuse = |tracks: &[Track], why: &str| match as_is_tags(tracks) {
+        let refuse = |tracks: &[Track], why: &str| match as_is_tags(tracks, None) {
             Err(ImportError::Untagged(msg)) => assert!(msg.contains(why), "{msg}"),
             other => panic!("expected a refusal about {why:?}, got {other:?}"),
         };
