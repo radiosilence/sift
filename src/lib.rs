@@ -1,5 +1,6 @@
 pub mod check;
 pub mod config;
+pub mod discogs;
 pub mod format;
 pub mod import;
 pub mod library;

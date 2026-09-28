@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Discogs is consulted as a second metadata source, as beets' `discogs` plugin does: when MusicBrainz's best match is not close enough to apply, and the `discogs` plugin is enabled with a token (`discogs.user_token` or `DISCOGS_TOKEN`), the same artist and album are searched on Discogs and its releases compete with MusicBrainz's on match distance. A Discogs release id is namespaced `discogs:<number>` (`--search-id discogs:<number>` applies one directly) and carries no MusicBrainz identifiers of its own; its cover art comes from Discogs rather than the Cover Art Archive.
 - `ImportError::Exists(dir)` for an album whose destinations are already taken by another copy of it, in place of a `Conflict` message carrying the path, so a caller can treat it as already filed.
 - Title, album and artist comparison is beets' `string_dist`, ported with its test suite: a leading "the", a bracketed or parenthesised part, a featured artist and a "Pt."/"Part" suffix cost a fraction of an unrelated difference; "(EP)" and "Single" cost nothing; "Song Title, The" equals "The Song Title"; accents are transliterated. It had counted "My Song (Remastered)" as far from "My Song" as any four-letter typo.
 - `Importer::enrich(dir)` adds what beets' `replaygain`, `lastgenre` and `lyrics` plugins add after an import: album and track gain, MusicBrainz genres when the album has none, and lyrics for tracks without them. Each writes only its own tags, and a failure in one is reported without stopping the others.

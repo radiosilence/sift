@@ -412,6 +412,11 @@ pub struct Release {
     pub label_info: Vec<LabelInfo>,
     #[serde(default)]
     pub media: Vec<Medium>,
+    /// Discogs' own cover image, for a `discogs:`-sourced release; a
+    /// MusicBrainz release has none, and its art comes from the Cover Art
+    /// Archive instead.
+    #[serde(default)]
+    pub cover_url: Option<String>,
 }
 
 impl Release {

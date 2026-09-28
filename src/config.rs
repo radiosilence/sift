@@ -53,6 +53,16 @@ pub struct Config {
     pub musicbrainz_contact: String,
     /// Where MusicBrainz responses are kept between imports.
     pub cache_dir: Option<PathBuf>,
+    /// Set only when the `discogs` plugin is listed and a token is
+    /// available, from `discogs.user_token` or `DISCOGS_TOKEN`.
+    pub discogs: Option<DiscogsConf>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DiscogsConf {
+    pub token: String,
+    /// Prefix a medley's sub-tracks with the enclosing index track's title.
+    pub index_tracks: bool,
 }
 
 /// The template beets ships with, translated.
@@ -74,6 +84,7 @@ impl Default for Config {
             strong_threshold: 0.04,
             musicbrainz_contact: "https://github.com/radiosilence/sift".into(),
             cache_dir: dirs::cache_dir().map(|d| d.join("sift")),
+            discogs: None,
         }
     }
 }
@@ -116,6 +127,8 @@ struct Raw {
     embedart: RawArt,
     #[serde(rename = "match", default)]
     matching: RawMatch,
+    #[serde(default)]
+    discogs: RawDiscogs,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -133,6 +146,12 @@ struct RawArt {
 #[derive(Debug, Default, Deserialize)]
 struct RawMatch {
     strong_rec_thresh: Option<f64>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RawDiscogs {
+    user_token: Option<String>,
+    index_tracks: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -164,6 +183,9 @@ impl Config {
         let mut cfg = Self::default();
         let mut art_width = None;
         let mut fetchart = false;
+        let mut discogs_enabled = false;
+        let mut discogs_token = None;
+        let mut discogs_index_tracks = false;
         for raw in layers {
             if let Some(d) = raw.directory {
                 cfg.directory = expand(&d);
@@ -208,11 +230,22 @@ impl Config {
             if let Some(t) = raw.matching.strong_rec_thresh {
                 cfg.strong_threshold = t;
             }
+            discogs_enabled |= raw.plugins.contains("discogs");
+            discogs_token = raw.discogs.user_token.or(discogs_token);
+            discogs_index_tracks = raw.discogs.index_tracks.unwrap_or(discogs_index_tracks);
         }
         cfg.fetch_art = fetchart;
         if let Some(w) = art_width {
             cfg.art_max_width = w;
         }
+        let token = std::env::var("DISCOGS_TOKEN").ok().or(discogs_token);
+        cfg.discogs = discogs_enabled
+            .then_some(token)
+            .flatten()
+            .map(|token| DiscogsConf {
+                token,
+                index_tracks: discogs_index_tracks,
+            });
         // No `directory` is allowed: a shared base config often leaves it to
         // a per-machine file, and a caller may set it after loading. Whoever
         // imports checks it is set.
