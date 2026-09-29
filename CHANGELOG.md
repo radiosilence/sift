@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+
+- **macOS release binaries are signed with a Developer ID and notarised.** Downloaded through a browser, the ad-hoc signed binaries were quarantined and Gatekeeper refused to run them until the quarantine attribute was cleared.
+
 ## 0.3.4
 
 - **`Importer::import_replacing` files a new copy over one already there.** A plain import takes files landing on an existing copy of the same format and length for a repeat and moves nothing, which is right for a retry and wrong for a copy fetched because the filed one is damaged: damage does not change a file's format or stated length. With a bin directory, any folder the new files would land in is moved into the bin first, at its path relative to the library (renamed "… (replaced N)" if the bin already holds one), and the new copy is filed.
