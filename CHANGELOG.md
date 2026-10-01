@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 0.3.6
+
+### Fixed
+
+- **Working out where an album goes no longer lists the library for every track.** Matching a folder's spelling on disk read the library root and statted every entry in it, for each directory of each track's destination, so planning a re-file of a large library on a USB drive took minutes. On a case-sensitive disk a folder of exactly the name is now checked first, with one stat; a listing is read only when that misses (and always on macOS, where the check cannot tell spellings apart), and only an entry whose name matches is statted. Nothing below a folder that does not exist is looked up.
+
 ## 0.3.5
 
 ### Changed
