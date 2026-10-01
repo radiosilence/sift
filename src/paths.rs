@@ -153,28 +153,36 @@ fn existing_case(root: &Path, path: &Path) -> std::path::PathBuf {
     };
     let parts: Vec<_> = rel.components().collect();
     let mut out = root.to_path_buf();
+    // Below a directory that does not exist yet, nothing does.
+    let mut absent = false;
     for (i, part) in parts.iter().enumerate() {
         let name = part.as_os_str();
-        let last = i + 1 == parts.len();
-        if last {
+        if absent || i + 1 == parts.len() {
             out.push(name);
             continue;
         }
-        // Read the directory rather than ask whether the name exists: on a
-        // case-insensitive disk it "exists" in any case, and the question is
-        // how it is spelled.
+        // On a case-sensitive disk a directory of exactly this name is the
+        // answer, for one stat. On a case-insensitive one it "exists" in any
+        // case, and the question is how it is spelled, so the listing is read.
+        if CASE_SENSITIVE && out.join(name).is_dir() {
+            out.push(name);
+            continue;
+        }
         let fold =
             |n: &std::ffi::OsStr| n.to_string_lossy().nfc().collect::<String>().to_lowercase();
         let want = fold(name);
+        // Names first: only an entry that matches is asked whether it is a
+        // directory, so a listing of thousands of artists costs one read.
         let dirs: Vec<std::ffi::OsString> = std::fs::read_dir(&out)
             .map(|entries| {
                 entries
                     .flatten()
-                    .filter(|e| e.path().is_dir() && fold(&e.file_name()) == want)
+                    .filter(|e| fold(&e.file_name()) == want && e.path().is_dir())
                     .map(|e| e.file_name())
                     .collect()
             })
             .unwrap_or_default();
+        absent = dirs.is_empty();
         let spelled = dirs
             .iter()
             .find(|d| d.as_os_str() == name)
@@ -185,6 +193,10 @@ fn existing_case(root: &Path, path: &Path) -> std::path::PathBuf {
     }
     out
 }
+
+/// Whether the disk tells `Rain` from `RAIN`: the same split as
+/// [`collision_key`].
+const CASE_SENSITIVE: bool = !cfg!(any(target_os = "macos", windows));
 
 /// How two destination names compare on the filesystem they land on:
 /// case-insensitively on macOS, where `Rain.flac` and `RAIN.flac` are one
@@ -305,6 +317,15 @@ pub async fn transfer(from: &Path, to: &Path, move_file: bool) -> std::io::Resul
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_path_under_a_folder_not_yet_made_is_kept_as_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("Other")).unwrap();
+        let got = under(root, "New Artist/(2020) Album [FLAC]/01. A.flac").unwrap();
+        assert_eq!(got, root.join("New Artist/(2020) Album [FLAC]/01. A.flac"));
+    }
 
     #[test]
     fn a_folder_already_filed_in_another_case_is_reused() {
