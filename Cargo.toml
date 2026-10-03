@@ -15,7 +15,7 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png"]
 lofty = "0.25"
 regex = "1.13.1"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "query"] }
-rusqlite = { version = "0.39", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 serde_yaml_ng = "0.10.0"
