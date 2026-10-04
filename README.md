@@ -4,6 +4,13 @@ Matches a folder of music against MusicBrainz, writes its tags, embeds cover
 art and files it into a library. A library and a CLI; the CLI reads an
 existing beets `config.yaml`, so it can stand in for `beet import`.
 
+The library is published to crates.io as `sift-music`, since `sift` was taken;
+it is still imported as `sift`:
+
+```toml
+sift = { package = "sift-music", version = "0.4" }
+```
+
 ```console
 $ mise use -g github:radiosilence/sift        # or brew install radiosilence/sift/sift,
                                               # or a static binary from the releases

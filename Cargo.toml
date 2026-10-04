@@ -1,7 +1,21 @@
 [package]
-name = "sift"
-version = "0.3.6"
+name = "sift-music"
+version = "0.4.0"
 edition = "2024"
+description = "Music tagger and library organiser: MusicBrainz matching, tag writing, cover art, fb2k-style paths"
+license = "MIT"
+repository = "https://github.com/radiosilence/sift"
+keywords = ["music", "musicbrainz", "tagging", "foobar2000"]
+categories = ["multimedia::audio", "command-line-utilities"]
+exclude = [".github", "lefthook.yml", "mise.toml"]
+
+# `sift` is taken on crates.io; the library and binary keep the name.
+[lib]
+name = "sift"
+
+[[bin]]
+name = "sift"
+path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0.104"
@@ -15,7 +29,7 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png"]
 lofty = "0.25"
 regex = "1.13.1"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "query"] }
-rusqlite = { version = "0.39", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 serde_yaml_ng = "0.10.0"
