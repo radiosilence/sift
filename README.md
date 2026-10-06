@@ -27,6 +27,26 @@ $ sift mbsync year:2020..                     # refresh from MusicBrainz
 $ sift missing ; sift bad ; sift stats         # gaps, damaged audio, totals
 ```
 
+## Why not beets
+
+beets is the reference: the match weights, query syntax, config keys and
+path templates follow it, and its distance tests are ported. sift exists
+for the places beets does not fit.
+
+- **It is a library first.** koan and slsk-mcp file downloads by calling
+  sift as a Rust dependency, and expose its commands over GraphQL and MCP.
+  From a Rust service, beets is a subprocess: a Python environment and its
+  plugins installed beside every deployment, and output to parse.
+- **One static binary**, the same on a Mac and a Raspberry Pi, installed
+  with mise or Homebrew.
+- **The files are the library.** beets keeps metadata in `library.db` and
+  queries that, so a tag changed by another tool is invisible until
+  `beet update`. sift's index is rebuilt from the files and can be deleted
+  at any time.
+
+An existing beets config and library work unchanged, so the two can be run
+side by side and beets dropped when sift covers what it was used for.
+
 ## What it reads from a beets config
 
 `directory`, `include`, `import.move`/`import.copy`, `paths.default` and
