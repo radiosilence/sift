@@ -7,6 +7,10 @@
 - **sift reads its own config, `~/.config/sift/config.yaml` or `$SIFT_CONFIG`, before the beets locations.** A setup that no longer runs beets had to keep its config under beets' name and location. The format is the same as the beets config sift already read, `include:` included, with path templates in fb2k syntax; an existing beets config still loads unchanged when there is no sift one.
 - **`sift migrate-config`** writes a sift config from a beets one: each file of an `include:` tree under the same relative name, keeping only the keys sift reads and translating `paths` templates to fb2k. It refuses to overwrite an existing file.
 
+### Fixed
+
+- **`migrate-config` keeps every file it writes inside `--to`.** With a relative `--from`, an include such as `../x.yaml` was written above `--to`; it is now refused, as any include outside the config's directory is. A file included twice is written once rather than reported as already existing, and absolute or `~` includes are rewritten relative to the including file, so the migrated config does not point back at the beets one.
+
 ### Changed
 
 - **A path template that calls any fb2k function is taken as fb2k and not translated.** Only `$num(` and `$if(` were recognised, so an fb2k template using, say, `$upper(` without either was mangled as if it were beets syntax. Translated templates now load back unchanged, which `migrate-config` relies on.
