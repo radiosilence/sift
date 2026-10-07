@@ -1,4 +1,4 @@
-//! `sift` — tag and file music. Reads your beets config.
+//! `sift` — tag and file music. Reads its own config, or your beets one.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -15,7 +15,8 @@ use sift::{Config, Importer, Outcome};
     about = "Match music against MusicBrainz, tag it, and file it into a library"
 )]
 struct Cli {
-    /// Config file. Defaults to the beets config: $BEETSDIR/config.yaml or
+    /// Config file. Defaults to the first that exists of $SIFT_CONFIG,
+    /// ~/.config/sift/config.yaml, $BEETSDIR/config.yaml and
     /// ~/.config/beets/config.yaml. Given before the command, as in beets:
     /// after it, `-c` is `import`'s `--copy`.
     #[arg(short, long)]
@@ -37,6 +38,18 @@ enum Command {
     Completions {
         /// The shell to complete for.
         shell: clap_complete::Shell,
+    },
+    /// Write a sift config from a beets one: the same files and includes,
+    /// keeping only the keys sift reads, with path templates in fb2k syntax.
+    /// Refuses to overwrite any existing file.
+    MigrateConfig {
+        /// The beets config. Defaults to $BEETSDIR/config.yaml, then
+        /// ~/.config/beets/config.yaml.
+        #[arg(long)]
+        from: Option<PathBuf>,
+        /// Directory to write into. Defaults to ~/.config/sift.
+        #[arg(long)]
+        to: Option<PathBuf>,
     },
     /// Import albums: one per directory given.
     Import {
@@ -192,6 +205,19 @@ async fn run() -> anyhow::Result<ExitCode> {
         clap_complete::generate(shell, &mut Cli::command(), "sift", &mut std::io::stdout());
         return Ok(ExitCode::SUCCESS);
     }
+    // Before the config: it migrates from a config with no `directory`.
+    if let Command::MigrateConfig { from, to } = cli.command {
+        let from = from
+            .or_else(Config::beets_path)
+            .ok_or_else(|| anyhow::anyhow!("no beets config found: pass --from"))?;
+        let to = to
+            .or_else(sift::config::sift_dir)
+            .ok_or_else(|| anyhow::anyhow!("no home directory: pass --to"))?;
+        for p in sift::config::migrate(&from, &to)? {
+            say!("{}", p.display());
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
     let path = cli.config.clone().or_else(Config::default_path);
     let mut cfg = match &path {
         Some(p) => Config::load(p)?,
@@ -212,7 +238,9 @@ async fn run() -> anyhow::Result<ExitCode> {
         .ok_or_else(|| anyhow::anyhow!("no data directory: pass --index"))?;
 
     match cli.command {
-        Command::Completions { .. } => unreachable!("handled before the config is read"),
+        Command::Completions { .. } | Command::MigrateConfig { .. } => {
+            unreachable!("handled before the config is read")
+        }
         Command::Update => {
             let mut lib = Library::open(&index)?.with_import_added(cfg.import_added);
             let r = lib.update(&cfg.directory)?;
