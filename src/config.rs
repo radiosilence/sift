@@ -1,5 +1,5 @@
-//! Configuration, read from a beets `config.yaml` so an existing setup keeps
-//! working unchanged.
+//! Configuration, read from sift's own `config.yaml` or from a beets one, so
+//! an existing beets setup keeps working unchanged. Both use the same keys.
 //!
 //! Only what sift acts on is read; everything else in the file is ignored
 //! rather than rejected, so a config full of plugin settings still loads.
@@ -9,7 +9,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -27,6 +27,20 @@ pub enum ConfigError {
     Regex {
         pattern: String,
         source: regex::Error,
+    },
+    #[error("{path}: an include outside the including file's directory cannot be migrated")]
+    IncludeOutside { path: PathBuf },
+    #[error("{path} already exists")]
+    Exists { path: PathBuf },
+    #[error("{path}: {source}")]
+    Write {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    #[error("{path}: {source}")]
+    Serialize {
+        path: PathBuf,
+        source: serde_yaml_ng::Error,
     },
 }
 
@@ -172,68 +186,95 @@ impl Ratio {
     }
 }
 
-#[derive(Debug, Default, Deserialize)]
+/// One config file as sift reads it. Serialising it back writes only the
+/// keys sift reads, which is what `migrate` relies on.
+#[derive(Debug, Default, Deserialize, Serialize)]
 struct Raw {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     include: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     directory: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_default")]
     import: RawImport,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     paths: BTreeMap<String, String>,
     /// Ordered: beets applies these in file order, and so must we.
+    #[serde(skip_serializing_if = "Option::is_none")]
     replace: Option<serde_yaml_ng::Mapping>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     asciify_paths: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     original_date: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     per_disc_numbering: Option<bool>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_default")]
     plugins: PluginList,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_default")]
     fetchart: RawArt,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_default")]
     embedart: RawArt,
-    #[serde(rename = "match", default)]
+    #[serde(rename = "match", default, skip_serializing_if = "is_default")]
     matching: RawMatch,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_default")]
     discogs: RawDiscogs,
+    #[serde(skip_serializing_if = "Option::is_none")]
     ftintitle: Option<RawFtInTitle>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+fn is_default<T: Default + PartialEq>(t: &T) -> bool {
+    *t == T::default()
+}
+
+#[derive(Debug, Default, PartialEq, Deserialize, Serialize)]
 struct RawFtInTitle {
+    #[serde(skip_serializing_if = "Option::is_none")]
     auto: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     drop: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     format: Option<String>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, PartialEq, Deserialize, Serialize)]
 struct RawImport {
-    #[serde(rename = "move")]
+    #[serde(rename = "move", skip_serializing_if = "Option::is_none")]
     move_files: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     copy: Option<bool>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, PartialEq, Deserialize, Serialize)]
 struct RawArt {
+    #[serde(skip_serializing_if = "Option::is_none")]
     maxwidth: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     minwidth: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     quality: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     enforce_ratio: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     high_resolution: Option<bool>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, PartialEq, Deserialize, Serialize)]
 struct RawMatch {
+    #[serde(skip_serializing_if = "Option::is_none")]
     strong_rec_thresh: Option<f64>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, PartialEq, Deserialize, Serialize)]
 struct RawDiscogs {
+    #[serde(skip_serializing_if = "Option::is_none")]
     user_token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     index_tracks: Option<bool>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+/// The plugins whose presence sift acts on.
+const PLUGINS: &[&str] = &["discogs", "fetchart", "ftintitle", "importadded"];
+
+#[derive(Debug, Default, PartialEq, Deserialize, Serialize)]
 #[serde(untagged)]
 enum PluginList {
     #[default]
@@ -250,10 +291,28 @@ impl PluginList {
             Self::Line(s) => s.split_whitespace().any(|p| p == name),
         }
     }
+
+    /// Only the plugins sift acts on, in file order.
+    fn known(&self) -> Self {
+        let names: Vec<String> = match self {
+            Self::None => return Self::None,
+            Self::List(l) => l.clone(),
+            Self::Line(s) => s.split_whitespace().map(str::to_string).collect(),
+        };
+        let kept: Vec<String> = names
+            .into_iter()
+            .filter(|p| PLUGINS.contains(&p.as_str()))
+            .collect();
+        if kept.is_empty() {
+            Self::None
+        } else {
+            Self::List(kept)
+        }
+    }
 }
 
 impl Config {
-    /// Load a beets config, following `include:` relative to its directory.
+    /// Load a sift or beets config, following `include:` relative to its directory.
     /// Later files override earlier ones, as in beets: includes first, then
     /// the file itself.
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
@@ -386,28 +445,158 @@ impl Config {
         Ok(cfg)
     }
 
-    /// `$BEETSDIR/config.yaml`, then `~/.config/beets/config.yaml`.
+    /// The first of `$SIFT_CONFIG`, `~/.config/sift/config.yaml`,
+    /// `$BEETSDIR/config.yaml` and `~/.config/beets/config.yaml` that exists.
     pub fn default_path() -> Option<PathBuf> {
-        std::env::var_os("BEETSDIR")
-            .map(|d| PathBuf::from(d).join("config.yaml"))
-            .or_else(|| dirs::home_dir().map(|h| h.join(".config/beets/config.yaml")))
-            .filter(|p| p.exists())
+        search(
+            std::env::var_os("SIFT_CONFIG").map(PathBuf::from),
+            std::env::var_os("BEETSDIR").map(PathBuf::from),
+            dirs::home_dir().as_deref(),
+        )
+    }
+
+    /// The first of `$BEETSDIR/config.yaml` and `~/.config/beets/config.yaml`
+    /// that exists.
+    pub fn beets_path() -> Option<PathBuf> {
+        beets_candidates(
+            std::env::var_os("BEETSDIR").map(PathBuf::from),
+            dirs::home_dir().as_deref(),
+        )
+        .find(|p| p.exists())
     }
 }
 
-fn collect(path: &Path, out: &mut Vec<Raw>, depth: usize) -> Result<(), ConfigError> {
+fn search(
+    sift_config: Option<PathBuf>,
+    beetsdir: Option<PathBuf>,
+    home: Option<&Path>,
+) -> Option<PathBuf> {
+    sift_config
+        .into_iter()
+        .chain(home.map(|h| h.join(".config/sift/config.yaml")))
+        .chain(beets_candidates(beetsdir, home))
+        .find(|p| p.exists())
+}
+
+fn beets_candidates(
+    beetsdir: Option<PathBuf>,
+    home: Option<&Path>,
+) -> impl Iterator<Item = PathBuf> {
+    beetsdir
+        .map(|d| d.join("config.yaml"))
+        .into_iter()
+        .chain(home.map(|h| h.join(".config/beets/config.yaml")))
+}
+
+/// `~/.config/sift`, where `migrate` writes by default.
+pub fn sift_dir() -> Option<PathBuf> {
+    dirs::home_dir().map(|h| h.join(".config/sift"))
+}
+
+/// Copy the beets config at `from`, and the files it includes, into `to`
+/// under the same relative names, keeping only the keys sift reads and
+/// translating `paths` templates to fb2k syntax. Nothing is written if any
+/// destination already exists. Returns the paths written.
+pub fn migrate(from: &Path, to: &Path) -> Result<Vec<PathBuf>, ConfigError> {
+    let root = from.parent().unwrap_or(Path::new("."));
+    let mut files = Vec::new();
+    migrate_collect(from, root, &mut files, 0)?;
+    let mut planned = Vec::new();
+    for (rel, mut raw) in files {
+        let dest = to.join(&rel);
+        if dest.exists() || planned.iter().any(|(d, _)| d == &dest) {
+            return Err(ConfigError::Exists { path: dest });
+        }
+        raw.paths.retain(|k, _| k == "default" || k == "comp");
+        for t in raw.paths.values_mut() {
+            *t = translate(t);
+        }
+        raw.plugins = raw.plugins.known();
+        let text = serde_yaml_ng::to_string(&raw).map_err(|source| ConfigError::Serialize {
+            path: dest.clone(),
+            source,
+        })?;
+        planned.push((dest, text));
+    }
+    let mut written = Vec::new();
+    for (dest, text) in planned {
+        let write = || -> std::io::Result<()> {
+            if let Some(dir) = dest.parent() {
+                std::fs::create_dir_all(dir)?;
+            }
+            use std::io::Write;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&dest)?
+                .write_all(text.as_bytes())
+        };
+        write().map_err(|source| ConfigError::Write {
+            path: dest.clone(),
+            source,
+        })?;
+        written.push(dest);
+    }
+    Ok(written)
+}
+
+/// Read `path` and its includes, each with its path relative to `root`.
+fn migrate_collect(
+    path: &Path,
+    root: &Path,
+    out: &mut Vec<(PathBuf, Raw)>,
+    depth: usize,
+) -> Result<(), ConfigError> {
+    let rel = normalise(path)
+        .strip_prefix(normalise(root))
+        .map(Path::to_path_buf)
+        .map_err(|_| ConfigError::IncludeOutside { path: path.into() })?;
+    let raw = read_raw(path)?;
+    if depth < 8 {
+        let dir = path.parent().unwrap_or(Path::new("."));
+        for inc in &raw.include {
+            migrate_collect(&dir.join(expand(inc)), root, out, depth + 1)?;
+        }
+    }
+    out.push((rel, raw));
+    Ok(())
+}
+
+/// Drop `.` components and resolve `..` lexically, so `a/./b.yaml` and
+/// `a/c/../b.yaml` both compare as `a/b.yaml`.
+fn normalise(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for c in path.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !out.pop() {
+                    out.push("..");
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+fn read_raw(path: &Path) -> Result<Raw, ConfigError> {
     let text = std::fs::read_to_string(path).map_err(|source| ConfigError::Read {
         path: path.into(),
         source,
     })?;
-    let raw: Raw = if text.trim().is_empty() {
-        Raw::default()
-    } else {
-        serde_yaml_ng::from_str(&text).map_err(|source| ConfigError::Parse {
-            path: path.into(),
-            source,
-        })?
-    };
+    if text.trim().is_empty() {
+        return Ok(Raw::default());
+    }
+    serde_yaml_ng::from_str(&text).map_err(|source| ConfigError::Parse {
+        path: path.into(),
+        source,
+    })
+}
+
+fn collect(path: &Path, out: &mut Vec<Raw>, depth: usize) -> Result<(), ConfigError> {
+    let raw = read_raw(path)?;
     if depth < 8 {
         let dir = path.parent().unwrap_or(Path::new("."));
         for inc in &raw.include {
@@ -445,18 +634,30 @@ fn field(name: &str) -> String {
 }
 
 /// Translate a beets path template into fb2k syntax. A template that uses
-/// no beets syntax is returned as it is, so sift's own templates pass
-/// through.
+/// no beets syntax, or calls an fb2k function, is returned as it is, so
+/// sift's own templates (and translated ones) pass through.
 pub fn translate(template: &str) -> String {
     if !template.contains('$') && !template.contains("%if{") && !template.contains('{') {
         return template.to_string();
     }
-    if template.contains("$num(") || template.contains("$if(") {
+    if calls_fb2k_function(template) {
         return template.to_string();
     }
     let chars: Vec<char> = template.chars().collect();
     let (out, _) = translate_until(&chars, 0, &[]);
     out
+}
+
+/// Whether `template` has a `$name(` whose name is an fb2k function. beets
+/// writes functions as `%name{`, and has no fields named like these.
+fn calls_fb2k_function(template: &str) -> bool {
+    template.split('$').skip(1).any(|rest| {
+        rest.split_once('(').is_some_and(|(name, _)| {
+            !name.is_empty()
+                && name.chars().all(|c| c.is_ascii_alphanumeric())
+                && crate::format::functions::is_known_function(name)
+        })
+    })
 }
 
 /// Translate from `i` until one of `stops` at nesting depth zero.
@@ -665,5 +866,89 @@ mod tests {
         assert!(Ratio::Percent(10.0).allows(1000, 950));
         assert!(!Ratio::Percent(10.0).allows(1000, 800));
         assert!(!Ratio::Pixels(10).allows(1000, 980));
+    }
+
+    #[test]
+    fn searches_sift_then_beets_locations() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let beetsdir = dir.path().join("beetsdir");
+        let explicit = dir.path().join("explicit.yaml");
+        let sift = home.join(".config/sift/config.yaml");
+        let beets_env = beetsdir.join("config.yaml");
+        let beets_home = home.join(".config/beets/config.yaml");
+        let found = || search(Some(explicit.clone()), Some(beetsdir.clone()), Some(&home));
+
+        assert_eq!(found(), None);
+        for p in [&beets_home, &beets_env, &sift, &explicit] {
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, "").unwrap();
+            assert_eq!(found().as_ref(), Some(p));
+        }
+        assert_eq!(search(None, None, Some(&home)), Some(sift));
+    }
+
+    fn beets_tree() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("base.yaml"),
+            "paths:\n  default: $albumartist/%if{$year,($year) }$album/$track $title\n  singleton: Singles/$title\noriginal_date: true\nplugins: [fetchart, lastgenre, discogs]\nlastgenre:\n  count: 3\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("config.yaml"),
+            "include: [./base.yaml]\n# per machine\ndirectory: /music\ndiscogs:\n  user_token: abc\n  source_weight: 0.5\n",
+        )
+        .unwrap();
+        dir
+    }
+
+    #[test]
+    fn migrates_a_beets_config_and_its_includes() {
+        let from = beets_tree();
+        let to = tempfile::tempdir().unwrap();
+        let to = to.path().join("sift");
+        let written = migrate(&from.path().join("config.yaml"), &to).unwrap();
+        assert_eq!(written, [to.join("base.yaml"), to.join("config.yaml")]);
+
+        let base: serde_yaml_ng::Value =
+            serde_yaml_ng::from_str(&std::fs::read_to_string(to.join("base.yaml")).unwrap())
+                .unwrap();
+        let template =
+            "%album artist%/$if(%year%,'('%year%') ',)%album%/$num(%tracknumber%,2) %title%";
+        assert_eq!(base["paths"]["default"].as_str(), Some(template));
+        assert!(base["paths"].get("singleton").is_none());
+        assert!(base.get("lastgenre").is_none());
+        assert_eq!(
+            base["plugins"],
+            serde_yaml_ng::from_str::<serde_yaml_ng::Value>("[fetchart, discogs]").unwrap()
+        );
+
+        let config: serde_yaml_ng::Value =
+            serde_yaml_ng::from_str(&std::fs::read_to_string(to.join("config.yaml")).unwrap())
+                .unwrap();
+        assert_eq!(config["include"][0].as_str(), Some("./base.yaml"));
+        assert_eq!(config["directory"].as_str(), Some("/music"));
+        assert_eq!(config["discogs"]["user_token"].as_str(), Some("abc"));
+        assert!(config["discogs"].get("source_weight").is_none());
+
+        let original = Config::load(&from.path().join("config.yaml")).unwrap();
+        let migrated = Config::load(&to.join("config.yaml")).unwrap();
+        assert_eq!(migrated.path_default, template);
+        assert_eq!(format!("{migrated:?}"), format!("{original:?}"));
+    }
+
+    #[test]
+    fn migrate_writes_nothing_when_a_destination_exists() {
+        let from = beets_tree();
+        let to = tempfile::tempdir().unwrap();
+        std::fs::write(to.path().join("base.yaml"), "kept").unwrap();
+        let err = migrate(&from.path().join("config.yaml"), to.path()).unwrap_err();
+        assert!(matches!(err, ConfigError::Exists { .. }), "{err}");
+        assert!(!to.path().join("config.yaml").exists());
+        assert_eq!(
+            std::fs::read_to_string(to.path().join("base.yaml")).unwrap(),
+            "kept"
+        );
     }
 }

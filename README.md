@@ -1,8 +1,8 @@
 # sift
 
 Matches a folder of music against MusicBrainz, writes its tags, embeds cover
-art and files it into a library. A library and a CLI; the CLI reads an
-existing beets `config.yaml`, so it can stand in for `beet import`.
+art and files it into a library. A library and a CLI; the CLI reads its own
+config or an existing beets `config.yaml`, so it can stand in for `beet import`.
 
 The library is published to crates.io as `sift-music`, since `sift` was taken;
 it is still imported as `sift`:
@@ -14,7 +14,8 @@ sift = { package = "sift-music", version = "0.4" }
 ```console
 $ mise use -g github:radiosilence/sift        # or brew install radiosilence/sift/sift,
                                               # or a static binary from the releases
-$ sift import ~/Downloads/some-album          # uses ~/.config/beets/config.yaml
+$ sift migrate-config                         # ~/.config/beets → ~/.config/sift
+$ sift import ~/Downloads/some-album          # uses ~/.config/sift/config.yaml
 $ sift match ~/Downloads/some-album           # show candidates, change nothing
 $ sift import --search-id <mbid> <dir>        # apply a specific release
 $ sift update                                 # index the library
@@ -47,13 +48,48 @@ for the places beets does not fit.
 An existing beets config and library work unchanged, so the two can be run
 side by side and beets dropped when sift covers what it was used for.
 
-## What it reads from a beets config
+## Config
 
-`directory`, `include`, `import.move`/`import.copy`, `paths.default` and
-`paths.comp`, `replace` (in file order), `asciify_paths`, `original_date`,
-`per_disc_numbering`, `match.strong_rec_thresh`, whether `fetchart` is among
-the `plugins`, and `embedart`/`fetchart` `maxwidth`. Everything else is
-ignored rather than rejected.
+sift uses the first of these that exists, unless `-c` names one:
+
+1. `$SIFT_CONFIG`
+2. `~/.config/sift/config.yaml`
+3. `$BEETSDIR/config.yaml`
+4. `~/.config/beets/config.yaml`
+
+sift's own config has the same keys as beets', so a beets config keeps
+working as it is. sift reads `directory`, `include`, `import.move`/`import.copy`,
+`paths.default` and `paths.comp`, `replace` (in file order), `asciify_paths`,
+`original_date`, `per_disc_numbering`, `match.strong_rec_thresh`, the
+`plugins` it acts on (`fetchart`, `importadded`, `ftintitle`, `discogs`), the
+`fetchart`/`embedart` size, quality and ratio options, `ftintitle` and
+`discogs` options. Everything else is ignored rather than rejected.
+
+`include:` paths are relative to the including file and are read first, so a
+tracked base file can hold the shared settings and an untracked per-machine
+file the rest:
+
+```yaml
+# ~/.config/sift/base.yaml
+paths:
+  default: "%album artist%/['('%year%') ']%album%/$num(%tracknumber%,2) %title%"
+original_date: true
+plugins: [fetchart, discogs]
+```
+
+```yaml
+# ~/.config/sift/config.yaml
+include: [./base.yaml]
+directory: /Volumes/music
+discogs:
+  user_token: ...
+```
+
+`sift migrate-config` writes a sift config from a beets one (`--from`,
+default the beets locations above) into `~/.config/sift` (`--to`): each file
+under the same relative name, its `include:` list kept, only the keys sift
+reads, and path templates translated to fb2k syntax. Comments are not
+carried over, and it refuses to overwrite any file already there.
 
 Discogs is consulted as a second source, as beets' `discogs` plugin does,
 when MusicBrainz has no match under `match.strong_rec_thresh` and the
