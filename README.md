@@ -28,6 +28,28 @@ $ sift mbsync year:2020..                     # refresh from MusicBrainz
 $ sift missing ; sift bad ; sift stats         # gaps, damaged audio, totals
 ```
 
+## Using the services politely
+
+MusicBrainz, the Cover Art Archive, Discogs and LRCLIB are run by small
+teams and volunteers, and are shared by every tagger that calls them. sift
+paces itself against each, but some of that depends on how it is run.
+
+- **Run one sift at a time.** Each process paces MusicBrainz (one request a
+  second, slower when refused) and Discogs on its own, so two imports in
+  parallel ask twice as fast. Queue folders instead; the service's global
+  budget is shared with everyone else.
+- **Keep the cache.** Responses are kept under the cache directory
+  (`~/Library/Caches/sift` on macOS, `~/.cache/sift` on Linux) for a day
+  for searches and a week for releases. Deleting it makes the next import of
+  the same albums ask again.
+- **Embedding the library:** reuse one `Importer` for the process rather than
+  building one per album, since each holds its own pacing gate, and set
+  `Config::musicbrainz_contact` to your own project URL or email so
+  MusicBrainz can reach whoever is sending the requests.
+- **Add what is missing.** An album with no match is usually missing from
+  MusicBrainz rather than mismatched. Adding the release there, instead of
+  importing with `--as-is`, fixes it for every tagger.
+
 ## Why not beets
 
 beets is the reference: the match weights, query syntax, config keys and
