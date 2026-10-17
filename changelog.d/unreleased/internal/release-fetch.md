@@ -1,1 +1,1 @@
-- **`just release` fetches crates before resolving the lockfile offline.** The offline resolve failed on a machine whose cargo cache lacked a locked dev-dependency.
+- **`just release` resolves the lockfile online.** It ran `cargo update --workspace --offline`, which fails on a machine whose cargo cache lacks a locked crate; `--workspace` alone already confines the update to the version bump.
