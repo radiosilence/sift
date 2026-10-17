@@ -15,6 +15,10 @@
 
 - **A path template that calls any fb2k function is taken as fb2k and not translated.** Only `$num(` and `$if(` were recognised, so an fb2k template using, say, `$upper(` without either was mangled as if it were beets syntax. Translated templates now load back unchanged, which `migrate-config` relies on.
 
+### Fixed
+
+- **A hidden track before track 1 is matched and filed.** MusicBrainz lists a CD's pregap track (HTOA) apart from the medium's tracks, and sift read only the tracks, so the rip's track 00 paired with nothing and was left behind. The pregap is now part of the release as track 0; it is not counted in the track total, and the tracks after it keep their numbers.
+
 ## 0.4.0
 
 ### Changed

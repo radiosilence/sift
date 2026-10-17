@@ -1,0 +1,1 @@
+- **rusqlite 0.40.** Two versions of rusqlite cannot link into one binary, since each bundles SQLite; this is the version koan uses, so koan can depend on sift.

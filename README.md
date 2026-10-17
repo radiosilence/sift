@@ -151,3 +151,17 @@ instead of disambiguated.
   not deleted.
 
 Many of these came from koan, where each was a bug first.
+
+## Development
+
+`just hooks` installs a pre-commit hook that formats; `just check` runs what
+CI runs. A change adds a changelog fragment under `changelog.d/unreleased/`
+(see `changelog.d/README.md`) rather than editing CHANGELOG.md, which is
+generated, so open pull requests do not conflict on it.
+
+`just release patch|minor|major` opens a release pull request with the
+version bumped and the changelog written; the Release workflow does the same
+from GitHub. Merging it publishes `sift-music` to crates.io, then the GitHub
+release with the binaries, then the Homebrew formula. CI creates the tag;
+tags are never pushed by hand. If a publish fails, running CI on main by hand
+retries whatever is not yet released.
