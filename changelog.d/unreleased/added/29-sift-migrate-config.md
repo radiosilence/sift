@@ -1,0 +1,1 @@
+- **`sift migrate-config`** writes a sift config from a beets one: each file of an `include:` tree under the same relative name, keeping only the keys sift reads and translating `paths` templates to fb2k. It refuses to overwrite an existing file.

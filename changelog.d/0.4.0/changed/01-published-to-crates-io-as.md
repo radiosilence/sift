@@ -1,0 +1,1 @@
+- **Published to crates.io as `sift-music`.** `sift` is another crate's name there. The library and binary are still called `sift`, so `use sift::…` and the `sift` command are unchanged; a dependent names the package: `sift = { package = "sift-music", version = "0.4" }`. Each release publishes the crate after the GitHub release.

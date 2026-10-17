@@ -1,0 +1,2 @@
+- `sift completions <shell>` prints completions for zsh, bash, fish, elvish or PowerShell, without needing a config.
+- `-c`/`--config` is given before the command, as in beets. It was global, and after `import` it collided with `-c`/`--copy`.
