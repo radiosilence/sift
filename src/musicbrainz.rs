@@ -467,13 +467,32 @@ impl Release {
     }
 
     pub fn track_count(&self) -> usize {
-        self.media.iter().map(|m| m.tracks.len()).sum()
+        self.media
+            .iter()
+            .map(|m| m.tracks.len() + usize::from(m.pregap.is_some()))
+            .sum()
     }
 
+    /// Every track in order, each medium's pregap (position 0) first.
     pub fn tracks(&self) -> impl Iterator<Item = (&Medium, &ReleaseTrack)> {
         self.media
             .iter()
-            .flat_map(|m| m.tracks.iter().map(move |t| (m, t)))
+            .flat_map(|m| m.pregap.iter().chain(m.tracks.iter()).map(move |t| (m, t)))
+    }
+
+    /// The track's number counted through the whole release: a pregap is
+    /// 0 and is not counted, so the tracks after it keep their numbers.
+    pub fn overall_number(&self, index: usize) -> u32 {
+        let mut n = 0;
+        for (i, (_, t)) in self.tracks().enumerate() {
+            if t.position != 0 {
+                n += 1;
+            }
+            if i == index {
+                return if t.position == 0 { 0 } else { n };
+            }
+        }
+        n
     }
 
     pub fn is_compilation(&self) -> bool {
@@ -510,6 +529,10 @@ pub struct Label {
 pub struct Medium {
     pub position: u32,
     pub format: Option<String>,
+    /// A hidden track before track 1 (HTOA), which MusicBrainz lists
+    /// apart from `tracks`, at position 0.
+    #[serde(default)]
+    pub pregap: Option<ReleaseTrack>,
     #[serde(default)]
     pub tracks: Vec<ReleaseTrack>,
 }
