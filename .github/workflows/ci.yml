@@ -179,7 +179,9 @@ jobs:
   # Before the GitHub release: a version on crates.io cannot be taken back, so
   # it goes out only once every check has passed, and a failure here leaves
   # nothing released for a manual run to trip over. Publishing errors on a
-  # version already out, so a re-run checks the index first.
+  # version already out, so a re-run checks the index first. The package job
+  # has already built this commit's crate as crates.io will see it, so the
+  # upload skips that build rather than compiling it again from cold.
   crates:
     name: Publish to crates.io
     needs: [test, lint, format, changelog, package, version, build]
@@ -199,7 +201,7 @@ jobs:
             echo "sift-music ${VERSION} is already on crates.io"
             exit 0
           fi
-          cargo publish --locked
+          cargo publish --locked --no-verify
 
   # Creates the tag through the API, on the commit that was built. The notes
   # are the version's section of CHANGELOG.md.
