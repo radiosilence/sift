@@ -7,7 +7,7 @@ license = "MIT"
 repository = "https://github.com/radiosilence/sift"
 keywords = ["music", "musicbrainz", "tagging", "foobar2000"]
 categories = ["multimedia::audio", "command-line-utilities"]
-exclude = [".github", "lefthook.yml", "mise.toml"]
+exclude = [".github", "changelog.d", "scripts", "justfile", "lefthook.yml", "mise.toml"]
 
 # `sift` is taken on crates.io; the library and binary keep the name.
 [lib]
