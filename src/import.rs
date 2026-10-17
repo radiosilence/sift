@@ -1654,7 +1654,7 @@ mod tests {
         .unwrap();
         let importer = Importer::with_musicbrainz(Config::default(), MusicBrainz::new("test"));
         let rt = &release.media[0].tracks[0];
-        let tags = importer.tags(&release, 0, 1, rt, 1);
+        let tags = importer.tags(&release, 0, 1, rt);
         assert_eq!(tags.date.as_deref(), Some("2002-02-18"));
         assert_eq!(tags.original_date.as_deref(), Some("2002-02-18"));
     }
