@@ -60,6 +60,9 @@ sed -i.bak "s/package = \"sift-music\", version = \"[^\"]*\"/package = \"sift-mu
 rm -f README.md.bak
 grep -q "package = \"sift-music\", version = \"$new_major.$new_minor\"" README.md
 
+# Offline so only the version changes in Cargo.lock; fetched first so the
+# offline resolve has every locked crate, dev-dependencies included.
+cargo fetch --locked --quiet
 cargo update --workspace --offline
 
 python3 scripts/changelog.py --release "$version"

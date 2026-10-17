@@ -1,0 +1,1 @@
+- **`just release` fetches crates before resolving the lockfile offline.** The offline resolve failed on a machine whose cargo cache lacked a locked dev-dependency.

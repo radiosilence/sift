@@ -7,10 +7,6 @@
 - **sift reads its own config, `~/.config/sift/config.yaml` or `$SIFT_CONFIG`, before the beets locations.** A setup that no longer runs beets had to keep its config under beets' name and location. The format is the same as the beets config sift already read, `include:` included, with path templates in fb2k syntax; an existing beets config still loads unchanged when there is no sift one.
 - **`sift migrate-config`** writes a sift config from a beets one: each file of an `include:` tree under the same relative name, keeping only the keys sift reads and translating `paths` templates to fb2k. It refuses to overwrite an existing file.
 
-### Fixed
-
-- **`migrate-config` keeps every file it writes inside `--to`.** With a relative `--from`, an include such as `../x.yaml` was written above `--to`; it is now refused, as any include outside the config's directory is. A file included twice is written once rather than reported as already existing, and absolute or `~` includes are rewritten relative to the including file, so the migrated config does not point back at the beets one.
-
 ### Changed
 
 - **A path template that calls any fb2k function is taken as fb2k and not translated.** Only `$num(` and `$if(` were recognised, so an fb2k template using, say, `$upper(` without either was mangled as if it were beets syntax. Translated templates now load back unchanged, which `migrate-config` relies on.
@@ -18,6 +14,11 @@
 ### Fixed
 
 - **A hidden track before track 1 is matched and filed.** MusicBrainz lists a CD's pregap track (HTOA) apart from the medium's tracks, and sift read only the tracks, so the rip's track 00 paired with nothing and was left behind. The pregap is now part of the release as track 0; it is not counted in the track total, and the tracks after it keep their numbers.
+
+### Internal
+
+- **Releases are cut through a release pull request.** `just release patch|minor|major` (or the Release workflow) bumps the version, turns the changelog fragments in `changelog.d/` into the release and opens the PR; merging it publishes the crate to crates.io, then the GitHub release with the version's changelog section as its notes. The crate now goes out before the GitHub release, so a failed publish leaves nothing released and a manual run of CI retries it. Pull requests add a fragment instead of editing CHANGELOG.md, so they no longer conflict on it, and CI packages the crate on every run, so a packaging problem shows on the pull request rather than during a release.
+- **`just release` fetches crates before resolving the lockfile offline.** The offline resolve failed on a machine whose cargo cache lacked a locked dev-dependency.
 
 ## 0.4.0
 
