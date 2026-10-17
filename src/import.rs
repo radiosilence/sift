@@ -689,7 +689,7 @@ impl Importer {
             .iter()
             .map(|&(l, r)| {
                 let (medium, rt) = remote[r];
-                (l, self.tags(release, r, medium.position, rt, remote.len()))
+                (l, self.tags(release, r, medium.position, rt))
             })
             .collect();
         self.file(tracks, &entries, Some(release), source_dir, filing, log)
@@ -890,7 +890,6 @@ impl Importer {
         index: usize,
         disc: u32,
         rt: &crate::musicbrainz::ReleaseTrack,
-        total: usize,
     ) -> Tags {
         let medium = release.media.iter().find(|m| m.position == disc);
         // A release with no date of its own (or MusicBrainz's placeholder
@@ -913,7 +912,10 @@ impl Importer {
         let (track, track_total) = if self.cfg.per_disc_numbering {
             (rt.position, medium.map_or(0, |m| m.tracks.len()) as u32)
         } else {
-            (index as u32 + 1, total as u32)
+            (
+                release.overall_number(index),
+                release.media.iter().map(|m| m.tracks.len()).sum::<usize>() as u32,
+            )
         };
         let album_artist = release.artist();
         let (artist, title) = self.fold_featuring(

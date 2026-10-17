@@ -506,6 +506,7 @@ fn build_media(flat: Vec<FlatTrack>) -> Vec<Medium> {
         .map(|(position, tracks)| Medium {
             position,
             format: None,
+            pregap: None,
             tracks,
         })
         .collect()
