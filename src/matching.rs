@@ -332,7 +332,7 @@ fn pair_by_number(local: &[Track], release: &Release) -> Option<Vec<(usize, usiz
         .all(|(i, t)| t.track.is_some_and(|n| overall.insert(n, i).is_none()));
     let continuous: Vec<(usize, usize)> = if unique {
         (0..release.tracks().count())
-            .filter_map(|r| overall.get(&(r as u32 + 1)).map(|&l| (l, r)))
+            .filter_map(|r| overall.get(&release.overall_number(r)).map(|&l| (l, r)))
             .collect()
     } else {
         Vec::new()
@@ -532,6 +532,36 @@ mod tests {
         ];
         let m = score(&local, &two_sides);
         assert_eq!(m.pairs, [(0, 0), (1, 1), (2, 2), (3, 3)]);
+        assert!(m.is_complete());
+    }
+
+    #[test]
+    fn a_hidden_track_before_track_one_pairs_with_the_pregap() {
+        let with_pregap: Release = serde_json::from_value(serde_json::json!({
+            "id": "r", "title": "Geogaddi",
+            "artist-credit": [{"name": "Boards of Canada", "joinphrase": "", "artist": {"id": "a", "name": "Boards of Canada"}}],
+            "media": [{"position": 1,
+                "pregap": {"id": "t0", "position": 0, "title": "[silence] / [unknown]", "length": 134000, "recording": {"id": "r0"}},
+                "tracks": [
+                    {"id": "t1", "position": 1, "title": "Ready Lets Go", "length": 59000, "recording": {"id": "r1"}},
+                    {"id": "t2", "position": 2, "title": "Music Is Math", "length": 321000, "recording": {"id": "r2"}}
+                ]}]
+        }))
+        .unwrap();
+        assert_eq!(with_pregap.track_count(), 3);
+        assert_eq!(
+            (0..3)
+                .map(|i| with_pregap.overall_number(i))
+                .collect::<Vec<_>>(),
+            [0, 1, 2]
+        );
+        let local = vec![
+            track("[silence] + [unknown]", Some(0), 103),
+            track("Ready Lets Go", Some(1), 59),
+            track("Music Is Math", Some(2), 321),
+        ];
+        let m = score(&local, &with_pregap);
+        assert_eq!(m.pairs, [(0, 0), (1, 1), (2, 2)]);
         assert!(m.is_complete());
     }
 

@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 0.3.7
+
+### Fixed
+
+- **A hidden track before track 1 is matched and filed.** MusicBrainz lists a CD's pregap track (HTOA) apart from the medium's tracks, and sift read only the tracks, so the rip's track 00 paired with nothing and was left behind. The pregap is now part of the release as track 0; it is not counted in the track total, and the tracks after it keep their numbers. Backported from 0.4 for dependents still on rusqlite below 0.40.
+
 ## 0.3.6
 
 ### Fixed
