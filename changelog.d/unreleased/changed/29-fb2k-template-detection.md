@@ -1,0 +1,1 @@
+- **A path template that calls any fb2k function is taken as fb2k and not translated.** Only `$num(` and `$if(` were recognised, so an fb2k template using, say, `$upper(` without either was mangled as if it were beets syntax. Translated templates now load back unchanged, which `migrate-config` relies on.
