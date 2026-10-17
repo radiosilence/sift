@@ -498,9 +498,15 @@ pub fn sift_dir() -> Option<PathBuf> {
 /// translating `paths` templates to fb2k syntax. Nothing is written if any
 /// destination already exists. Returns the paths written.
 pub fn migrate(from: &Path, to: &Path) -> Result<Vec<PathBuf>, ConfigError> {
-    let root = from.parent().unwrap_or(Path::new("."));
+    // Absolute, not canonical: a symlinked include (as stow makes) is filed
+    // under the name it is included by.
+    let from = std::path::absolute(from).map_err(|source| ConfigError::Read {
+        path: from.into(),
+        source,
+    })?;
+    let root = normalise(from.parent().unwrap_or(Path::new("/")));
     let mut files = Vec::new();
-    migrate_collect(from, root, &mut files, 0)?;
+    migrate_collect(&from, &root, &mut files, &mut Vec::new(), 0)?;
     let mut planned = Vec::new();
     for (rel, mut raw) in files {
         let dest = to.join(&rel);
@@ -540,26 +546,63 @@ pub fn migrate(from: &Path, to: &Path) -> Result<Vec<PathBuf>, ConfigError> {
     Ok(written)
 }
 
-/// Read `path` and its includes, each with its path relative to `root`.
+/// Read `path` and its includes, each with its path relative to `root`,
+/// includes first. Each file is read once, however often it is included.
+/// Its `include:` entries are rewritten relative to its own directory, so
+/// none points back at the original location. Returns `path`'s relative
+/// name.
 fn migrate_collect(
     path: &Path,
     root: &Path,
     out: &mut Vec<(PathBuf, Raw)>,
+    seen: &mut Vec<PathBuf>,
     depth: usize,
-) -> Result<(), ConfigError> {
+) -> Result<PathBuf, ConfigError> {
+    let outside = || ConfigError::IncludeOutside { path: path.into() };
     let rel = normalise(path)
-        .strip_prefix(normalise(root))
+        .strip_prefix(root)
         .map(Path::to_path_buf)
-        .map_err(|_| ConfigError::IncludeOutside { path: path.into() })?;
-    let raw = read_raw(path)?;
+        .map_err(|_| outside())?;
+    if rel.is_absolute()
+        || rel
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(outside());
+    }
+    if seen.contains(&rel) {
+        return Ok(rel);
+    }
+    seen.push(rel.clone());
+    let mut raw = read_raw(path)?;
+    let includes = std::mem::take(&mut raw.include);
     if depth < 8 {
-        let dir = path.parent().unwrap_or(Path::new("."));
-        for inc in &raw.include {
-            migrate_collect(&dir.join(expand(inc)), root, out, depth + 1)?;
+        let dir = path.parent().unwrap_or(Path::new("/"));
+        let rel_dir = rel.parent().unwrap_or(Path::new(""));
+        for inc in includes {
+            let child = migrate_collect(&dir.join(expand(&inc)), root, out, seen, depth + 1)?;
+            raw.include
+                .push(relative_to(rel_dir, &child).to_string_lossy().into_owned());
         }
     }
-    out.push((rel, raw));
-    Ok(())
+    out.push((rel.clone(), raw));
+    Ok(rel)
+}
+
+/// `file` as a path relative to `dir`; both are relative to the same root,
+/// or both absolute, and contain no `..`.
+fn relative_to(dir: &Path, file: &Path) -> PathBuf {
+    let common = dir
+        .components()
+        .zip(file.components())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let mut out = PathBuf::new();
+    for _ in common..dir.components().count() {
+        out.push("..");
+    }
+    out.extend(file.components().skip(common));
+    out
 }
 
 /// Drop `.` components and resolve `..` lexically, so `a/./b.yaml` and
@@ -571,7 +614,11 @@ fn normalise(path: &Path) -> PathBuf {
         match c {
             Component::CurDir => {}
             Component::ParentDir => {
-                if !out.pop() {
+                if matches!(
+                    out.components().next_back(),
+                    None | Some(Component::ParentDir)
+                ) || !out.pop()
+                {
                     out.push("..");
                 }
             }
@@ -927,7 +974,7 @@ mod tests {
         let config: serde_yaml_ng::Value =
             serde_yaml_ng::from_str(&std::fs::read_to_string(to.join("config.yaml")).unwrap())
                 .unwrap();
-        assert_eq!(config["include"][0].as_str(), Some("./base.yaml"));
+        assert_eq!(config["include"][0].as_str(), Some("base.yaml"));
         assert_eq!(config["directory"].as_str(), Some("/music"));
         assert_eq!(config["discogs"]["user_token"].as_str(), Some("abc"));
         assert!(config["discogs"].get("source_weight").is_none());
@@ -950,5 +997,73 @@ mod tests {
             std::fs::read_to_string(to.path().join("base.yaml")).unwrap(),
             "kept"
         );
+    }
+
+    #[test]
+    fn migrate_refuses_an_include_above_a_relative_from() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("cfg");
+        std::fs::create_dir(&cfg).unwrap();
+        std::fs::write(dir.path().join("x.yaml"), "directory: /x\n").unwrap();
+        std::fs::write(cfg.join("config.yaml"), "include: [../x.yaml]\n").unwrap();
+        let to = dir.path().join("out");
+        let cwd = std::env::current_dir().unwrap();
+        // A relative `from` is resolved against the working directory.
+        let from = relative_to(&cwd, &cfg.join("config.yaml"));
+        let err = migrate(&from, &to).unwrap_err();
+        assert!(matches!(err, ConfigError::IncludeOutside { .. }), "{err}");
+        assert!(!to.exists());
+    }
+
+    #[test]
+    fn normalise_keeps_leading_parents() {
+        assert_eq!(
+            normalise(Path::new("../../../a/x")),
+            Path::new("../../../a/x")
+        );
+        assert_eq!(normalise(Path::new("a/./b/../c")), Path::new("a/c"));
+    }
+
+    #[test]
+    fn migrate_writes_a_diamond_include_once() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("shared.yaml"), "original_date: true\n").unwrap();
+        std::fs::write(dir.path().join("a.yaml"), "include: [shared.yaml]\n").unwrap();
+        std::fs::write(dir.path().join("b.yaml"), "include: [./shared.yaml]\n").unwrap();
+        std::fs::write(
+            dir.path().join("config.yaml"),
+            "include: [a.yaml, b.yaml]\ndirectory: /music\n",
+        )
+        .unwrap();
+        let to = dir.path().join("out");
+        let written = migrate(&dir.path().join("config.yaml"), &to).unwrap();
+        assert_eq!(
+            written,
+            ["shared.yaml", "a.yaml", "b.yaml", "config.yaml"].map(|f| to.join(f))
+        );
+    }
+
+    #[test]
+    fn migrate_rewrites_an_absolute_include_as_relative() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        std::fs::write(dir.path().join("base.yaml"), "original_date: true\n").unwrap();
+        std::fs::write(
+            dir.path().join("sub/machine.yaml"),
+            format!("include: [{}]\n", dir.path().join("base.yaml").display()),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("config.yaml"),
+            "include: [sub/machine.yaml]\n",
+        )
+        .unwrap();
+        let to = dir.path().join("out");
+        migrate(&dir.path().join("config.yaml"), &to).unwrap();
+        let machine: serde_yaml_ng::Value =
+            serde_yaml_ng::from_str(&std::fs::read_to_string(to.join("sub/machine.yaml")).unwrap())
+                .unwrap();
+        assert_eq!(machine["include"][0].as_str(), Some("../base.yaml"));
+        assert!(Config::load(&to.join("config.yaml")).unwrap().original_date);
     }
 }
