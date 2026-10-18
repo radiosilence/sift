@@ -712,6 +712,19 @@ impl Library {
         Ok(())
     }
 
+    /// Stamp every file indexed under `dir` as added at `added`, in seconds
+    /// since the epoch. For an album moved outside [`Library::rename`] (a
+    /// re-import), whose files a scan finds as new: it keeps the date it
+    /// first arrived.
+    pub fn set_added(&self, dir: &Path, added: i64) -> Result<(), LibraryError> {
+        let prefix = format!("{}/", dir.to_string_lossy().trim_end_matches('/'));
+        self.conn.execute(
+            "UPDATE items SET added = ?2 WHERE substr(path, 1, length(?1)) = ?1",
+            params![prefix, added],
+        )?;
+        Ok(())
+    }
+
     fn all(&self) -> Result<Vec<Item>, LibraryError> {
         let mut stmt = self.conn.prepare(
             "SELECT path, size, mtime, added, title, artist, album, albumartist, track,
@@ -1037,6 +1050,33 @@ pub(crate) mod tests {
         assert_eq!(
             item.added,
             past.duration_since(UNIX_EPOCH).unwrap().as_secs() as i64
+        );
+    }
+
+    #[test]
+    fn set_added_stamps_only_the_album_under_its_directory() {
+        let root = tempfile::tempdir().unwrap();
+        for d in ["A", "A 2"] {
+            std::fs::create_dir(root.path().join(d)).unwrap();
+        }
+        tagged_wav(&root.path().join("A/x.wav"), "A", "B", "T", 1);
+        tagged_wav(&root.path().join("A 2/y.wav"), "A", "C", "T", 1);
+        let mut lib = Library::in_memory().unwrap();
+        lib.update(root.path()).unwrap();
+        lib.set_added(&root.path().join("A"), 42).unwrap();
+        let added = |name: &str| {
+            lib.items(&Query::default())
+                .unwrap()
+                .into_iter()
+                .find(|i| i.track.path.ends_with(name))
+                .unwrap()
+                .added
+        };
+        assert_eq!(added("x.wav"), 42);
+        assert_ne!(
+            added("y.wav"),
+            42,
+            "a directory sharing the prefix is not touched"
         );
     }
 }

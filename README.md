@@ -150,6 +150,14 @@ instead of disambiguated.
   of `enrich`): from the release when MusicBrainz has it, otherwise by
   splitting the credit only where every part is an artist the library
   already holds, since "&", "," and " x " also occur inside band names.
+- **Library writes can be previewed.** `Importer::credit_plan`,
+  `Importer::enrich_plan` and `Importer::rematch` return what `credit`,
+  `enrich` and `reimport` would write (each file's credits and their source,
+  genres, each track's lyrics, the release a re-import would apply and why it
+  might stop for review) without changing a file, so a front end can show a
+  change before making it. Gain is the exception: measuring it decodes every
+  file, so it is only done to write it. `Library::set_added` restamps an album
+  a re-import moved, so it keeps the date it first arrived.
 - **One copy of each track.** A folder holding an album in two formats, or
   with `(1)` duplicates, is imported from the best copy of each track.
 - **Nothing is overwritten.** Every destination is planned and checked before

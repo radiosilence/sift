@@ -196,6 +196,67 @@ pub struct Credited {
     pub problems: Vec<String>,
 }
 
+/// What [`Importer::credit`] would write. See [`Importer::credit_plan`].
+#[derive(Debug, Default, Clone, serde::Serialize)]
+pub struct CreditPlan {
+    pub files: Vec<PlannedCredit>,
+    pub problems: Vec<String>,
+}
+
+/// The credits one file would be given. A list left empty is not written:
+/// the file already has it, or nothing was found for it.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PlannedCredit {
+    pub path: PathBuf,
+    pub artists: Vec<String>,
+    pub artist_ids: Vec<String>,
+    pub album_artists: Vec<String>,
+    pub album_artist_ids: Vec<String>,
+    /// The MusicBrainz release the credits come from; none when the files'
+    /// own credit was split by the artists the library knows.
+    pub release: Option<String>,
+}
+
+/// What [`Importer::enrich`] would add. See [`Importer::enrich_plan`].
+#[derive(Debug, Default, Clone, serde::Serialize)]
+pub struct EnrichPlan {
+    pub credits: CreditPlan,
+    /// Written to every track; empty when the album has genres already or
+    /// MusicBrainz has none.
+    pub genres: Vec<String>,
+    /// Each track that has none and would be given lyrics.
+    pub lyrics: Vec<PlannedLyrics>,
+    pub problems: Vec<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PlannedLyrics {
+    pub path: PathBuf,
+    /// Timed lines (LRC) rather than plain text.
+    pub synced: bool,
+    pub text: String,
+}
+
+#[derive(Default)]
+struct Lookups {
+    genres: Vec<String>,
+    lyrics: Vec<PlannedLyrics>,
+    problems: Vec<String>,
+}
+
+/// What [`Importer::reimport`] would match an album to. See
+/// [`Importer::rematch`].
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Rematch {
+    /// The closest release and how the files line up against it.
+    pub best: Option<Comparison>,
+    /// Why a re-import without a release id would stop for a person to
+    /// choose rather than apply `best`.
+    pub review: Option<String>,
+    /// Every release considered, best first.
+    pub candidates: Vec<Candidate>,
+}
+
 /// How many search hits are looked up in full. Each is a rate-limited
 /// request, so this is the time an import spends at MusicBrainz.
 const LOOKUPS: usize = 5;
@@ -272,10 +333,43 @@ impl Importer {
     /// that already carry them alone. A release on MusicBrainz names its
     /// artists itself; otherwise a credit is split only where
     /// [`credits::split`] finds every part among the `known` artists.
-    /// `artist` and `albumartist` are never changed.
+    /// `artist` and `albumartist` are never changed. Writes what
+    /// [`Importer::credit_plan`] lists.
     pub async fn credit(&self, dir: &Path, known: &Known) -> Result<Credited, ImportError> {
+        let plan = self.credit_plan(dir, known).await?;
+        let mut out = Credited {
+            problems: plan.problems,
+            ..Credited::default()
+        };
+        for c in &plan.files {
+            let credits = meta::Credits {
+                artists: &c.artists,
+                artist_ids: &c.artist_ids,
+                album_artists: &c.album_artists,
+                album_artist_ids: &c.album_artist_ids,
+            };
+            match meta::write_credits(&c.path, &credits) {
+                Ok(()) => {
+                    out.files += 1;
+                    for a in c.artists.iter().chain(&c.album_artists) {
+                        if !out.artists.contains(a) {
+                            out.artists.push(a.clone());
+                        }
+                    }
+                }
+                Err(e) => out.problems.push(e.to_string()),
+            }
+        }
+        Ok(out)
+    }
+
+    /// What [`Importer::credit`] would write to each file of the album, and
+    /// where each credit comes from, without writing anything. Files that
+    /// already carry their credits, or whose credit cannot be split, are
+    /// not listed.
+    pub async fn credit_plan(&self, dir: &Path, known: &Known) -> Result<CreditPlan, ImportError> {
         let tracks = read_dir(dir).await?;
-        let mut out = Credited::default();
+        let mut out = CreditPlan::default();
         let pending = |t: &Track| t.artists.is_empty() || t.album_artists.is_empty();
         if !tracks.iter().any(pending) {
             return Ok(out);
@@ -333,27 +427,22 @@ impl Importer {
             if artists.is_empty() && album_artists.is_empty() {
                 continue;
             }
-            let credits = meta::Credits {
-                artist_ids: if artists.is_empty() { &[] } else { &artist_ids },
-                album_artist_ids: if album_artists.is_empty() {
-                    &[]
+            out.files.push(PlannedCredit {
+                path: t.path.clone(),
+                artist_ids: if artists.is_empty() {
+                    empty()
                 } else {
-                    &album_artist_ids
+                    artist_ids
                 },
-                artists: &artists,
-                album_artists: &album_artists,
-            };
-            match meta::write_credits(&t.path, &credits) {
-                Ok(()) => {
-                    out.files += 1;
-                    for a in artists.iter().chain(&album_artists) {
-                        if !out.artists.contains(a) {
-                            out.artists.push(a.clone());
-                        }
-                    }
-                }
-                Err(e) => out.problems.push(e.to_string()),
-            }
+                album_artist_ids: if album_artists.is_empty() {
+                    empty()
+                } else {
+                    album_artist_ids
+                },
+                artists,
+                album_artists,
+                release: release.as_ref().map(|r| r.id.clone()),
+            });
         }
         Ok(out)
     }
@@ -392,27 +481,59 @@ impl Importer {
             Err(e) => out.problems.push(format!("replaygain: {e}")),
         }
 
+        let found = self.lookups(&tracks).await;
+        out.problems.extend(found.problems);
+        if !found.genres.is_empty() {
+            let genre = found.genres.join("; ");
+            for p in &paths {
+                if let Err(e) = meta::set(p, &[("genre".into(), Some(genre.clone()))]) {
+                    out.problems.push(e.to_string());
+                }
+            }
+            out.genres = found.genres;
+        }
+        for l in &found.lyrics {
+            match meta::set_lyrics(&l.path, &l.text) {
+                Ok(()) => out.lyrics += 1,
+                Err(e) => out.problems.push(e.to_string()),
+            }
+        }
+        Ok(out)
+    }
+
+    /// What [`Importer::enrich`] would add to the album, without writing
+    /// anything: the artist credits, the genres and each track's lyrics,
+    /// looked up as enriching would. Gain is not measured: that takes
+    /// decoding every file, and is only worth doing to write it.
+    pub async fn enrich_plan(&self, dir: &Path, known: &Known) -> Result<EnrichPlan, ImportError> {
+        let credits = self.credit_plan(dir, known).await?;
+        let tracks = read_dir(dir).await?;
+        let found = self.lookups(&tracks).await;
+        let mut problems = credits.problems.clone();
+        problems.extend(found.problems);
+        Ok(EnrichPlan {
+            credits,
+            genres: found.genres,
+            lyrics: found.lyrics,
+            problems,
+        })
+    }
+
+    /// Genres from MusicBrainz when no track has any, and lyrics for each
+    /// track without them.
+    async fn lookups(&self, tracks: &[Track]) -> Lookups {
+        let mut out = Lookups::default();
         let untagged = tracks
             .iter()
             .all(|t| t.genre.as_deref().is_none_or(|g| g.trim().is_empty()));
         if untagged && let Some(id) = tracks.iter().find_map(|t| t.mb_album_id.clone()) {
             match self.mb.genres(&id).await {
-                Ok(g) if !g.is_empty() => {
-                    let genre = g.join("; ");
-                    for p in &paths {
-                        if let Err(e) = meta::set(p, &[("genre".into(), Some(genre.clone()))]) {
-                            out.problems.push(e.to_string());
-                        }
-                    }
-                    out.genres = g;
-                }
-                Ok(_) => {}
+                Ok(g) => out.genres = g,
                 Err(e) => out.problems.push(format!("genres: {e}")),
             }
         }
-
         let lyrics = crate::lyrics::Client::new();
-        for t in &tracks {
+        for t in tracks {
             let (Some(artist), Some(title)) = (&t.artist, &t.title) else {
                 continue;
             };
@@ -421,17 +542,21 @@ impl Importer {
             }
             let album = t.album.as_deref().unwrap_or("");
             match lyrics.get(artist, title, album, t.duration.as_secs()).await {
-                Ok(crate::lyrics::Lyrics::Synced(l) | crate::lyrics::Lyrics::Plain(l)) => {
-                    match meta::set_lyrics(&t.path, &l) {
-                        Ok(()) => out.lyrics += 1,
-                        Err(e) => out.problems.push(e.to_string()),
-                    }
-                }
+                Ok(crate::lyrics::Lyrics::Synced(text)) => out.lyrics.push(PlannedLyrics {
+                    path: t.path.clone(),
+                    synced: true,
+                    text,
+                }),
+                Ok(crate::lyrics::Lyrics::Plain(text)) => out.lyrics.push(PlannedLyrics {
+                    path: t.path.clone(),
+                    synced: false,
+                    text,
+                }),
                 Ok(_) => {}
                 Err(e) => out.problems.push(format!("lyrics: {e}")),
             }
         }
-        Ok(out)
+        out
     }
 
     /// Match an album already in the library again, as beets' `import -L`
@@ -486,27 +611,14 @@ impl Importer {
             best.parts
         );
 
-        if release_id.is_none() {
-            let reason = if best.distance > self.cfg.strong_threshold {
-                Some(format!(
-                    "closest match is distance {:.3}, above {:.3}",
-                    best.distance, self.cfg.strong_threshold
-                ))
-            } else if !best.is_complete() {
-                Some(format!(
-                    "{} tracks missing, {} files unmatched",
-                    best.missing, best.extra
-                ))
-            } else {
-                None
-            };
-            if let Some(reason) = reason {
-                return Ok(Outcome::Review {
-                    reason,
-                    candidates: matches.iter().take(5).map(Candidate::from).collect(),
-                    log,
-                });
-            }
+        if release_id.is_none()
+            && let Some(reason) = self.review_reason(best)
+        {
+            return Ok(Outcome::Review {
+                reason,
+                candidates: matches.iter().take(5).map(Candidate::from).collect(),
+                log,
+            });
         }
         let best = best.clone();
         let dest = self.apply(&tracks, &best, dir, filing, &mut log).await?;
@@ -590,63 +702,42 @@ impl Importer {
     pub async fn compare(&self, dir: &Path, release_id: &str) -> Result<Comparison, ImportError> {
         let (tracks, _) = one_copy_each(read_dir(dir).await?);
         let release = self.release(release_id).await?;
-        let m = matching::score(&tracks, &release);
-        let remote: Vec<_> = release.tracks().collect();
-        let name = |t: &Track| {
-            t.path
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default()
-        };
-        let pairs = m
-            .pairs
-            .iter()
-            .map(|&(l, r)| {
-                let (medium, rt) = remote[r];
-                let local = &tracks[l];
-                PairView {
-                    file: name(local),
-                    file_title: local.title.clone(),
-                    disc: medium.position,
-                    position: rt.position,
-                    title: rt.title.clone(),
-                    title_distance: (matching::string_distance(
-                        local.title.as_deref().unwrap_or_default(),
-                        &rt.title,
-                    ) * 1000.0)
-                        .round()
-                        / 1000.0,
-                    length_delta_secs: rt
-                        .length
-                        .or(rt.recording.length)
-                        .map(|ms| (local.duration.as_secs_f64() - ms as f64 / 1000.0).round()),
-                }
-            })
-            .collect();
-        let missing = remote
-            .iter()
-            .enumerate()
-            .filter(|(r, _)| !m.pairs.iter().any(|&(_, pr)| pr == *r))
-            .map(|(_, (medium, rt))| ReleaseTrackView {
-                disc: medium.position,
-                position: rt.position,
-                title: rt.title.clone(),
-                length_secs: rt.length.or(rt.recording.length).map(|ms| ms / 1000),
-            })
-            .collect();
-        let extra = tracks
-            .iter()
-            .enumerate()
-            .filter(|(l, _)| !m.pairs.iter().any(|&(pl, _)| pl == *l))
-            .map(|(_, t)| name(t))
-            .collect();
-        Ok(Comparison {
-            release: Candidate::from(&m),
-            parts: m.parts,
-            pairs,
-            missing,
-            extra,
+        Ok(comparison(&tracks, &matching::score(&tracks, &release)))
+    }
+
+    /// What [`Importer::reimport`] without a release id would match the
+    /// album to, changing nothing: the closest release found, the files
+    /// against it track by track, and why the re-import would stop for a
+    /// choice rather than apply it.
+    pub async fn rematch(&self, dir: &Path) -> Result<Rematch, ImportError> {
+        let (tracks, _) = one_copy_each(read_dir(dir).await?);
+        let mut matches = self.candidates(dir, &tracks, &mut String::new()).await?;
+        matches.sort_by(|a, b| a.distance.total_cmp(&b.distance));
+        Ok(Rematch {
+            best: matches.first().map(|m| comparison(&tracks, m)),
+            review: match matches.first() {
+                Some(m) => self.review_reason(m),
+                None => Some("no candidates found on MusicBrainz".into()),
+            },
+            candidates: matches.iter().take(5).map(Candidate::from).collect(),
         })
+    }
+
+    /// Why the closest match is not applied without a person choosing it.
+    fn review_reason(&self, best: &Match) -> Option<String> {
+        if best.distance > self.cfg.strong_threshold {
+            Some(format!(
+                "closest match is distance {:.3}, above {:.3}",
+                best.distance, self.cfg.strong_threshold
+            ))
+        } else if !best.is_complete() {
+            Some(format!(
+                "{} tracks missing, {} files unmatched",
+                best.missing, best.extra
+            ))
+        } else {
+            None
+        }
     }
 
     /// A release by id, dispatched to whichever service it names.
@@ -1317,6 +1408,66 @@ pub struct ReleaseTrackView {
     pub position: u32,
     pub title: String,
     pub length_secs: Option<u64>,
+}
+
+/// The files against the release `m` pairs them with.
+fn comparison(tracks: &[Track], m: &Match) -> Comparison {
+    let remote: Vec<_> = m.release.tracks().collect();
+    let name = |t: &Track| {
+        t.path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    };
+    let pairs = m
+        .pairs
+        .iter()
+        .map(|&(l, r)| {
+            let (medium, rt) = remote[r];
+            let local = &tracks[l];
+            PairView {
+                file: name(local),
+                file_title: local.title.clone(),
+                disc: medium.position,
+                position: rt.position,
+                title: rt.title.clone(),
+                title_distance: (matching::string_distance(
+                    local.title.as_deref().unwrap_or_default(),
+                    &rt.title,
+                ) * 1000.0)
+                    .round()
+                    / 1000.0,
+                length_delta_secs: rt
+                    .length
+                    .or(rt.recording.length)
+                    .map(|ms| (local.duration.as_secs_f64() - ms as f64 / 1000.0).round()),
+            }
+        })
+        .collect();
+    let missing = remote
+        .iter()
+        .enumerate()
+        .filter(|(r, _)| !m.pairs.iter().any(|&(_, pr)| pr == *r))
+        .map(|(_, (medium, rt))| ReleaseTrackView {
+            disc: medium.position,
+            position: rt.position,
+            title: rt.title.clone(),
+            length_secs: rt.length.or(rt.recording.length).map(|ms| ms / 1000),
+        })
+        .collect();
+    let extra = tracks
+        .iter()
+        .enumerate()
+        .filter(|(l, _)| !m.pairs.iter().any(|&(pl, _)| pl == *l))
+        .map(|(_, t)| name(t))
+        .collect();
+    Comparison {
+        release: Candidate::from(m),
+        parts: m.parts,
+        pairs,
+        missing,
+        extra,
+    }
 }
 
 /// A file's artist list, kept only while every name in it is still in the

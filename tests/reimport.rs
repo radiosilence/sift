@@ -209,3 +209,43 @@ async fn a_replacing_import_sets_the_filed_copy_aside() {
     );
     assert!(aside.join("02 Crush With Eyeliner.wav").exists());
 }
+
+#[tokio::test]
+async fn a_rematch_names_the_release_a_reimport_would_apply_and_changes_nothing() {
+    let root = tempfile::tempdir().unwrap();
+    let lib = root.path().join("lib");
+    let dir = lib.join("REM").join("Monster");
+    for (n, title) in [
+        (1, "What's the Frequency, Kenneth?"),
+        (2, "Crush With Eyeliner"),
+    ] {
+        let f = dir.join(format!("{n}.wav"));
+        wav(&f);
+        meta::write(
+            &f,
+            &meta::Tags {
+                title: title.into(),
+                artist: "R.E.M.".into(),
+                album: "Monster".into(),
+                album_artist: "R.E.M.".into(),
+                track: n,
+                track_total: 2,
+                mb_album_id: Some("rel".into()),
+                ..Default::default()
+            },
+            None,
+            false,
+        )
+        .unwrap();
+    }
+    let rematch = importer(&lib).await.rematch(&dir).await.unwrap();
+    let best = rematch.best.expect("the tagged release is found");
+    assert_eq!(best.release.id, "rel");
+    assert_eq!(best.pairs.len(), 2);
+    assert!(best.missing.is_empty() && best.extra.is_empty());
+    assert_eq!(
+        rematch.candidates.first().map(|c| c.id.as_str()),
+        Some("rel")
+    );
+    assert!(dir.join("1.wav").exists(), "nothing moved");
+}
