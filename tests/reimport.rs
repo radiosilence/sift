@@ -249,3 +249,75 @@ async fn a_rematch_names_the_release_a_reimport_would_apply_and_changes_nothing(
     );
     assert!(dir.join("1.wav").exists(), "nothing moved");
 }
+
+#[tokio::test]
+async fn a_retag_plan_lists_each_change_and_destination_and_writes_nothing() {
+    let root = tempfile::tempdir().unwrap();
+    let lib = root.path().join("lib");
+    let old = lib.join("REM").join("Monstre");
+    for (n, title) in [(1, "Kenneth"), (2, "Crush")] {
+        let f = old.join(format!("{n}.wav"));
+        wav(&f);
+        tag(&f, "Monstre", title, n);
+    }
+    std::fs::write(old.join("cover.jpg"), b"jpg").unwrap();
+    let plan = importer(&lib).await.retag_plan(&old, "rel").await.unwrap();
+    assert_eq!(plan.refused, None);
+    let monster = lib.join("R.E.M_").join("Monster");
+    assert_eq!(plan.companions.len(), 1);
+    assert_eq!(plan.companions[0].to, monster.join("cover.jpg"));
+    assert!(!plan.companions[0].stays);
+    assert!(plan.untouched.is_empty());
+    let crush = plan
+        .files
+        .iter()
+        .find(|f| f.path.ends_with("2.wav"))
+        .unwrap();
+    assert_eq!(
+        crush.to.as_deref(),
+        Some(monster.join("02 Crush With Eyeliner.wav").as_path())
+    );
+    let album = crush.changes.iter().find(|c| c.field == "album").unwrap();
+    assert_eq!(
+        (album.old.as_deref(), album.new.as_deref()),
+        (Some("Monstre"), Some("Monster"))
+    );
+    assert!(
+        crush
+            .changes
+            .iter()
+            .any(|c| c.field == "mb_albumid" && c.new.as_deref() == Some("rel"))
+    );
+    assert!(
+        !crush.changes.iter().any(|c| c.field == "artist"),
+        "an unchanged field is not listed"
+    );
+    assert_eq!(
+        meta::read(&old.join("2.wav")).unwrap().album.as_deref(),
+        Some("Monstre")
+    );
+}
+
+#[tokio::test]
+async fn a_refused_retag_plan_still_lists_each_file() {
+    let root = tempfile::tempdir().unwrap();
+    let lib = root.path().join("lib");
+    let old = lib.join("REM").join("Monstre");
+    for (n, title) in [(1, "Kenneth"), (2, "Crush")] {
+        let f = old.join(format!("{n}.wav"));
+        wav(&f);
+        tag(&f, "Monstre", title, n);
+    }
+    let taken = lib
+        .join("R.E.M_")
+        .join("Monster")
+        .join("02 Crush With Eyeliner.wav");
+    wav(&taken);
+    let plan = importer(&lib).await.retag_plan(&old, "rel").await.unwrap();
+    assert!(
+        plan.refused
+            .is_some_and(|r| r.contains("already in the library"))
+    );
+    assert_eq!(plan.files.len(), 2);
+    assert!(plan.files.iter().all(|f| !f.changes.is_empty()));
+}

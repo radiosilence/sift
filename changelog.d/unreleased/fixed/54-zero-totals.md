@@ -1,0 +1,1 @@
+- **A zero track or disc total reads as none.** A file tagged `TRACKTOTAL=0` or `DISCTOTAL=0`, as taggers write for a number they lack, no longer reads as a total of 0, nor does a track number of 0.

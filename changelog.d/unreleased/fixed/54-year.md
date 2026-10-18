@@ -1,0 +1,1 @@
+- **A cleared date stays cleared.** Setting or clearing a date, and writing tags, also remove `YEAR`, which reading falls back to.
