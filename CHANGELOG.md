@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.0
+
+### Fixed
+
+- **Collaboration credits split more reliably.** "Malcolm X & Robyn", "A (feat. B)", "A;B" and a pair with several albums together are now credited to each artist; as-is imports no longer write back an artist list that an edit made stale.
+
 ## 0.5.2
 
 ### Added
