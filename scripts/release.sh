@@ -60,7 +60,8 @@ sed -i.bak "s/package = \"sift-music\", version = \"[^\"]*\"/package = \"sift-mu
 rm -f README.md.bak
 grep -q "package = \"sift-music\", version = \"$new_major.$new_minor\"" README.md
 
-cargo update --workspace --offline
+# Only the workspace's own entries change in Cargo.lock.
+cargo update --workspace
 
 python3 scripts/changelog.py --release "$version"
 

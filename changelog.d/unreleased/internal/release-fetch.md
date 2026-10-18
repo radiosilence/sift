@@ -1,0 +1,1 @@
+- **`just release` resolves the lockfile online.** It ran `cargo update --workspace --offline`, which fails on a machine whose cargo cache lacks a locked crate; `--workspace` alone already confines the update to the version bump.

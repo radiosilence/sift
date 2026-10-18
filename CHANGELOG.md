@@ -25,6 +25,8 @@
 
 - **Releases are cut through a release pull request.** `just release patch|minor|major` (or the Release workflow) bumps the version, turns the changelog fragments in `changelog.d/` into the release and opens the PR; merging it publishes the crate to crates.io, then the GitHub release with the version's changelog section as its notes. The crate now goes out before the GitHub release, so a failed publish leaves nothing released and a manual run of CI retries it. Pull requests add a fragment instead of editing CHANGELOG.md, so they no longer conflict on it, and CI packages the crate on every run, so a packaging problem shows on the pull request rather than during a release.
 
+- **`just release` resolves the lockfile online.** It ran `cargo update --workspace --offline`, which fails on a machine whose cargo cache lacks a locked crate; `--workspace` alone already confines the update to the version bump.
+
 ## 0.4.0
 
 ### Changed
