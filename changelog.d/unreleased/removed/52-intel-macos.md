@@ -1,0 +1,1 @@
+- **Intel macOS binaries.** Releases no longer include `sift-macos-x86_64.tar.gz`, and the Homebrew formula installs on Apple silicon Macs only. Intel Macs can still install with `cargo install sift-music`.
