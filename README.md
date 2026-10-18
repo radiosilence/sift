@@ -8,7 +8,7 @@ The library is published to crates.io as `sift-music`, since `sift` was taken;
 it is still imported as `sift`:
 
 ```toml
-sift = { package = "sift-music", version = "0.4" }
+sift = { package = "sift-music", version = "0.5" }
 ```
 
 ```console

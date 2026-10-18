@@ -255,15 +255,19 @@ pub fn score(local: &[Track], release: &Release) -> Match {
     };
 
     let cost = |l: usize, r: usize| -> (f64, f64) {
-        let (medium, track) = remote[r];
-        let _ = medium;
+        let (_, track) = remote[r];
         let title = local[l].title.as_deref().unwrap_or_default();
+        // A pregap's length on MusicBrainz is an estimate of silence and
+        // hidden audio together, which rips split differently; it says
+        // nothing about whether the file is that track.
+        let length = if track.position == 0 {
+            None
+        } else {
+            track.length.or(track.recording.length)
+        };
         (
             string_distance(title, &track.title),
-            length_distance(
-                local[l].duration.as_secs_f64(),
-                track.length.or(track.recording.length),
-            ),
+            length_distance(local[l].duration.as_secs_f64(), length),
         )
     };
 
@@ -563,6 +567,37 @@ mod tests {
         let m = score(&local, &with_pregap);
         assert_eq!(m.pairs, [(0, 0), (1, 1), (2, 2)]);
         assert!(m.is_complete());
+    }
+
+    #[test]
+    fn an_untagged_hidden_track_pairs_with_the_pregap() {
+        // Belgica as MusicBrainz has it, and a rip whose track 00 carries
+        // the pregap's title but no track number, and a length that differs
+        // from MusicBrainz's estimate by half a minute.
+        let belgica: Release =
+            serde_json::from_str(include_str!("../tests/fixtures/belgica.json")).unwrap();
+        let mut local = vec![Track {
+            title: Some("[silence] / [unknown]".into()),
+            album: Some("Belgica: Original Soundtrack".into()),
+            artist: Some("Soulwax".into()),
+            disc: Some(1),
+            duration: Duration::from_secs(103),
+            ..Default::default()
+        }];
+        for (n, (_, t)) in belgica.tracks().skip(1).enumerate() {
+            local.push(Track {
+                title: Some(t.title.clone()),
+                album: Some("Belgica: Original Soundtrack".into()),
+                artist: Some("Soulwax".into()),
+                track: Some(n as u32 + 1),
+                disc: Some(1),
+                duration: Duration::from_millis(t.length.unwrap()),
+                ..Default::default()
+            });
+        }
+        let m = score(&local, &belgica);
+        assert!(m.pairs.contains(&(0, 0)), "{:?}", m.pairs);
+        assert!(m.is_complete(), "missing {} extra {}", m.missing, m.extra);
     }
 
     #[test]
