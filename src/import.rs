@@ -298,14 +298,15 @@ impl Importer {
                         t.mb_track_id.as_ref() == Some(&rt.id)
                             || t.mb_recording_id.as_ref() == Some(&rt.recording.id)
                     });
-                    // A file matched to no track of the release is credited
-                    // with the release's artists only.
+                    // A file matched to no track of the release takes the
+                    // release's artists, unless the release is a compilation,
+                    // whose tracks each have their own.
                     let (artists, artist_ids) = match rt {
                         Some(rt) if !rt.artist_credit.is_empty() => {
                             credited(&rt.artist_credit).unzip()
                         }
-                        Some(_) => credited(&r.artist_credit).unzip(),
-                        None => (empty(), empty()),
+                        None if r.is_compilation() => (empty(), empty()),
+                        _ => credited(&r.artist_credit).unzip(),
                     };
                     let (album_artists, album_artist_ids) = credited(&r.artist_credit).unzip();
                     (artists, artist_ids, album_artists, album_artist_ids)
@@ -1318,6 +1319,18 @@ pub struct ReleaseTrackView {
     pub length_secs: Option<u64>,
 }
 
+/// A file's artist list, kept only while every name in it is still in the
+/// credit it lists: an edit to the credit, or a list from some other tagger
+/// that disagrees with it, leaves the list to be credited again.
+fn names_in(list: &[String], credit: &str) -> Vec<String> {
+    let credit = matching::normalise(credit);
+    let fits = list.iter().all(|n| {
+        let n = matching::normalise(n);
+        !n.is_empty() && format!(" {credit} ").contains(&format!(" {n} "))
+    });
+    if fits { list.to_vec() } else { Vec::new() }
+}
+
 /// Tags for filing each file as it is, or why its tags cannot be trusted to.
 fn as_is_tags(
     tracks: &[Track],
@@ -1401,8 +1414,10 @@ fn as_is_tags(
                 disc_total: 0,
                 date: date.clone(),
                 compilation: album_artist == "Various Artists",
-                artists: t.artists.clone(),
-                album_artists: t.album_artists.clone(),
+                // Against the credit before ftintitle moved a featured
+                // artist into the title: that artist is still on the track.
+                artists: names_in(&t.artists, t.artist.as_deref().unwrap_or(&album_artist)),
+                album_artists: names_in(&t.album_artists, &album_artist),
                 ..Tags::default()
             },
         ));
@@ -1545,6 +1560,22 @@ fn walk(dir: &Path) -> Vec<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_artist_list_is_kept_only_while_the_credit_still_names_it() {
+        let list = |names: &[&str]| names.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let both = list(&["Lauer", "The Golden Filter"]);
+        assert_eq!(names_in(&both, "Lauer & The Golden Filter"), both);
+        assert_eq!(names_in(&both, "LAUER × the golden filter"), both);
+        assert_eq!(
+            names_in(&both, "Lauer"),
+            Vec::<String>::new(),
+            "edited away"
+        );
+        assert_eq!(names_in(&list(&["Ann"]), "Joanne"), Vec::<String>::new());
+        assert_eq!(names_in(&list(&[""]), "Joanne"), Vec::<String>::new());
+        assert_eq!(names_in(&[], "Anything"), Vec::<String>::new());
+    }
 
     fn track(path: &str, format: &str, number: Option<u32>, title: Option<&str>) -> Track {
         Track {
