@@ -14,6 +14,7 @@ sift = { package = "sift-music", version = "0.7" }
 ```console
 $ mise use -g github:radiosilence/sift        # or brew install radiosilence/sift/sift,
                                               # or a static binary from the releases
+                                              # (macOS: Apple silicon only)
 $ sift migrate-config                         # ~/.config/beets → ~/.config/sift
 $ sift import ~/Downloads/some-album          # uses ~/.config/sift/config.yaml
 $ sift match ~/Downloads/some-album           # show candidates, change nothing
