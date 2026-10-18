@@ -193,3 +193,33 @@ async fn files_without_a_release_are_split_only_by_known_artists() {
     assert!(t.mb_artist_ids.is_empty(), "no ids are invented");
     assert_eq!(t.artist.as_deref(), Some(CREDIT));
 }
+
+#[tokio::test]
+async fn a_credit_plan_lists_each_write_and_makes_none() {
+    let root = tempfile::tempdir().unwrap();
+    let lib = root.path().join("lib");
+    let dir = lib.join("album");
+    album(&dir, true);
+    let importer = importer(&lib).await;
+
+    let plan = importer.credit_plan(&dir, &Known::default()).await.unwrap();
+    assert_eq!(plan.files.len(), 2, "{:?}", plan.problems);
+    let first = &plan.files[0];
+    assert_eq!(first.artists, both());
+    assert_eq!(first.album_artist_ids, ["otpmd", "fatm"]);
+    assert_eq!(first.release.as_deref(), Some("rel"));
+    assert!(
+        meta::read(&dir.join("1.wav")).unwrap().artists.is_empty(),
+        "the plan writes nothing"
+    );
+
+    let mut known = Known::default();
+    known.add("Orchestre Tout Puissant Marcel Duchamp", &lib.join("a"));
+    known.add("Frànçois & the Atlas Mountains", &lib.join("b"));
+    let untagged = lib.join("untagged");
+    album(&untagged, false);
+    let split = importer.credit_plan(&untagged, &known).await.unwrap();
+    assert_eq!(split.files.len(), 2);
+    assert_eq!(split.files[0].release, None, "split from the known artists");
+    assert!(split.files[0].artist_ids.is_empty());
+}
