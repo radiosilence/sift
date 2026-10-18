@@ -1,6 +1,14 @@
 # Changelog
 
-## Unreleased
+## 0.5.2
+
+### Added
+
+- **Every artist on a credit is tagged.** Imports write `ARTISTS`, `ALBUMARTISTS` and every MusicBrainz artist id, where only the first artist's id was written before, so a collaboration can be listed under each artist. `Importer::credit`, run by `enrich`, adds them to files already filed: from their MusicBrainz release, or by splitting the credit where every part is an artist the library already holds.
+
+### Changed
+
+- **Artist ids are lists.** `Tags::mb_artist_id` and `mb_album_artist_id` become `mb_artist_ids` and `mb_album_artist_ids`, and `Importer::enrich` takes the library's known artists (`credits::Known`).
 
 ### Internal
 
