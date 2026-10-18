@@ -142,6 +142,14 @@ instead of disambiguated.
   requires one album and one artist across every file and a title and
   distinct track number for each; otherwise nothing moves and the reason is
   given, since a library filed from bad tags is worse than an album waiting.
+- **Every artist on a credit is tagged.** `artist` and `albumartist` keep the
+  credit as it reads ("A × B"); `ARTISTS`, `ALBUMARTISTS` and the MusicBrainz
+  artist ids hold each artist, as Picard writes them, so a player can list a
+  collaboration under both artists without parsing the string. Files tagged
+  before this, or by their own tags, are credited by `Importer::credit` (part
+  of `enrich`): from the release when MusicBrainz has it, otherwise by
+  splitting the credit only where every part is an artist the library
+  already holds, since "&", "," and " x " also occur inside band names.
 - **One copy of each track.** A folder holding an album in two formats, or
   with `(1)` duplicates, is imported from the best copy of each track.
 - **Nothing is overwritten.** Every destination is planned and checked before

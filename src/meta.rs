@@ -10,7 +10,7 @@ use std::time::Duration;
 use lofty::config::{ParseOptions, WriteOptions};
 use lofty::file::{AudioFile, TaggedFileExt};
 use lofty::picture::{MimeType, Picture, PictureType};
-use lofty::tag::{Accessor, ItemKey, Tag, TagExt};
+use lofty::tag::{Accessor, ItemKey, ItemValue, Tag, TagExt, TagItem};
 
 #[derive(Debug, thiserror::Error)]
 pub enum MetaError {
@@ -51,8 +51,14 @@ pub struct Track {
     /// Filed with the compilation template.
     pub compilation: bool,
     pub genre: Option<String>,
+    /// Each artist the credit names, as Picard's `ARTISTS` holds them.
+    pub artists: Vec<String>,
+    pub album_artists: Vec<String>,
     pub mb_recording_id: Option<String>,
+    pub mb_track_id: Option<String>,
     pub mb_album_id: Option<String>,
+    pub mb_artist_ids: Vec<String>,
+    pub mb_album_artist_ids: Vec<String>,
     pub duration: Duration,
     /// `FLAC`, `MP3`, `AAC`… as beets' `$format` spells it.
     pub format: String,
@@ -137,8 +143,28 @@ fn read_inner(path: &Path) -> Result<Track, MetaError> {
         t.original_date = s(ItemKey::OriginalReleaseDate);
         t.compilation = s(ItemKey::FlagCompilation).is_some_and(|v| v == "1");
         t.genre = tag.genre().map(|c| c.to_string());
+        let all = |k: ItemKey| {
+            tag.get_strings(k)
+                .flat_map(|v| v.split('\0'))
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        };
+        t.artists = all(ItemKey::TrackArtists);
+        // Vorbis comments may repeat ARTIST itself instead of carrying ARTISTS.
+        if t.artists.is_empty() {
+            let repeated = all(ItemKey::TrackArtist);
+            if repeated.len() > 1 {
+                t.artists = repeated;
+            }
+        }
+        t.album_artists = all(ItemKey::AlbumArtists);
         t.mb_recording_id = s(ItemKey::MusicBrainzRecordingId);
+        t.mb_track_id = s(ItemKey::MusicBrainzTrackId);
         t.mb_album_id = s(ItemKey::MusicBrainzReleaseId);
+        t.mb_artist_ids = all(ItemKey::MusicBrainzArtistId);
+        t.mb_album_artist_ids = all(ItemKey::MusicBrainzReleaseArtistId);
     }
     Ok(t)
 }
@@ -181,8 +207,13 @@ pub struct Tags {
     pub mb_recording_id: Option<String>,
     pub mb_track_id: Option<String>,
     pub mb_album_id: Option<String>,
-    pub mb_artist_id: Option<String>,
-    pub mb_album_artist_id: Option<String>,
+    /// Each artist the track's credit names, and the album's, in credit
+    /// order: what lets a player list a collaboration under every artist on
+    /// it without parsing `artist`. Empty removes the field.
+    pub artists: Vec<String>,
+    pub album_artists: Vec<String>,
+    pub mb_artist_ids: Vec<String>,
+    pub mb_album_artist_ids: Vec<String>,
     pub mb_release_group_id: Option<String>,
 }
 
@@ -232,11 +263,6 @@ pub fn write(
         (ItemKey::MusicBrainzRecordingId, &tags.mb_recording_id),
         (ItemKey::MusicBrainzTrackId, &tags.mb_track_id),
         (ItemKey::MusicBrainzReleaseId, &tags.mb_album_id),
-        (ItemKey::MusicBrainzArtistId, &tags.mb_artist_id),
-        (
-            ItemKey::MusicBrainzReleaseArtistId,
-            &tags.mb_album_artist_id,
-        ),
         (
             ItemKey::MusicBrainzReleaseGroupId,
             &tags.mb_release_group_id,
@@ -248,6 +274,16 @@ pub fn write(
             tag.insert_text(key, v.clone());
         }
     }
+    set_credits(
+        tag,
+        &Credits {
+            artists: &tags.artists,
+            album_artists: &tags.album_artists,
+            artist_ids: &tags.mb_artist_ids,
+            album_artist_ids: &tags.mb_album_artist_ids,
+        },
+        false,
+    );
     tag.remove_key(ItemKey::FlagCompilation);
     if tags.compilation {
         tag.insert_text(ItemKey::FlagCompilation, "1".into());
@@ -275,6 +311,58 @@ pub fn write(
             .and_then(|f| f.set_modified(modified))
             .map_err(lofty(path))?;
     }
+    Ok(())
+}
+
+/// The multi-valued artist fields, each written one value per item: repeated
+/// Vorbis comments, a null-separated ID3v2.4 `TXXX`, repeated MP4 atoms.
+pub struct Credits<'a> {
+    pub artists: &'a [String],
+    pub album_artists: &'a [String],
+    pub artist_ids: &'a [String],
+    pub album_artist_ids: &'a [String],
+}
+
+/// With `keep_unset`, a field given no values is left as it is rather than
+/// removed.
+fn set_credits(tag: &mut Tag, credits: &Credits, keep_unset: bool) {
+    for (key, values) in [
+        (ItemKey::TrackArtists, credits.artists),
+        (ItemKey::AlbumArtists, credits.album_artists),
+        (ItemKey::MusicBrainzArtistId, credits.artist_ids),
+        (
+            ItemKey::MusicBrainzReleaseArtistId,
+            credits.album_artist_ids,
+        ),
+    ] {
+        if keep_unset && values.is_empty() {
+            continue;
+        }
+        tag.remove_key(key);
+        for v in values {
+            tag.push(TagItem::new(key, ItemValue::Text(v.clone())));
+        }
+    }
+}
+
+/// Write only the multi-valued artist fields given values, leaving every
+/// other tag as it is: for crediting each artist on files already filed.
+pub fn write_credits(path: &Path, credits: &Credits) -> Result<(), MetaError> {
+    raise_allocation_limit();
+    let mut file = lofty::probe::Probe::open(path)
+        .map_err(lofty(path))?
+        .read()
+        .map_err(lofty(path))?;
+    let tag_type = file.primary_tag_type();
+    if file.tag(tag_type).is_none() {
+        file.insert_tag(Tag::new(tag_type));
+    }
+    let tag = file
+        .tag_mut(tag_type)
+        .ok_or_else(|| MetaError::NoTag(path.to_path_buf()))?;
+    set_credits(tag, credits, true);
+    tag.save_to_path(path, WriteOptions::default())
+        .map_err(lofty(path))?;
     Ok(())
 }
 

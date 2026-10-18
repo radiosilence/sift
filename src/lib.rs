@@ -1,6 +1,7 @@
 pub mod art;
 pub mod check;
 pub mod config;
+pub mod credits;
 pub mod discogs;
 pub mod format;
 pub mod ftintitle;
@@ -16,5 +17,5 @@ pub mod replaygain;
 
 pub use config::Config;
 pub use import::{
-    Candidate, Comparison, Edits, Enriched, ImportError, Importer, Outcome, TrackEdit,
+    Candidate, Comparison, Credited, Edits, Enriched, ImportError, Importer, Outcome, TrackEdit,
 };
