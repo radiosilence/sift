@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.7.0
+
+### Added
+
+- **Dry runs for library writes.** `Importer::credit_plan`, `Importer::enrich_plan` and `Importer::rematch` return what `credit`, `enrich` and `reimport` would write, without changing a file, so a front end can preview them. `Library::set_added` lets an album moved by a re-import keep its import date.
+
+### Internal
+
+- **Release script recuts a stale branch.** `scripts/release.sh` deletes a release branch whose PR was closed or merged, locally and on origin, and cuts it again from origin/main; a branch with an open PR still stops it.
+
 ## 0.6.0
 
 ### Fixed
