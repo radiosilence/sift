@@ -1,0 +1,1 @@
+- **Artist ids are lists.** `Tags::mb_artist_id` and `mb_album_artist_id` become `mb_artist_ids` and `mb_album_artist_ids`, and `Importer::enrich` takes the library's known artists (`credits::Known`).

@@ -7,9 +7,11 @@ use std::path::{Path, PathBuf};
 
 use crate::art::{self, ArtRules};
 use crate::config::Config;
+use crate::credits::{self, Known};
 use crate::discogs::{Discogs, DiscogsError};
 use crate::matching::{self, Match};
 use crate::meta::{self, Tags, Track};
+use crate::musicbrainz::credited;
 use crate::musicbrainz::{MbError, MusicBrainz, Release};
 use crate::paths;
 
@@ -179,6 +181,18 @@ pub struct Enriched {
     pub genres: Vec<String>,
     /// Tracks given lyrics.
     pub lyrics: usize,
+    /// Artists credited one by one where the files named them only together.
+    pub artists: Vec<String>,
+    pub problems: Vec<String>,
+}
+
+/// What [`Importer::credit`] wrote.
+#[derive(Debug, Default)]
+pub struct Credited {
+    /// Files given artist credits.
+    pub files: usize,
+    /// Each artist credited, once.
+    pub artists: Vec<String>,
     pub problems: Vec<String>,
 }
 
@@ -253,14 +267,110 @@ impl Importer {
             .await
     }
 
+    /// Credit each artist on the album's files that name only one credit
+    /// (`ARTISTS`, `ALBUMARTISTS` and their MusicBrainz ids), leaving files
+    /// that already carry them alone. A release on MusicBrainz names its
+    /// artists itself; otherwise a credit is split only where
+    /// [`credits::split`] finds every part among the `known` artists.
+    /// `artist` and `albumartist` are never changed.
+    pub async fn credit(&self, dir: &Path, known: &Known) -> Result<Credited, ImportError> {
+        let tracks = read_dir(dir).await?;
+        let mut out = Credited::default();
+        let pending = |t: &Track| t.artists.is_empty() || t.album_artists.is_empty();
+        if !tracks.iter().any(pending) {
+            return Ok(out);
+        }
+        let release = match tracks.iter().find_map(|t| t.mb_album_id.clone()) {
+            Some(id) if source_of(&id) == Source::MusicBrainz => match self.mb.release(&id).await {
+                Ok(r) => Some(r),
+                Err(e) => {
+                    out.problems.push(format!("artist credits: {e}"));
+                    return Ok(out);
+                }
+            },
+            _ => None,
+        };
+        for t in tracks.iter().filter(|t| pending(t)) {
+            let empty = Vec::new;
+            let (artists, artist_ids, album_artists, album_artist_ids) = match &release {
+                Some(r) => {
+                    let rt = r.tracks().map(|(_, rt)| rt).find(|rt| {
+                        t.mb_track_id.as_ref() == Some(&rt.id)
+                            || t.mb_recording_id.as_ref() == Some(&rt.recording.id)
+                    });
+                    // A file matched to no track of the release is credited
+                    // with the release's artists only.
+                    let (artists, artist_ids) = match rt {
+                        Some(rt) if !rt.artist_credit.is_empty() => {
+                            credited(&rt.artist_credit).unzip()
+                        }
+                        Some(_) => credited(&r.artist_credit).unzip(),
+                        None => (empty(), empty()),
+                    };
+                    let (album_artists, album_artist_ids) = credited(&r.artist_credit).unzip();
+                    (artists, artist_ids, album_artists, album_artist_ids)
+                }
+                None => {
+                    let split = |credit: Option<&str>| {
+                        credit
+                            .and_then(|c| credits::split(c, known, dir))
+                            .unwrap_or_default()
+                    };
+                    let album_artist = t.album_artist.as_deref().or(t.artist.as_deref());
+                    (
+                        split(t.artist.as_deref()),
+                        empty(),
+                        split(album_artist),
+                        empty(),
+                    )
+                }
+            };
+            let keep =
+                |had: &Vec<String>, new: Vec<String>| if had.is_empty() { new } else { empty() };
+            let artists = keep(&t.artists, artists);
+            let album_artists = keep(&t.album_artists, album_artists);
+            if artists.is_empty() && album_artists.is_empty() {
+                continue;
+            }
+            let credits = meta::Credits {
+                artist_ids: if artists.is_empty() { &[] } else { &artist_ids },
+                album_artist_ids: if album_artists.is_empty() {
+                    &[]
+                } else {
+                    &album_artist_ids
+                },
+                artists: &artists,
+                album_artists: &album_artists,
+            };
+            match meta::write_credits(&t.path, &credits) {
+                Ok(()) => {
+                    out.files += 1;
+                    for a in artists.iter().chain(&album_artists) {
+                        if !out.artists.contains(a) {
+                            out.artists.push(a.clone());
+                        }
+                    }
+                }
+                Err(e) => out.problems.push(e.to_string()),
+            }
+        }
+        Ok(out)
+    }
+
     /// What beets' `replaygain`, `lastgenre` and `lyrics` plugins add after
     /// an import: album and track gain, genres from MusicBrainz when the
-    /// album has none, and lyrics for tracks without them. Each is written
-    /// only to its own tags, and each failure is reported rather than
-    /// stopping the rest.
-    pub async fn enrich(&self, dir: &Path) -> Result<Enriched, ImportError> {
+    /// album has none, and lyrics for tracks without them; and each artist
+    /// on a collaboration credited one by one ([`Importer::credit`]). Each
+    /// is written only to its own tags, and each failure is reported rather
+    /// than stopping the rest.
+    pub async fn enrich(&self, dir: &Path, known: &Known) -> Result<Enriched, ImportError> {
+        let credited = self.credit(dir, known).await?;
         let tracks = read_dir(dir).await?;
-        let mut out = Enriched::default();
+        let mut out = Enriched {
+            artists: credited.artists,
+            problems: credited.problems,
+            ..Enriched::default()
+        };
         let paths: Vec<PathBuf> = tracks.iter().map(|t| t.path.clone()).collect();
 
         let measured = {
@@ -925,6 +1035,18 @@ impl Importer {
         );
         // A Discogs release carries none of MusicBrainz's own identifiers.
         let mb_ids = source_of(&release.id) == Source::MusicBrainz;
+        let track_credit = if rt.artist_credit.is_empty() {
+            &release.artist_credit
+        } else {
+            &rt.artist_credit
+        };
+        let ids = |credit: &[crate::musicbrainz::ArtistCredit]| -> Vec<String> {
+            if mb_ids {
+                credited(credit).map(|(_, id)| id).collect()
+            } else {
+                Vec::new()
+            }
+        };
         Tags {
             title,
             artist,
@@ -944,17 +1066,12 @@ impl Importer {
             mb_recording_id: mb_ids.then(|| rt.recording.id.clone()),
             mb_track_id: mb_ids.then(|| rt.id.clone()),
             mb_album_id: mb_ids.then(|| release.id.clone()),
-            mb_artist_id: mb_ids
-                .then(|| {
-                    rt.artist_credit
-                        .first()
-                        .or(release.artist_credit.first())
-                        .map(|c| c.artist.id.clone())
-                })
-                .flatten(),
-            mb_album_artist_id: mb_ids
-                .then(|| release.artist_credit.first().map(|c| c.artist.id.clone()))
-                .flatten(),
+            artists: credited(track_credit).map(|(name, _)| name).collect(),
+            album_artists: credited(&release.artist_credit)
+                .map(|(name, _)| name)
+                .collect(),
+            mb_artist_ids: ids(track_credit),
+            mb_album_artist_ids: ids(&release.artist_credit),
             mb_release_group_id: mb_ids
                 .then(|| release.release_group.as_ref().map(|g| g.id.clone()))
                 .flatten(),
@@ -1284,6 +1401,8 @@ fn as_is_tags(
                 disc_total: 0,
                 date: date.clone(),
                 compilation: album_artist == "Various Artists",
+                artists: t.artists.clone(),
+                album_artists: t.album_artists.clone(),
                 ..Tags::default()
             },
         ));
@@ -1449,6 +1568,7 @@ mod tests {
             bitrate: None,
             sample_rate: None,
             bit_depth: None,
+            ..Default::default()
         }
     }
 

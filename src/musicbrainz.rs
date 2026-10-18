@@ -438,6 +438,16 @@ pub fn credit_name(credits: &[ArtistCredit]) -> String {
         .collect()
 }
 
+/// Each artist a credit names, by their own name rather than as credited
+/// ("Frànçois & the Atlas Mountains" however the sleeve spells it), with
+/// their id. The names are what files written by different releases agree
+/// on.
+pub fn credited(credits: &[ArtistCredit]) -> impl Iterator<Item = (String, String)> + '_ {
+    credits
+        .iter()
+        .map(|c| (c.artist.name.clone(), c.artist.id.clone()))
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct Release {
     pub id: String,

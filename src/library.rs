@@ -744,6 +744,7 @@ impl Library {
                     duration: Duration::from_secs_f64(r.get::<_, f64>(20)?.max(0.0)),
                     original_date: r.get(21)?,
                     compilation: r.get(22)?,
+                    ..Default::default()
                 },
             })
         })?;
