@@ -279,7 +279,10 @@ jobs:
   crates:
     name: Publish to crates.io
     needs: [test, lint, format, changelog, package, version, build, apple]
-    if: needs.version.outputs.should_release == 'true'
+    # `changes` runs only on pull requests, so on main it is skipped, and a
+    # skipped job upstream fails every later job's implicit success() check.
+    # Each release job therefore states what it waits for itself.
+    if: ${{ !cancelled() && !failure() && needs.version.outputs.should_release == 'true' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -302,7 +305,7 @@ jobs:
   release:
     name: Release
     needs: [version, crates]
-    if: needs.version.outputs.should_release == 'true'
+    if: ${{ !cancelled() && needs.crates.result == 'success' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -334,6 +337,7 @@ jobs:
   homebrew:
     name: Update Homebrew tap
     needs: [version, release]
+    if: ${{ !cancelled() && needs.release.result == 'success' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
