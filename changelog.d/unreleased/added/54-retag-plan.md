@@ -1,0 +1,1 @@
+- **Retag and edit previews.** `Importer::retag_plan` lists every field re-tagging an album from a release would change in each file, old and new, and where each file would go; `Track::apply` and `meta::changes` preview a hand edit the same way; `set` can set or clear `artists` and `albumartists` with their ids.
