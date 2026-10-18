@@ -1,0 +1,1 @@
+- **`release.yml` no longer warms the cargo cache.** The step existed only for the offline lockfile update that `just release` has since dropped.
