@@ -14,7 +14,7 @@ Music tagger and library organiser, published to crates.io as `sift-music`. koan
 
 ## Releasing
 
-`just release patch|minor|major` (or an exact `X.Y.Z`) branches from main, bumps `Cargo.toml`, `Cargo.lock` and the README's dependency line, turns the unreleased fragments into the version and opens the release PR. Merging it is the release: CI publishes the crate, then the GitHub release with the binaries and the changelog section as notes, then the Homebrew formula. A push releases only when it changes the version; `gh workflow run ci.yml` on main retries a release that failed part way.
+`just release patch|minor|major` (or an exact `X.Y.Z`) branches from main, bumps `Cargo.toml`, `Cargo.lock` and the README's dependency line, turns the unreleased fragments into the version and opens the release PR; `gh workflow run release.yml` does the same from CI. Merging it is the release: CI publishes the crate, then the GitHub release with the binaries and the changelog section as notes, then the Homebrew formula. A push releases only when it changes the version; `gh workflow run ci.yml` on main retries a release that failed part way.
 
 ## Check
 
