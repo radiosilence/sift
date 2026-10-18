@@ -59,6 +59,11 @@ pub struct Track {
     pub mb_album_id: Option<String>,
     pub mb_artist_ids: Vec<String>,
     pub mb_album_artist_ids: Vec<String>,
+    pub label: Option<String>,
+    pub catalog_number: Option<String>,
+    pub country: Option<String>,
+    pub media: Option<String>,
+    pub mb_release_group_id: Option<String>,
     pub duration: Duration,
     /// `FLAC`, `MP3`, `AAC`… as beets' `$format` spells it.
     pub format: String,
@@ -165,6 +170,11 @@ fn read_inner(path: &Path) -> Result<Track, MetaError> {
         t.mb_album_id = s(ItemKey::MusicBrainzReleaseId);
         t.mb_artist_ids = all(ItemKey::MusicBrainzArtistId);
         t.mb_album_artist_ids = all(ItemKey::MusicBrainzReleaseArtistId);
+        t.label = s(ItemKey::Label);
+        t.catalog_number = s(ItemKey::CatalogNumber);
+        t.country = s(ItemKey::ReleaseCountry);
+        t.media = s(ItemKey::OriginalMediaType);
+        t.mb_release_group_id = s(ItemKey::MusicBrainzReleaseGroupId);
     }
     Ok(t)
 }
@@ -388,6 +398,155 @@ pub const EDITABLE: &[&str] = &[
     "comp",
 ];
 
+impl Track {
+    /// A field [`set`] can change, by its beets name, as the file has it.
+    pub fn field(&self, name: &str) -> Option<String> {
+        let num = |n: Option<u32>| n.map(|n| n.to_string());
+        match name {
+            "title" => self.title.clone(),
+            "artist" => self.artist.clone(),
+            "album" => self.album.clone(),
+            "albumartist" => self.album_artist.clone(),
+            "track" => num(self.track),
+            "tracktotal" => num(self.track_total),
+            "disc" => num(self.disc),
+            "disctotal" => num(self.disc_total),
+            "date" | "year" => self.date.clone(),
+            "original_date" => self.original_date.clone(),
+            "genre" => self.genre.clone(),
+            "label" => self.label.clone(),
+            "catalognum" => self.catalog_number.clone(),
+            "comp" => self.compilation.then(|| "1".to_string()),
+            _ => None,
+        }
+    }
+
+    /// The track as it would read after [`set`] with `changes`: for working
+    /// out where an edit files an album before making it.
+    pub fn apply(&mut self, changes: &[Change]) {
+        for (field, value) in changes {
+            let number = || value.as_deref().and_then(|v| v.parse::<u32>().ok());
+            match field.as_str() {
+                "title" => self.title = value.clone(),
+                "artist" => self.artist = value.clone(),
+                "album" => self.album = value.clone(),
+                "albumartist" => self.album_artist = value.clone(),
+                "track" => self.track = number(),
+                "tracktotal" => self.track_total = number(),
+                "disc" => self.disc = number(),
+                "disctotal" => self.disc_total = number(),
+                "date" | "year" => self.date = value.clone(),
+                "original_date" => self.original_date = value.clone(),
+                "genre" => self.genre = value.clone(),
+                "label" => self.label = value.clone(),
+                "catalognum" => self.catalog_number = value.clone(),
+                "comp" => {
+                    self.compilation = value.as_deref().is_some_and(|v| v == "1" || v == "true")
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// One field a write would change in a file, by the name a person reads.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct TagChange {
+    pub field: &'static str,
+    pub old: Option<String>,
+    pub new: Option<String>,
+}
+
+/// Every field [`write`] with `new` would change in a file that reads as
+/// `old`. Lists are compared whole and shown joined by "; ".
+pub fn changes(old: &Track, new: &Tags) -> Vec<TagChange> {
+    let text = |s: &str| (!s.is_empty()).then(|| s.to_string());
+    let num = |n: u32| (n > 0).then(|| n.to_string());
+    let list = |v: &[String]| (!v.is_empty()).then(|| v.join("; "));
+    let pairs: Vec<(&'static str, Option<String>, Option<String>)> = vec![
+        ("title", old.title.clone(), text(&new.title)),
+        ("artist", old.artist.clone(), text(&new.artist)),
+        ("album", old.album.clone(), text(&new.album)),
+        (
+            "albumartist",
+            old.album_artist.clone(),
+            text(&new.album_artist),
+        ),
+        ("track", old.track.map(|n| n.to_string()), num(new.track)),
+        (
+            "tracktotal",
+            old.track_total.map(|n| n.to_string()),
+            num(new.track_total),
+        ),
+        ("disc", old.disc.map(|n| n.to_string()), num(new.disc)),
+        (
+            "disctotal",
+            old.disc_total.map(|n| n.to_string()),
+            num(new.disc_total),
+        ),
+        ("date", old.date.clone(), new.date.clone()),
+        (
+            "original_date",
+            old.original_date.clone(),
+            new.original_date.clone(),
+        ),
+        ("label", old.label.clone(), new.label.clone()),
+        (
+            "catalognum",
+            old.catalog_number.clone(),
+            new.catalog_number.clone(),
+        ),
+        ("country", old.country.clone(), new.country.clone()),
+        ("media", old.media.clone(), new.media.clone()),
+        (
+            "comp",
+            old.compilation.then(|| "1".into()),
+            new.compilation.then(|| "1".into()),
+        ),
+        ("artists", list(&old.artists), list(&new.artists)),
+        (
+            "albumartists",
+            list(&old.album_artists),
+            list(&new.album_artists),
+        ),
+        (
+            "mb_trackid",
+            old.mb_recording_id.clone(),
+            new.mb_recording_id.clone(),
+        ),
+        (
+            "mb_releasetrackid",
+            old.mb_track_id.clone(),
+            new.mb_track_id.clone(),
+        ),
+        (
+            "mb_albumid",
+            old.mb_album_id.clone(),
+            new.mb_album_id.clone(),
+        ),
+        (
+            "mb_artistids",
+            list(&old.mb_artist_ids),
+            list(&new.mb_artist_ids),
+        ),
+        (
+            "mb_albumartistids",
+            list(&old.mb_album_artist_ids),
+            list(&new.mb_album_artist_ids),
+        ),
+        (
+            "mb_releasegroupid",
+            old.mb_release_group_id.clone(),
+            new.mb_release_group_id.clone(),
+        ),
+    ];
+    pairs
+        .into_iter()
+        .filter(|(_, o, n)| o != n)
+        .map(|(field, old, new)| TagChange { field, old, new })
+        .collect()
+}
+
 /// Set or clear only the named fields in `path`, leaving every other tag as
 /// it is. [`write`] replaces everything sift knows about, which is right for
 /// an import and wrong for correcting one field of a filed album.
@@ -538,4 +697,45 @@ pub fn embedded_cover(path: &Path) -> Option<Vec<u8>> {
         .find(|p| p.pic_type() == PictureType::CoverFront)
         .or_else(|| tag.pictures().first())?;
     Some(pic.data().to_vec())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_fields_that_differ_are_changes() {
+        let old = Track {
+            title: Some("Kenneth".into()),
+            artist: Some("R.E.M.".into()),
+            track: Some(1),
+            artists: vec!["R.E.M.".into()],
+            ..Default::default()
+        };
+        let new = Tags {
+            title: "What's the Frequency, Kenneth?".into(),
+            artist: "R.E.M.".into(),
+            track: 1,
+            artists: vec!["R.E.M.".into()],
+            mb_album_id: Some("rel".into()),
+            ..Default::default()
+        };
+        let fields: Vec<_> = changes(&old, &new).iter().map(|c| c.field).collect();
+        assert_eq!(fields, ["title", "mb_albumid"]);
+    }
+
+    #[test]
+    fn an_edit_applies_as_set_would_write_it() {
+        let mut t = Track::default();
+        t.apply(&[
+            ("album".into(), Some("Monster".into())),
+            ("track".into(), Some("3".into())),
+            ("comp".into(), Some("1".into())),
+            ("genre".into(), None),
+        ]);
+        assert_eq!(t.field("album").as_deref(), Some("Monster"));
+        assert_eq!(t.field("track").as_deref(), Some("3"));
+        assert_eq!(t.field("comp").as_deref(), Some("1"));
+        assert_eq!(t.field("genre"), None);
+    }
 }
