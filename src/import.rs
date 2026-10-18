@@ -611,14 +611,14 @@ impl Importer {
             best.parts
         );
 
-        if release_id.is_none() {
-            if let Some(reason) = self.review_reason(best) {
-                return Ok(Outcome::Review {
-                    reason,
-                    candidates: matches.iter().take(5).map(Candidate::from).collect(),
-                    log,
-                });
-            }
+        if release_id.is_none()
+            && let Some(reason) = self.review_reason(best)
+        {
+            return Ok(Outcome::Review {
+                reason,
+                candidates: matches.iter().take(5).map(Candidate::from).collect(),
+                log,
+            });
         }
         let best = best.clone();
         let dest = self.apply(&tracks, &best, dir, filing, &mut log).await?;
