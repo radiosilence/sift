@@ -1,0 +1,1 @@
+- **Release pull requests package the macOS binary.** CI builds and packages it unsigned when a pull request changes the version, so a packaging failure shows before the release; the macOS clippy and test steps report independently.
