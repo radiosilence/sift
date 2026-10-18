@@ -250,7 +250,8 @@ struct Lookups {
 pub struct Retag {
     pub comparison: Comparison,
     pub files: Vec<RetagFile>,
-    /// Files matched to no track of the release, left as they are.
+    /// Files matched to no track of the release, and second copies of a
+    /// track, left as they are.
     pub untouched: Vec<PathBuf>,
     /// Why applying it would be refused: two files on one path, or a path
     /// another file already holds.
@@ -749,7 +750,7 @@ impl Importer {
     /// change in each file, where each file would go, the files it would
     /// leave untouched, and why it would be refused, if it would.
     pub async fn retag_plan(&self, dir: &Path, release_id: &str) -> Result<Retag, ImportError> {
-        let (tracks, _) = one_copy_each(read_dir(dir).await?);
+        let (tracks, spare) = one_copy_each(read_dir(dir).await?);
         let release = self.release(release_id).await?;
         let m = matching::score(&tracks, &release);
         let remote: Vec<_> = release.tracks().collect();
@@ -769,6 +770,7 @@ impl Importer {
                 .enumerate()
                 .filter(|(i, _)| !entries.iter().any(|(l, _)| l == i))
                 .map(|(_, t)| t.path.clone())
+                .chain(spare.iter().map(|t| t.path.clone()))
                 .collect(),
             refused: None,
         };
@@ -782,7 +784,9 @@ impl Importer {
                     }
                     out.files.push(RetagFile {
                         path: local.path.clone(),
-                        to,
+                        // A path differing only in case or Unicode form is
+                        // the same file, and stays.
+                        to: if moved { to } else { local.path.clone() },
                         changes: meta::changes(local, &tags),
                     });
                 }

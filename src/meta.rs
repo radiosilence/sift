@@ -278,6 +278,7 @@ pub fn write(
             &tags.mb_release_group_id,
         ),
     ];
+    tag.remove_key(ItemKey::Year);
     for (key, value) in optional {
         tag.remove_key(key);
         if let Some(v) = value {
@@ -396,7 +397,20 @@ pub const EDITABLE: &[&str] = &[
     "label",
     "catalognum",
     "comp",
+    "artists",
+    "albumartists",
 ];
+
+/// A list field as typed: names separated by "; ".
+fn split_list(value: Option<&str>) -> Vec<String> {
+    value
+        .unwrap_or_default()
+        .split(';')
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
+        .collect()
+}
 
 impl Track {
     /// A field [`set`] can change, by its beets name, as the file has it.
@@ -417,6 +431,10 @@ impl Track {
             "label" => self.label.clone(),
             "catalognum" => self.catalog_number.clone(),
             "comp" => self.compilation.then(|| "1".to_string()),
+            "artists" => (!self.artists.is_empty()).then(|| self.artists.join("; ")),
+            "albumartists" => {
+                (!self.album_artists.is_empty()).then(|| self.album_artists.join("; "))
+            }
             _ => None,
         }
     }
@@ -442,6 +460,14 @@ impl Track {
                 "catalognum" => self.catalog_number = value.clone(),
                 "comp" => {
                     self.compilation = value.as_deref().is_some_and(|v| v == "1" || v == "true")
+                }
+                "artists" => {
+                    self.artists = split_list(value.as_deref());
+                    self.mb_artist_ids.clear();
+                }
+                "albumartists" => {
+                    self.album_artists = split_list(value.as_deref());
+                    self.mb_album_artist_ids.clear();
                 }
                 _ => {}
             }
@@ -588,6 +614,20 @@ pub fn set(path: &Path, changes: &[Change]) -> Result<(), MetaError> {
                     tag.insert_text(ItemKey::FlagCompilation, "1".into());
                 }
             }
+            // A list of artists, "; " between them. Their MusicBrainz ids
+            // go with them: ids for the old names would no longer line up.
+            "artists" | "albumartists" => {
+                let (names, ids) = if field == "artists" {
+                    (ItemKey::TrackArtists, ItemKey::MusicBrainzArtistId)
+                } else {
+                    (ItemKey::AlbumArtists, ItemKey::MusicBrainzReleaseArtistId)
+                };
+                tag.remove_key(names);
+                tag.remove_key(ids);
+                for v in split_list(value.as_deref()) {
+                    tag.push(TagItem::new(names, ItemValue::Text(v)));
+                }
+            }
             name => {
                 let key = match name {
                     "title" => ItemKey::TrackTitle,
@@ -602,7 +642,9 @@ pub fn set(path: &Path, changes: &[Change]) -> Result<(), MetaError> {
                     _ => continue,
                 };
                 tag.remove_key(key);
-                if name == "year" {
+                // `read` falls back to the year, so a date set or cleared
+                // leaves none behind.
+                if matches!(name, "year" | "date") {
                     tag.remove_key(ItemKey::Year);
                 }
                 if let Some(v) = value {
@@ -737,5 +779,32 @@ mod tests {
         assert_eq!(t.field("track").as_deref(), Some("3"));
         assert_eq!(t.field("comp").as_deref(), Some("1"));
         assert_eq!(t.field("genre"), None);
+    }
+
+    #[test]
+    fn clearing_artists_takes_their_ids_and_clearing_a_date_takes_the_year() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.wav");
+        crate::library::tests::wav(&path, 44_100);
+        write(
+            &path,
+            &Tags {
+                title: "T".into(),
+                artist: "A × B".into(),
+                artists: vec!["A".into(), "B".into()],
+                mb_artist_ids: vec!["a".into(), "b".into()],
+                date: Some("2020-01-01".into()),
+                ..Default::default()
+            },
+            None,
+            false,
+        )
+        .unwrap();
+        set(&path, &[("artists".into(), None), ("date".into(), None)]).unwrap();
+        let t = read(&path).unwrap();
+        assert!(t.artists.is_empty() && t.mb_artist_ids.is_empty());
+        assert_eq!(t.date, None);
+        set(&path, &[("artists".into(), Some("A; B ;".into()))]).unwrap();
+        assert_eq!(read(&path).unwrap().artists, ["A", "B"]);
     }
 }
