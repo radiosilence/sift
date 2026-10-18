@@ -244,6 +244,27 @@ struct Lookups {
     problems: Vec<String>,
 }
 
+/// What re-tagging an album from one release would do. See
+/// [`Importer::retag_plan`].
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Retag {
+    pub comparison: Comparison,
+    pub files: Vec<RetagFile>,
+    /// Files matched to no track of the release, left as they are.
+    pub untouched: Vec<PathBuf>,
+    /// Why applying it would be refused: two files on one path, or a path
+    /// another file already holds.
+    pub refused: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RetagFile {
+    pub path: PathBuf,
+    /// Where it would be filed; its own path when it stays.
+    pub to: PathBuf,
+    pub changes: Vec<meta::TagChange>,
+}
+
 /// What [`Importer::reimport`] would match an album to. See
 /// [`Importer::rematch`].
 #[derive(Debug, Clone, serde::Serialize)]
@@ -723,6 +744,54 @@ impl Importer {
         })
     }
 
+    /// What [`Importer::reimport`] with `release_id` would do to an album
+    /// already in the library, changing nothing: every field it would
+    /// change in each file, where each file would go, the files it would
+    /// leave untouched, and why it would be refused, if it would.
+    pub async fn retag_plan(&self, dir: &Path, release_id: &str) -> Result<Retag, ImportError> {
+        let (tracks, _) = one_copy_each(read_dir(dir).await?);
+        let release = self.release(release_id).await?;
+        let m = matching::score(&tracks, &release);
+        let remote: Vec<_> = release.tracks().collect();
+        let entries: Vec<(usize, Tags)> = m
+            .pairs
+            .iter()
+            .map(|&(l, r)| {
+                let (medium, rt) = remote[r];
+                (l, self.tags(&release, r, medium.position, rt))
+            })
+            .collect();
+        let mut out = Retag {
+            comparison: comparison(&tracks, &m),
+            files: Vec::new(),
+            untouched: tracks
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| !entries.iter().any(|(l, _)| l == i))
+                .map(|(_, t)| t.path.clone())
+                .collect(),
+            refused: None,
+        };
+        match self.destinations(&tracks, &entries, Some(&release)) {
+            Ok(plan) => {
+                for (l, tags, to) in plan {
+                    let local = &tracks[l];
+                    let moved = paths::collision_key(&local.path) != paths::collision_key(&to);
+                    if moved && to.exists() && out.refused.is_none() {
+                        out.refused = Some(format!("{} is already in the library", to.display()));
+                    }
+                    out.files.push(RetagFile {
+                        path: local.path.clone(),
+                        to,
+                        changes: meta::changes(local, &tags),
+                    });
+                }
+            }
+            Err(e) => out.refused = Some(e.to_string()),
+        }
+        Ok(out)
+    }
+
     /// Why the closest match is not applied without a person choosing it.
     fn review_reason(&self, best: &Match) -> Option<String> {
         if best.distance > self.cfg.strong_threshold {
@@ -898,20 +967,14 @@ impl Importer {
             .await
     }
 
-    /// Tag and move each `(file, tags)` into place, with the release's cover
-    /// when there is one and the files' own otherwise.
-    async fn file(
+    /// Where each `(file, tags)` would be filed, refused if two would land
+    /// on one path.
+    fn destinations(
         &self,
         tracks: &[Track],
         entries: &[(usize, Tags)],
         release: Option<&Release>,
-        source_dir: &Path,
-        filing: Filing<'_>,
-        log: &mut String,
-    ) -> Result<PathBuf, ImportError> {
-        let in_place = matches!(filing, Filing::InPlace);
-        let itself =
-            |from: &Path, to: &Path| paths::collision_key(from) == paths::collision_key(to);
+    ) -> Result<Vec<(usize, Tags, PathBuf)>, ImportError> {
         let mut plan = Vec::with_capacity(entries.len());
         let mut claimed = std::collections::HashMap::new();
         for (l, tags) in entries {
@@ -935,6 +998,24 @@ impl Importer {
             }
             plan.push((l, tags, dest));
         }
+        Ok(plan)
+    }
+
+    /// Tag and move each `(file, tags)` into place, with the release's cover
+    /// when there is one and the files' own otherwise.
+    async fn file(
+        &self,
+        tracks: &[Track],
+        entries: &[(usize, Tags)],
+        release: Option<&Release>,
+        source_dir: &Path,
+        filing: Filing<'_>,
+        log: &mut String,
+    ) -> Result<PathBuf, ImportError> {
+        let in_place = matches!(filing, Filing::InPlace);
+        let itself =
+            |from: &Path, to: &Path| paths::collision_key(from) == paths::collision_key(to);
+        let plan = self.destinations(tracks, entries, release)?;
 
         // Every destination already there, each the same recording as its
         // source, is this album filed once before: a repeated import (a
