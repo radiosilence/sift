@@ -253,17 +253,46 @@ pub struct Retag {
     /// Files matched to no track of the release, and second copies of a
     /// track, left as they are.
     pub untouched: Vec<PathBuf>,
-    /// Why applying it would be refused: two files on one path, or a path
-    /// another file already holds.
+    /// Whether every file's front cover would be replaced by the one found
+    /// for the release (or the album's own, when none is), as `fetch_art`
+    /// does.
+    pub cover: bool,
+    /// The album's other files (cover, cue, log), which follow it when it
+    /// changes directory.
+    pub companions: Vec<Companion>,
+    /// Why applying it would be refused: two files on one path, a path
+    /// another file already holds, or a path that cannot be made.
     pub refused: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct RetagFile {
     pub path: PathBuf,
-    /// Where it would be filed; its own path when it stays.
-    pub to: PathBuf,
+    /// Where it would be filed, its own path when it stays; `None` when no
+    /// path could be made for it.
+    pub to: Option<PathBuf>,
     pub changes: Vec<meta::TagChange>,
+}
+
+/// A file beside the album's tracks, and where it would go.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Companion {
+    pub from: PathBuf,
+    pub to: PathBuf,
+    /// Something is already at `to`, so this one stays where it is.
+    pub stays: bool,
+}
+
+/// Where one matched file would be filed.
+struct Destination {
+    local: usize,
+    tags: Tags,
+    to: PathBuf,
+    /// `to` is the file's own path, differing at most in case or Unicode
+    /// form: it is retagged where it is.
+    stays: bool,
+    /// Another file already holds `to`.
+    occupied: bool,
 }
 
 /// What [`Importer::reimport`] would match an album to. See
@@ -762,38 +791,54 @@ impl Importer {
                 (l, self.tags(&release, r, medium.position, rt))
             })
             .collect();
-        let mut out = Retag {
-            comparison: comparison(&tracks, &m),
-            files: Vec::new(),
-            untouched: tracks
-                .iter()
-                .enumerate()
-                .filter(|(i, _)| !entries.iter().any(|(l, _)| l == i))
-                .map(|(_, t)| t.path.clone())
-                .chain(spare.iter().map(|t| t.path.clone()))
-                .collect(),
-            refused: None,
-        };
-        match self.destinations(&tracks, &entries, Some(&release)) {
-            Ok(plan) => {
-                for (l, tags, to) in plan {
-                    let local = &tracks[l];
-                    let moved = paths::collision_key(&local.path) != paths::collision_key(&to);
-                    if moved && to.exists() && out.refused.is_none() {
-                        out.refused = Some(format!("{} is already in the library", to.display()));
-                    }
-                    out.files.push(RetagFile {
-                        path: local.path.clone(),
-                        // A path differing only in case or Unicode form is
-                        // the same file, and stays.
-                        to: if moved { to } else { local.path.clone() },
-                        changes: meta::changes(local, &tags),
-                    });
+        let planned = self.destinations(&tracks, &entries, Some(&release), true);
+        // A refused plan still shows each file's changes, and the path each
+        // would take where one could be made, so the clash can be fixed.
+        let files = entries
+            .iter()
+            .enumerate()
+            .map(|(i, (l, tags))| {
+                let local = &tracks[*l];
+                let to = match &planned {
+                    Ok(plan) => Some((plan[i].to.clone(), plan[i].stays)),
+                    Err(_) => self
+                        .destination(local, tags, Some(&release))
+                        .ok()
+                        .map(|to| (to.clone(), same_file(&local.path, &to))),
+                };
+                RetagFile {
+                    path: local.path.clone(),
+                    to: to.map(|(to, stays)| if stays { local.path.clone() } else { to }),
+                    changes: meta::changes(local, tags),
                 }
-            }
-            Err(e) => out.refused = Some(e.to_string()),
-        }
-        Ok(out)
+            })
+            .collect();
+        let refused = match &planned {
+            Ok(plan) => plan
+                .iter()
+                .find(|d| d.occupied)
+                .map(|d| format!("{} is already in the library", d.to.display())),
+            Err(e) => Some(e.to_string()),
+        };
+        let companions = match &planned {
+            Ok(plan) => plan
+                .first()
+                .and_then(|d| d.to.parent())
+                .map(|new_dir| companions(dir, new_dir))
+                .unwrap_or_default(),
+            Err(_) => Vec::new(),
+        };
+        Ok(Retag {
+            comparison: comparison(&tracks, &m),
+            files,
+            untouched: unmatched(&tracks, &entries)
+                .chain(&spare)
+                .map(|t| t.path.clone())
+                .collect(),
+            cover: self.cfg.fetch_art,
+            companions,
+            refused,
+        })
     }
 
     /// Why the closest match is not applied without a person choosing it.
@@ -971,36 +1016,54 @@ impl Importer {
             .await
     }
 
+    /// Where `local` would be filed with `tags`.
+    fn destination(
+        &self,
+        local: &Track,
+        tags: &Tags,
+        release: Option<&Release>,
+    ) -> Result<PathBuf, ImportError> {
+        let rel = paths::render(&self.cfg, tags, local, release)?;
+        // Not `with_extension`: it cuts at the last dot, and titles have dots.
+        let ext = local
+            .path
+            .extension()
+            .map(|e| e.to_string_lossy().to_lowercase())
+            .unwrap_or_default();
+        Ok(paths::under(&self.cfg.directory, &format!("{rel}.{ext}"))?)
+    }
+
     /// Where each `(file, tags)` would be filed, refused if two would land
-    /// on one path.
+    /// on one path. In place, a file whose destination is itself is not
+    /// occupying it: it is the file being retagged.
     fn destinations(
         &self,
         tracks: &[Track],
         entries: &[(usize, Tags)],
         release: Option<&Release>,
-    ) -> Result<Vec<(usize, Tags, PathBuf)>, ImportError> {
+        in_place: bool,
+    ) -> Result<Vec<Destination>, ImportError> {
         let mut plan = Vec::with_capacity(entries.len());
         let mut claimed = std::collections::HashMap::new();
         for (l, tags) in entries {
-            let (l, tags) = (*l, tags.clone());
-            let local = &tracks[l];
-            let rel = paths::render(&self.cfg, &tags, local, release)?;
-            // Not `with_extension`: it cuts at the last dot, and titles have dots.
-            let ext = local
-                .path
-                .extension()
-                .map(|e| e.to_string_lossy().to_lowercase())
-                .unwrap_or_default();
-            let dest = paths::under(&self.cfg.directory, &format!("{rel}.{ext}"))?;
-            if let Some(other) = claimed.insert(paths::collision_key(&dest), l) {
+            let local = &tracks[*l];
+            let to = self.destination(local, tags, release)?;
+            if let Some(other) = claimed.insert(paths::collision_key(&to), *l) {
                 return Err(ImportError::Conflict(format!(
                     "{} and {} would both be filed as {}",
                     tracks[other].path.display(),
                     local.path.display(),
-                    dest.display()
+                    to.display()
                 )));
             }
-            plan.push((l, tags, dest));
+            let stays = same_file(&local.path, &to);
+            plan.push(Destination {
+                local: *l,
+                tags: tags.clone(),
+                occupied: to.exists() && !(in_place && stays),
+                to,
+                stays,
+            });
         }
         Ok(plan)
     }
@@ -1017,27 +1080,20 @@ impl Importer {
         log: &mut String,
     ) -> Result<PathBuf, ImportError> {
         let in_place = matches!(filing, Filing::InPlace);
-        let itself =
-            |from: &Path, to: &Path| paths::collision_key(from) == paths::collision_key(to);
-        let plan = self.destinations(tracks, entries, release)?;
+        let plan = self.destinations(tracks, entries, release, in_place)?;
 
         // Every destination already there, each the same recording as its
         // source, is this album filed once before: a repeated import (a
         // retry, a second request queued behind the first) succeeds and
         // moves nothing. Anything short of that is a conflict, and nothing
         // is overwritten either way.
-        // In place, a file whose destination is itself is not "already
-        // there": it is the file being retagged.
-        let mut present: Vec<bool> = plan
-            .iter()
-            .map(|(l, _, d)| d.exists() && !(in_place && itself(&tracks[*l].path, d)))
-            .collect();
+        let mut present: Vec<bool> = plan.iter().map(|d| d.occupied).collect();
         if let Filing::Replacing(bin) = filing {
             let mut taken: Vec<PathBuf> = plan
                 .iter()
                 .zip(&present)
                 .filter(|(_, p)| **p)
-                .filter_map(|((_, _, d), _)| d.parent().map(Path::to_path_buf))
+                .filter_map(|(d, _)| d.to.parent().map(Path::to_path_buf))
                 .collect();
             taken.sort();
             taken.dedup();
@@ -1045,18 +1101,18 @@ impl Importer {
                 let to = set_aside(&dir, &self.cfg.directory, bin).await?;
                 let _ = writeln!(log, "replaced: {} moved to {}", dir.display(), to.display());
             }
-            present = plan.iter().map(|(_, _, d)| d.exists()).collect();
+            present = plan.iter().map(|d| d.to.exists()).collect();
         }
         if !in_place && present.iter().all(|p| *p) && !plan.is_empty() {
-            let same = plan.iter().all(|(l, _, d)| {
-                meta::read(d).is_ok_and(|there| {
-                    let here = &tracks[*l];
+            let same = plan.iter().all(|d| {
+                meta::read(&d.to).is_ok_and(|there| {
+                    let here = &tracks[d.local];
                     there.format == here.format
                         && (there.duration.as_secs_f64() - here.duration.as_secs_f64()).abs() < 1.0
                 })
             });
             let dir = plan[0]
-                .2
+                .to
                 .parent()
                 .map(Path::to_path_buf)
                 .unwrap_or_default();
@@ -1072,7 +1128,7 @@ impl Importer {
         if let Some(i) = present.iter().position(|p| *p) {
             return Err(ImportError::Exists(
                 plan[i]
-                    .2
+                    .to
                     .parent()
                     .map(Path::to_path_buf)
                     .unwrap_or_default(),
@@ -1094,9 +1150,9 @@ impl Importer {
             }
         );
         let cover = cover_art.map(|c| c.bytes);
-        for (l, tags, dest) in &plan {
-            let local = &tracks[*l];
-            let (cover, tags) = (cover.clone(), tags.clone());
+        for d in &plan {
+            let (local, dest) = (&tracks[d.local], &d.to);
+            let (cover, tags) = (cover.clone(), d.tags.clone());
             // Moving: the source is ours to change, so tag it and move it.
             // Copying: the source must come out untouched, so copy first and
             // tag the copy, taking it back out if tagging fails.
@@ -1108,7 +1164,7 @@ impl Importer {
                 })
                 .await
                 .expect("tag writer panicked")?;
-                if !itself(&local.path, dest) {
+                if !d.stays {
                     paths::transfer(&local.path, dest, true).await?;
                 }
             } else {
@@ -1135,30 +1191,19 @@ impl Importer {
                 dest.display()
             );
         }
-        for (i, t) in tracks.iter().enumerate() {
-            if !entries.iter().any(|(l, _)| *l == i) {
-                let _ = writeln!(log, "left behind (no matching track): {}", t.path.display());
-            }
+        for t in unmatched(tracks, entries) {
+            let _ = writeln!(log, "left behind (no matching track): {}", t.path.display());
         }
         // A re-imported album that changed directory takes its other files
         // along, and leaves no empty directory behind.
-        if in_place
-            && let Some(new_dir) = plan.first().and_then(|(_, _, d)| d.parent())
-            && !itself(source_dir, new_dir)
-        {
-            if let Ok(entries) = std::fs::read_dir(source_dir) {
-                for entry in entries.flatten() {
-                    let from = entry.path();
-                    let to = new_dir.join(entry.file_name());
-                    if entry.file_type().is_ok_and(|t| t.is_file())
-                        && !meta::is_audio(&from)
-                        && !to.exists()
-                    {
-                        paths::transfer(&from, &to, true).await?;
-                    }
+        if in_place && let Some(new_dir) = plan.first().and_then(|d| d.to.parent()) {
+            for c in companions(source_dir, new_dir) {
+                if !c.stays {
+                    paths::transfer(&c.from, &c.to, true).await?;
                 }
             }
-            if std::fs::remove_dir(source_dir).is_ok()
+            if !same_file(source_dir, new_dir)
+                && std::fs::remove_dir(source_dir).is_ok()
                 && let Some(parent) = source_dir.parent()
             {
                 let _ = std::fs::remove_dir(parent);
@@ -1166,7 +1211,7 @@ impl Importer {
         }
         Ok(plan
             .first()
-            .and_then(|(_, _, d)| d.parent())
+            .and_then(|d| d.to.parent())
             .map(Path::to_path_buf)
             .unwrap_or_else(|| self.cfg.directory.clone()))
     }
@@ -1493,6 +1538,50 @@ pub struct ReleaseTrackView {
     pub position: u32,
     pub title: String,
     pub length_secs: Option<u64>,
+}
+
+/// Whether two paths name one file, differing at most in case or Unicode
+/// form.
+fn same_file(a: &Path, b: &Path) -> bool {
+    paths::collision_key(a) == paths::collision_key(b)
+}
+
+/// The tracks no entry is for.
+fn unmatched<'a>(
+    tracks: &'a [Track],
+    entries: &[(usize, Tags)],
+) -> impl Iterator<Item = &'a Track> {
+    let matched: std::collections::HashSet<usize> = entries.iter().map(|(l, _)| *l).collect();
+    tracks
+        .iter()
+        .enumerate()
+        .filter(move |(i, _)| !matched.contains(i))
+        .map(|(_, t)| t)
+}
+
+/// The album's other files in `from` (cover, cue, log) and where each goes
+/// when the album moves to `to`; none when it stays where it is.
+fn companions(from: &Path, to: &Path) -> Vec<Companion> {
+    if same_file(from, to) {
+        return Vec::new();
+    }
+    let Ok(entries) = std::fs::read_dir(from) else {
+        return Vec::new();
+    };
+    let mut out: Vec<Companion> = entries
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_file()) && !meta::is_audio(&e.path()))
+        .map(|e| {
+            let dest = to.join(e.file_name());
+            Companion {
+                from: e.path(),
+                stays: dest.exists(),
+                to: dest,
+            }
+        })
+        .collect();
+    out.sort_by(|a, b| a.from.cmp(&b.from));
+    out
 }
 
 /// The files against the release `m` pairs them with.

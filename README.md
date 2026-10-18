@@ -156,11 +156,12 @@ instead of disambiguated.
   genres, each track's lyrics, the release a re-import would apply and why it
   might stop for review) without changing a file, so a front end can show a
   change before making it. Gain is the exception: measuring it decodes every
-  file, so it is only done to write it. `Importer::retag_plan` lists every field a re-tag from a chosen release
-  would change in each file, and where each file would go. `Track::apply`
-  and `meta::changes` let a front end preview a hand edit the same way.
-  `Library::set_added` restamps an album
-  a re-import moved, so it keeps the date it first arrived.
+  file, so it is only done to write it. `Importer::retag_plan` lists every
+  field a re-tag from a chosen release would change in each file, where each
+  file and the album's other files would go, and whether the cover would be
+  replaced. A hand edit is previewed with `Track::apply` and `meta::diff`.
+  `Library::set_added` restamps an album a re-import moved, so it keeps the
+  date it first arrived.
 - **One copy of each track.** A folder holding an album in two formats, or
   with `(1)` duplicates, is imported from the best copy of each track.
 - **Nothing is overwritten.** Every destination is planned and checked before

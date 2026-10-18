@@ -260,8 +260,13 @@ async fn a_retag_plan_lists_each_change_and_destination_and_writes_nothing() {
         wav(&f);
         tag(&f, "Monstre", title, n);
     }
+    std::fs::write(old.join("cover.jpg"), b"jpg").unwrap();
     let plan = importer(&lib).await.retag_plan(&old, "rel").await.unwrap();
     assert_eq!(plan.refused, None);
+    let monster = lib.join("R.E.M_").join("Monster");
+    assert_eq!(plan.companions.len(), 1);
+    assert_eq!(plan.companions[0].to, monster.join("cover.jpg"));
+    assert!(!plan.companions[0].stays);
     assert!(plan.untouched.is_empty());
     let crush = plan
         .files
@@ -269,10 +274,8 @@ async fn a_retag_plan_lists_each_change_and_destination_and_writes_nothing() {
         .find(|f| f.path.ends_with("2.wav"))
         .unwrap();
     assert_eq!(
-        crush.to,
-        lib.join("R.E.M_")
-            .join("Monster")
-            .join("02 Crush With Eyeliner.wav")
+        crush.to.as_deref(),
+        Some(monster.join("02 Crush With Eyeliner.wav").as_path())
     );
     let album = crush.changes.iter().find(|c| c.field == "album").unwrap();
     assert_eq!(
@@ -293,4 +296,28 @@ async fn a_retag_plan_lists_each_change_and_destination_and_writes_nothing() {
         meta::read(&old.join("2.wav")).unwrap().album.as_deref(),
         Some("Monstre")
     );
+}
+
+#[tokio::test]
+async fn a_refused_retag_plan_still_lists_each_file() {
+    let root = tempfile::tempdir().unwrap();
+    let lib = root.path().join("lib");
+    let old = lib.join("REM").join("Monstre");
+    for (n, title) in [(1, "Kenneth"), (2, "Crush")] {
+        let f = old.join(format!("{n}.wav"));
+        wav(&f);
+        tag(&f, "Monstre", title, n);
+    }
+    let taken = lib
+        .join("R.E.M_")
+        .join("Monster")
+        .join("02 Crush With Eyeliner.wav");
+    wav(&taken);
+    let plan = importer(&lib).await.retag_plan(&old, "rel").await.unwrap();
+    assert!(
+        plan.refused
+            .is_some_and(|r| r.contains("already in the library"))
+    );
+    assert_eq!(plan.files.len(), 2);
+    assert!(plan.files.iter().all(|f| !f.changes.is_empty()));
 }

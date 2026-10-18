@@ -17,6 +17,7 @@ pub mod replaygain;
 
 pub use config::Config;
 pub use import::{
-    Candidate, Comparison, CreditPlan, Credited, Edits, EnrichPlan, Enriched, ImportError,
-    Importer, Outcome, PlannedCredit, PlannedLyrics, Rematch, Retag, RetagFile, TrackEdit,
+    Candidate, Companion, Comparison, CreditPlan, Credited, Edits, EnrichPlan, Enriched,
+    ImportError, Importer, Outcome, PlannedCredit, PlannedLyrics, Rematch, Retag, RetagFile,
+    TrackEdit,
 };
