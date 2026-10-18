@@ -1568,6 +1568,7 @@ mod tests {
             bitrate: None,
             sample_rate: None,
             bit_depth: None,
+            ..Default::default()
         }
     }
 
