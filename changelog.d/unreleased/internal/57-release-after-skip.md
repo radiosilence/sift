@@ -1,0 +1,1 @@
+- **Releases publish again.** The crates.io, GitHub release and Homebrew jobs no longer skip when the pull-request-only change detection is skipped on main.
