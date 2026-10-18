@@ -1,0 +1,1 @@
+- **A pregap track is matched by title and position, not length.** MusicBrainz gives a pregap an estimated length that rips rarely share (Belgica lists 134 s for a 103 s file), so the hidden track was refused even with the release named, and a 16-track vinyl release outscored the complete CD.
