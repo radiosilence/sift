@@ -136,14 +136,16 @@ jobs:
   # branches, which compile on every platform. What Linux cannot check is the
   # Apple toolchain and linker, so the macOS job runs when a pull request
   # changes the dependencies, the toolchain or CI, or a Rust file with
-  # Apple-only code. A release pull request bumps Cargo.lock, so it always
-  # runs.
+  # Apple-only code. A release pull request (one that changes the version)
+  # bumps Cargo.lock, so it always runs, and also builds and packages the
+  # macOS binary unsigned.
   changes:
     name: Changes
     runs-on: ubuntu-latest
     if: github.event_name == 'pull_request'
     outputs:
       apple: ${{ steps.diff.outputs.apple }}
+      release: ${{ steps.diff.outputs.release }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -163,7 +165,15 @@ jobs:
               apple=true
             fi
           done
-          echo "apple=$apple" | tee -a "$GITHUB_OUTPUT"
+          version_of() { sed -n 's/^version = "\(.*\)"/\1/p' | head -1; }
+          release=false
+          if [ "$(git show "$BASE:Cargo.toml" | version_of)" != "$(version_of < Cargo.toml)" ]; then
+            release=true
+          fi
+          {
+            echo "apple=$apple"
+            echo "release=$release"
+          } | tee -a "$GITHUB_OUTPUT"
 
   build:
     name: Build ${{ matrix.name }}
@@ -196,9 +206,12 @@ jobs:
 
   # Everything for Apple, on one runner: the account's macOS runners are few,
   # and every macOS job in every repository queues behind the others. A pull
-  # request that needs it (see `changes`) runs clippy and the tests on macOS;
-  # a release builds, signs, notarises and packages the arm64 binary, which
-  # its pull request has already checked. Other pushes to main do not run it.
+  # request that needs it (see `changes`) runs clippy and the tests on macOS,
+  # each reported on its own so one failure does not hide the other. A release
+  # pull request also builds and packages the binary, unsigned, so packaging
+  # breaks before the version merges. A release builds, signs, notarises,
+  # packages and uploads it; signing is required there. Other pushes to main
+  # do not run it.
   apple:
     name: Apple
     runs-on: macos-latest
@@ -206,6 +219,8 @@ jobs:
     if: ${{ !cancelled() && (needs.changes.outputs.apple == 'true' || needs.version.outputs.should_release == 'true') }}
     env:
       TARGET: aarch64-apple-darwin
+      CHECK: ${{ needs.changes.outputs.apple == 'true' }}
+      PACKAGE: ${{ needs.changes.outputs.release == 'true' || needs.version.outputs.should_release == 'true' }}
       RELEASE: ${{ needs.version.outputs.should_release == 'true' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -213,17 +228,21 @@ jobs:
         with:
           toolchain: stable
           components: clippy
+      # Saved only by releases, which build only the release profile, so it
+      # warms a release pull request's package build and nothing else; clippy
+      # and the tests on a pull request compile from cold.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - if: env.RELEASE != 'true'
+      - if: ${{ !cancelled() && env.CHECK == 'true' }}
         run: cargo clippy --locked --all-targets -- -D warnings
-      - if: env.RELEASE != 'true'
+      - if: ${{ !cancelled() && env.CHECK == 'true' }}
         run: cargo test --locked
-      - if: env.RELEASE == 'true'
+      - if: ${{ !cancelled() && env.PACKAGE == 'true' }}
         run: cargo build --release --locked --target "$TARGET"
       # Developer ID signed and notarised, so the tarball runs from a browser
-      # download without clearing quarantine.
+      # download without clearing quarantine. The action fails when a signing
+      # secret is missing, so a release never ships an unsigned binary.
       - name: Sign and notarise
         if: env.RELEASE == 'true'
         uses: radiosilence/blit-workflows/macos-notarise@c8a650dfa5a0fbe012c61eab28f615c1983aee18
@@ -235,9 +254,16 @@ jobs:
           api-key-p8: ${{ secrets.APPLE_API_KEY_P8 }}
           api-key-id: ${{ secrets.APPLE_API_KEY_ID }}
           api-issuer-id: ${{ secrets.APPLE_API_ISSUER_ID }}
+      # The tarball's binary is run, so a package that would not start fails
+      # here rather than after a release.
       - name: Package
-        if: env.RELEASE == 'true'
-        run: tar -czf sift-macos-arm64.tar.gz -C "target/$TARGET/release" sift
+        if: ${{ !cancelled() && env.PACKAGE == 'true' }}
+        run: |
+          tar -czf sift-macos-arm64.tar.gz -C "target/$TARGET/release" sift
+          mkdir "$RUNNER_TEMP/unpacked"
+          tar -xzf sift-macos-arm64.tar.gz -C "$RUNNER_TEMP/unpacked"
+          "$RUNNER_TEMP/unpacked/sift" --version
+      # Runs only when every earlier step succeeded, signing included.
       - if: env.RELEASE == 'true'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
