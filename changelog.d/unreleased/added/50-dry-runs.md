@@ -1,0 +1,1 @@
+- **Dry runs for library writes.** `Importer::credit_plan`, `Importer::enrich_plan` and `Importer::rematch` return what `credit`, `enrich` and `reimport` would write, without changing a file, so a front end can preview them.
