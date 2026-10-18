@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.8.0
+
+### Added
+
+- **Retag and edit previews.** `Importer::retag_plan` lists every field re-tagging an album from a release would change in each file, old and new, where each file and the album's other files would go, and whether the cover would be replaced; `Track::apply` and `meta::diff` preview a hand edit; `set` can set or clear `artists` and `albumartists` with their ids.
+
+### Removed
+
+- **Intel macOS binaries.** Releases no longer include `sift-macos-x86_64.tar.gz`, and the Homebrew formula installs on Apple silicon Macs only. Intel Macs can still install with `cargo install sift-music`.
+
+### Fixed
+
+- **A cleared date stays cleared.** Setting or clearing a date, and writing tags, also remove `YEAR`, which reading falls back to.
+- **A zero track or disc total reads as none.** A file tagged `TRACKTOTAL=0` or `DISCTOTAL=0`, as taggers write for a number they lack, no longer reads as a total of 0, nor does a track number of 0.
+
+### Internal
+
+- **Release pull requests package the macOS binary.** CI builds and packages it unsigned when a pull request changes the version, so a packaging failure shows before the release; the macOS clippy and test steps report independently.
+
 ## 0.7.0
 
 ### Added
