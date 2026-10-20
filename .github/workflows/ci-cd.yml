@@ -111,7 +111,7 @@ jobs:
             fi
           fi
           # Whether this run releases, the one answer every release job reads.
-          # A pull request: a release PR (branch `release-*`, or a version
+          # A pull request: a release PR (branch `release-v*`, or a version
           # change), which runs everything. A push to main: it changes the
           # version and that version is not out yet; comparing with the latest
           # release alone let a push landing while a release ran release it
@@ -119,12 +119,16 @@ jobs:
           # retried: whatever version is not out yet.
           version=$(version_of < Cargo.toml)
           bumped=false
-          if [ "$(git show "${base:-HEAD^1}:Cargo.toml" 2>/dev/null | version_of)" != "$version" ]; then
+          # Against the commit before, not the diff base: a push landing while a
+          # release run is still going would otherwise see the same bump and
+          # release it again. A bump that is not the head commit is released by
+          # a manual run.
+          if [ "$(git show HEAD^1:Cargo.toml 2>/dev/null | version_of)" != "$version" ]; then
             bumped=true
           fi
           case "$EVENT" in
             pull_request)
-              case "$HEAD_REF" in release-*) bumped=true ;; esac
+              case "$HEAD_REF" in release-v*) bumped=true ;; esac
               release=$bumped
               ;;
             *)
