@@ -233,7 +233,7 @@ jobs:
           done | sort -u | while read -r id event sha; do
             [ "$id" = "$SELF" ] && continue
             if [ "$event" = push ]; then
-              changed=$(gh api "repos/$GITHUB_REPOSITORY/commits/$sha" --jq '.files[].filename') || continue
+              changed=$(gh api --paginate "repos/$GITHUB_REPOSITORY/commits/$sha" --jq '.files[].filename') || continue
               if printf '%s\n' "$changed" | grep -qx Cargo.toml; then
                 continue
               fi
