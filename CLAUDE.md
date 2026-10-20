@@ -14,7 +14,11 @@ Music tagger and library organiser, published to crates.io as `sift-music`. koan
 
 ## Releasing
 
-`just release patch|minor|major` (or an exact `X.Y.Z`) branches from main, bumps `Cargo.toml`, `Cargo.lock` and the README's dependency line, turns the unreleased fragments into the version and opens the release PR; `gh workflow run release.yml` does the same from CI. Merging it is the release: CI publishes the crate, then the GitHub release with the binaries and the changelog section as notes, then the Homebrew formula. A push releases only when it changes the version; `gh workflow run ci.yml` on main retries a release that failed part way.
+`just release patch|minor|major` (or an exact `X.Y.Z`) branches from main, bumps `Cargo.toml`, `Cargo.lock` and the README's dependency line, turns the unreleased fragments into the version and opens the release PR; `gh workflow run release.yml` does the same from CI. Merging it is the release: CI publishes the crate, then the GitHub release with the binaries and the changelog section as notes, then the Homebrew formula. A push releases only when it changes the version; `gh workflow run ci-cd.yml` on main retries a release that failed part way.
+
+## CI
+
+`.github/workflows/ci-cd.yml` is one workflow: CI jobs gated on the domains a change touches (worked out by its `changes` job), the `Checks` job the ruleset requires, then the release jobs on main. A skipped job is a domain the change did not touch and passes `Checks`. A new directory of code, or a new job, needs adding to `changes` and to `Checks`'s `needs`; the README's Development section says how.
 
 ## Check
 
