@@ -99,7 +99,7 @@ jobs:
           base=HEAD^1
           if [ "$EVENT" = "push" ]; then
             passed=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow ci-cd.yml --branch main --event push \
-              --status success --limit 1 --json headSha --jq '.[0].headSha' 2>/dev/null || true)
+              --status success --limit 1 --json headSha --jq '.[0].headSha // empty' 2>/dev/null || true)
             if [ -n "$passed" ] && [ "$passed" != "$(git rev-parse HEAD)" ] && git fetch -q --deepen=100 origin main && git merge-base --is-ancestor "$passed" HEAD; then
               base=$passed
             fi
@@ -137,8 +137,8 @@ jobs:
             echo "changes since $(git rev-parse --short "$base"):"
             printf '%s\n' "$files" | sed 's/^/  /'
 
-            # Anything cargo compiles or that decides how.
-            touches '^src/|^tests/|^benches/|^examples/|^build\.rs$|^Cargo\.(toml|lock)$|^\.cargo/|^rust-toolchain|^\.github/' || rust=false
+            # Anything cargo compiles or packages, or that decides how.
+            touches '^\.gitignore$|^LICENSE$|^src/|^tests/|^benches/|^examples/|^build\.rs$|^Cargo\.(toml|lock)$|^\.cargo/|^rust-toolchain|^\.github/' || rust=false
 
             # What the release binaries' build adds to the checks: the musl
             # targets and the ARM runner. A pull request builds them only when
@@ -155,16 +155,19 @@ jobs:
             # since they compile on every platform. A pull request holds a
             # macOS runner only for what Linux cannot check: the Apple
             # toolchain and linker, through the dependencies, the toolchain or
-            # CI, or a Rust change within twenty lines of a cfg naming an Apple
-            # target. Main runs it for any Rust change.
+            # CI, or a change to a Rust file that names an Apple target in a
+            # cfg. Main runs it for any Rust change.
             apple=false
             if [ "$EVENT" != "pull_request" ]; then
               apple=$rust
             elif touches '^build\.rs$|^Cargo\.(toml|lock)$|^\.cargo/|^rust-toolchain|^\.github/'; then
               apple=true
-            elif git diff -U20 "$base" HEAD -- '*.rs' \
-              | grep -E '^[ +-]' | grep -qE 'target_os *= *"(macos|ios)"|target_vendor *= *"apple"'; then
-              apple=true
+            else
+              for f in $(printf '%s\n' "$files" | grep '\.rs$' || true); do
+                if [ -f "$f" ] && grep -qE 'target_os *= *"(macos|ios)"|target_vendor *= *"apple"' "$f"; then
+                  apple=true
+                fi
+              done
             fi
           fi
           # A release runs everything it ships.
@@ -185,7 +188,9 @@ jobs:
   # GitHub has no priority among its runners, and the account's few macOS ones
   # are what a release waits on. A release cancels this repository's pull
   # request runs, which are re-run from their page or by the next push, and
-  # main's earlier non-release runs, which a newer one supersedes. At the start
+  # main's earlier runs that cannot be releasing, which a newer one supersedes:
+  # a push titled `release: ` or changing `Cargo.toml` is left alone, as the
+  # workflow's `concurrency` leaves it. At the start
   # rather than in CD, so the release builds that start alongside the checks
   # find the runners free. A job of its own, so only it holds a token that can
   # cancel runs.
@@ -197,6 +202,7 @@ jobs:
     if: github.event_name != 'pull_request' && needs.changes.outputs.release == 'true'
     permissions:
       actions: write
+      contents: read
     steps:
       - env:
           GH_TOKEN: ${{ github.token }}
@@ -204,10 +210,16 @@ jobs:
         run: |
           for status in requested queued pending waiting in_progress; do
             gh run list --repo "$GITHUB_REPOSITORY" --workflow ci-cd.yml --status "$status" --limit 100 \
-              --json databaseId,event,headBranch,displayTitle \
-              --jq '.[] | select(.event == "pull_request" or (.event == "push" and .headBranch == "main" and (.displayTitle | startswith("release: ") | not))) | .databaseId'
-          done | sort -u | while read -r id; do
+              --json databaseId,event,headBranch,headSha,displayTitle \
+              --jq '.[] | select(.event == "pull_request" or (.event == "push" and .headBranch == "main" and (.displayTitle | startswith("release: ") | not))) | "\(.databaseId) \(.event) \(.headSha)"'
+          done | sort -u | while read -r id event sha; do
             [ "$id" = "$SELF" ] && continue
+            if [ "$event" = push ]; then
+              changed=$(gh api "repos/$GITHUB_REPOSITORY/commits/$sha" --jq '.files[].filename') || continue
+              if printf '%s\n' "$changed" | grep -qx Cargo.toml; then
+                continue
+              fi
+            fi
             echo "cancelling run $id"
             gh run cancel "$id" --repo "$GITHUB_REPOSITORY" || true
           done
@@ -257,7 +269,7 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
           shared-key: lint
           cache-on-failure: true
-      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo clippy --locked --all-targets -- -D warnings
 
   format:
     name: Check Formatting
@@ -492,7 +504,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     needs: [changes, checks, build, macos-release]
-    if: ${{ !cancelled() && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled') && !contains(needs.*.result, 'skipped') && needs.changes.outputs.release == 'true' }}
+    if: ${{ !cancelled() && github.event_name != 'pull_request' && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled') && !contains(needs.*.result, 'skipped') && needs.changes.outputs.release == 'true' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # stable
