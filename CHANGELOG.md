@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.8.1
+
+### Security
+
+- **Dependencies updated for RustSec advisories.** Fixes rustls (RUSTSEC-2026-0346/0347/0348/0349), rustls-webpki (RUSTSEC-2026-0382) and webpki-root-certs (RUSTSEC-2026-0383).
+
+### Internal
+
+- **Releases publish again.** The crates.io, GitHub release and Homebrew jobs no longer skip when the pull-request-only change detection is skipped on main.
+- **One CI/CD workflow gated by `Checks`.** `ci.yml` becomes `ci-cd.yml`: each job runs only for the domains a change touches, `Checks` is the one required status, and the release jobs run after it on main, publishing the binaries CI built. The macOS release build starts alongside the checks, and a release cancels pull request runs so it finds the macOS runners free.
+
 ## 0.8.0
 
 ### Added
