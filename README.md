@@ -202,6 +202,19 @@ CI runs. A change adds a changelog fragment under `changelog.d/unreleased/`
 (see `changelog.d/README.md`) rather than editing CHANGELOG.md, which is
 generated, so open pull requests do not conflict on it.
 
+CI and the release are one workflow, `.github/workflows/ci-cd.yml`. Its
+`changes` job reads the diff (against the base for a pull request, against
+the last main commit whose run passed for a push) and says which domains it
+touches: `rust` (code, manifests, toolchain), `dist` (the Linux release
+binaries, built on a pull request only when the dependencies, toolchain or CI
+change) and `apple` (the macOS job, held on a pull request for what Linux
+cannot check). Each job runs only for its domain, so most jobs skip on a
+documentation change; that is expected. The ruleset requires one status,
+`Checks`, which passes when every job either passed or was skipped. Changes
+under `.github/` count for every domain, and Markdown counts for none. To add
+a domain, give `changes` an output and an allowlist of paths for it, put the
+new job under that output's `if:`, and add the job to `Checks`'s `needs`.
+
 `just release patch|minor|major` opens a release pull request with the
 version bumped and the changelog written; the Release workflow does the same
 from GitHub. Merging it publishes `sift-music` to crates.io, then the GitHub

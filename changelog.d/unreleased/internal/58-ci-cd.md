@@ -1,0 +1,1 @@
+- **One CI/CD workflow gated by `Checks`.** `ci.yml` becomes `ci-cd.yml`: each job runs only for the domains a change touches, `Checks` is the one required status, and the release jobs run after it on main, publishing the binaries CI built. The macOS release build starts alongside the checks, and a release cancels pull request runs so it finds the macOS runners free.
