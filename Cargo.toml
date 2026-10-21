@@ -1,6 +1,6 @@
 [package]
 name = "sift-music"
-version = "0.8.0"
+version = "0.8.1"
 edition = "2024"
 description = "Music tagger and library organiser: MusicBrainz matching, tag writing, cover art, fb2k-style paths"
 license = "MIT"
