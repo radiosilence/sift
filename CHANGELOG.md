@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.9.0
+
+### Added
+
+- **Reading, removing and replacing embedded pictures.** `meta::pictures` lists every picture a file's tags carry, with its type, MIME type, size and dimensions; `meta::remove_pictures` removes them all, and `meta::set_cover` makes one image the only picture, as the front cover. Every other tag is left as it was. Callers such as slsk-mcp can correct a filed album's art without retagging it.
+
+### Internal
+
+- **Workflows are linted.** Pull requests that touch `.github/workflows` or `.github/actions` run actionlint, with shellcheck on the `run:` scripts.
+
 ## 0.8.1
 
 ### Security
