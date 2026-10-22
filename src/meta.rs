@@ -309,6 +309,7 @@ pub fn write(
         tag.remove_picture_type(PictureType::CoverFront);
         tag.push_picture(front_cover(data));
     }
+    repair_languages(tag);
     tag.save_to_path(path, WriteOptions::default())
         .map_err(lofty(path))?;
     if let Some(modified) = original_mtime {
@@ -368,6 +369,7 @@ pub fn write_credits(path: &Path, credits: &Credits) -> Result<(), MetaError> {
         .tag_mut(tag_type)
         .ok_or_else(|| MetaError::NoTag(path.to_path_buf()))?;
     set_credits(tag, credits, true);
+    repair_languages(tag);
     tag.save_to_path(path, WriteOptions::default())
         .map_err(lofty(path))?;
     Ok(())
@@ -616,6 +618,7 @@ pub fn set(path: &Path, changes: &[Change]) -> Result<(), MetaError> {
         .tag_mut(tag_type)
         .ok_or_else(|| MetaError::NoTag(path.to_path_buf()))?;
     set_tag(tag, changes);
+    repair_languages(tag);
     tag.save_to_path(path, WriteOptions::default())
         .map_err(lofty(path))?;
     Ok(())
@@ -749,6 +752,7 @@ pub fn set_replaygain(
         tag.remove_key(key);
         tag.insert_text(key, value);
     }
+    repair_languages(tag);
     tag.save_to_path(path, WriteOptions::default())
         .map_err(lofty(path))?;
     Ok(())
@@ -770,6 +774,7 @@ pub fn set_lyrics(path: &Path, lyrics: &str) -> Result<(), MetaError> {
         .ok_or_else(|| MetaError::NoTag(path.to_path_buf()))?;
     tag.remove_key(ItemKey::Lyrics);
     tag.insert_text(ItemKey::Lyrics, lyrics.to_string());
+    repair_languages(tag);
     tag.save_to_path(path, WriteOptions::default())
         .map_err(lofty(path))?;
     Ok(())
@@ -853,6 +858,30 @@ pub fn pictures(path: &Path) -> Result<Vec<Embedded>, MetaError> {
         .collect())
 }
 
+/// Give every item whose language is not three ASCII letters the unknown
+/// language, `XXX`. Some taggers write lyrics and comments with a language
+/// of zero bytes; lofty reads them but refuses to write them back, so any
+/// change to such a file would otherwise fail.
+fn repair_languages(tag: &mut Tag) {
+    let bad = |i: &TagItem| !i.lang().iter().all(u8::is_ascii_alphabetic);
+    let repaired: Vec<TagItem> = tag
+        .items()
+        .filter(|i| bad(i))
+        .cloned()
+        .map(|mut i| {
+            i.set_lang(lofty::tag::items::UNKNOWN_LANGUAGE);
+            i
+        })
+        .collect();
+    if repaired.is_empty() {
+        return;
+    }
+    tag.retain(|i| !bad(i));
+    for item in repaired {
+        tag.push(item);
+    }
+}
+
 /// Remove every picture embedded in `path`, from every tag, leaving the rest
 /// of the tags alone.
 pub fn remove_pictures(path: &Path) -> Result<(), MetaError> {
@@ -876,6 +905,7 @@ fn replace_pictures(path: &Path, cover: Option<&[u8]>) -> Result<(), MetaError> 
             while !tag.pictures().is_empty() {
                 tag.remove_picture(0);
             }
+            repair_languages(tag);
         }
     }
     if let Some(data) = cover {
@@ -930,6 +960,24 @@ mod tests {
         assert_eq!(t.field("track").as_deref(), Some("3"));
         assert_eq!(t.field("comp").as_deref(), Some("1"));
         assert_eq!(t.field("genre"), None);
+    }
+
+    #[test]
+    fn lyrics_with_a_language_of_zero_bytes_can_be_written_back() {
+        let mut tag = Tag::new(lofty::tag::TagType::Id3v2);
+        let mut lyrics = TagItem::new(ItemKey::Lyrics, ItemValue::Text("words".into()));
+        lyrics.set_lang([0; 3]);
+        tag.push(lyrics);
+        assert!(
+            tag.dump_to(&mut Vec::new(), WriteOptions::default())
+                .is_err()
+        );
+        repair_languages(&mut tag);
+        tag.dump_to(&mut Vec::new(), WriteOptions::default())
+            .unwrap();
+        let item = tag.get(ItemKey::Lyrics).unwrap();
+        assert_eq!(item.lang(), b"XXX");
+        assert_eq!(item.value().text(), Some("words"));
     }
 
     /// A Vorbis comment crediting each artist by repeating `ARTIST`.
