@@ -869,7 +869,8 @@ fn repair_id3v2_languages(path: &Path) -> Result<(), MetaError> {
     use lofty::mpeg::MpegFile;
     use lofty::tag::items::UNKNOWN_LANGUAGE;
     let is_mpeg = lofty::probe::Probe::open(path)
-        .and_then(|p| p.guess_file_type())
+        .map_err(lofty(path))?
+        .guess_file_type()
         .map_err(lofty(path))?
         .file_type()
         == Some(lofty::file::FileType::Mpeg);
