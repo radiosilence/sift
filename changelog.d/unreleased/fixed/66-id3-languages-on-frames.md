@@ -1,0 +1,1 @@
+- **Files whose lyrics or comments carry an invalid language can be written.** The repair in 0.9.1 had no effect: it worked on the generic tag, which never reaches these ID3v2 frames. Lyrics and comment frames with a language that is not three letters are now set to unknown (`XXX`) on the frames themselves before any write.
