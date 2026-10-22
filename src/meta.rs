@@ -249,6 +249,7 @@ pub fn write(
     } else {
         None
     };
+    repair_id3v2_languages(path)?;
     let mut file = lofty::probe::Probe::open(path)
         .map_err(lofty(path))?
         .read()
@@ -309,7 +310,6 @@ pub fn write(
         tag.remove_picture_type(PictureType::CoverFront);
         tag.push_picture(front_cover(data));
     }
-    repair_languages(tag);
     tag.save_to_path(path, WriteOptions::default())
         .map_err(lofty(path))?;
     if let Some(modified) = original_mtime {
@@ -357,6 +357,7 @@ fn set_credits(tag: &mut Tag, credits: &Credits, keep_unset: bool) {
 /// other tag as it is: for crediting each artist on files already filed.
 pub fn write_credits(path: &Path, credits: &Credits) -> Result<(), MetaError> {
     raise_allocation_limit();
+    repair_id3v2_languages(path)?;
     let mut file = lofty::probe::Probe::open(path)
         .map_err(lofty(path))?
         .read()
@@ -369,7 +370,6 @@ pub fn write_credits(path: &Path, credits: &Credits) -> Result<(), MetaError> {
         .tag_mut(tag_type)
         .ok_or_else(|| MetaError::NoTag(path.to_path_buf()))?;
     set_credits(tag, credits, true);
-    repair_languages(tag);
     tag.save_to_path(path, WriteOptions::default())
         .map_err(lofty(path))?;
     Ok(())
@@ -606,6 +606,7 @@ pub fn diff(old: &Track, new: &Track) -> Vec<TagChange> {
 /// an import and wrong for correcting one field of a filed album.
 pub fn set(path: &Path, changes: &[Change]) -> Result<(), MetaError> {
     raise_allocation_limit();
+    repair_id3v2_languages(path)?;
     let mut file = lofty::probe::Probe::open(path)
         .map_err(lofty(path))?
         .read()
@@ -618,7 +619,6 @@ pub fn set(path: &Path, changes: &[Change]) -> Result<(), MetaError> {
         .tag_mut(tag_type)
         .ok_or_else(|| MetaError::NoTag(path.to_path_buf()))?;
     set_tag(tag, changes);
-    repair_languages(tag);
     tag.save_to_path(path, WriteOptions::default())
         .map_err(lofty(path))?;
     Ok(())
@@ -732,6 +732,7 @@ pub fn set_replaygain(
     album: crate::replaygain::Gain,
 ) -> Result<(), MetaError> {
     raise_allocation_limit();
+    repair_id3v2_languages(path)?;
     let mut file = lofty::probe::Probe::open(path)
         .map_err(lofty(path))?
         .read()
@@ -752,7 +753,6 @@ pub fn set_replaygain(
         tag.remove_key(key);
         tag.insert_text(key, value);
     }
-    repair_languages(tag);
     tag.save_to_path(path, WriteOptions::default())
         .map_err(lofty(path))?;
     Ok(())
@@ -761,6 +761,7 @@ pub fn set_replaygain(
 /// Write lyrics, leaving every other tag alone.
 pub fn set_lyrics(path: &Path, lyrics: &str) -> Result<(), MetaError> {
     raise_allocation_limit();
+    repair_id3v2_languages(path)?;
     let mut file = lofty::probe::Probe::open(path)
         .map_err(lofty(path))?
         .read()
@@ -774,7 +775,6 @@ pub fn set_lyrics(path: &Path, lyrics: &str) -> Result<(), MetaError> {
         .ok_or_else(|| MetaError::NoTag(path.to_path_buf()))?;
     tag.remove_key(ItemKey::Lyrics);
     tag.insert_text(ItemKey::Lyrics, lyrics.to_string());
-    repair_languages(tag);
     tag.save_to_path(path, WriteOptions::default())
         .map_err(lofty(path))?;
     Ok(())
@@ -858,28 +858,47 @@ pub fn pictures(path: &Path) -> Result<Vec<Embedded>, MetaError> {
         .collect())
 }
 
-/// Give every item whose language is not three ASCII letters the unknown
-/// language, `XXX`. Some taggers write lyrics and comments with a language
-/// of zero bytes; lofty reads them but refuses to write them back, so any
-/// change to such a file would otherwise fail.
-fn repair_languages(tag: &mut Tag) {
-    let bad = |i: &TagItem| !i.lang().iter().all(u8::is_ascii_alphabetic);
-    let repaired: Vec<TagItem> = tag
-        .items()
-        .filter(|i| bad(i))
-        .cloned()
-        .map(|mut i| {
-            i.set_lang(lofty::tag::items::UNKNOWN_LANGUAGE);
-            i
-        })
-        .collect();
-    if repaired.is_empty() {
-        return;
+/// Give every ID3v2 lyrics and comment frame in `path` whose language is
+/// not three ASCII letters the unknown language, `XXX`. Some taggers write
+/// a language of zero bytes; lofty reads such frames but refuses to write
+/// them back, and keeps them out of reach of the generic tag, so every
+/// change to the file would otherwise fail. Only MPEG files are checked,
+/// and the file is written only when a frame needs repair.
+fn repair_id3v2_languages(path: &Path) -> Result<(), MetaError> {
+    use lofty::id3::v2::Frame;
+    use lofty::mpeg::MpegFile;
+    use lofty::tag::items::UNKNOWN_LANGUAGE;
+    let is_mpeg = lofty::probe::Probe::open(path)
+        .and_then(|p| p.guess_file_type())
+        .map_err(lofty(path))?
+        .file_type()
+        == Some(lofty::file::FileType::Mpeg);
+    if !is_mpeg {
+        return Ok(());
     }
-    tag.retain(|i| !bad(i));
-    for item in repaired {
-        tag.push(item);
+    let mut file = std::fs::File::open(path).map_err(lofty(path))?;
+    let mut mpeg = MpegFile::read_from(&mut file, ParseOptions::new()).map_err(lofty(path))?;
+    let Some(tag) = mpeg.id3v2_mut() else {
+        return Ok(());
+    };
+    let mut repaired = false;
+    tag.retain_mut(|frame| {
+        let language = match frame {
+            Frame::Comment(f) => &mut f.language,
+            Frame::UnsynchronizedText(f) => &mut f.language,
+            _ => return true,
+        };
+        if !language.iter().all(u8::is_ascii_alphabetic) {
+            *language = UNKNOWN_LANGUAGE;
+            repaired = true;
+        }
+        true
+    });
+    if repaired {
+        tag.save_to_path(path, WriteOptions::default())
+            .map_err(lofty(path))?;
     }
+    Ok(())
 }
 
 /// Remove every picture embedded in `path`, from every tag, leaving the rest
@@ -895,6 +914,7 @@ pub fn set_cover(path: &Path, cover: &[u8]) -> Result<(), MetaError> {
 
 fn replace_pictures(path: &Path, cover: Option<&[u8]>) -> Result<(), MetaError> {
     raise_allocation_limit();
+    repair_id3v2_languages(path)?;
     let mut file = lofty::probe::Probe::open(path)
         .map_err(lofty(path))?
         .read()
@@ -905,7 +925,6 @@ fn replace_pictures(path: &Path, cover: Option<&[u8]>) -> Result<(), MetaError> 
             while !tag.pictures().is_empty() {
                 tag.remove_picture(0);
             }
-            repair_languages(tag);
         }
     }
     if let Some(data) = cover {
@@ -962,22 +981,37 @@ mod tests {
         assert_eq!(t.field("genre"), None);
     }
 
+    /// An MP3 whose ID3v2.3 tag holds one lyrics frame with a language of
+    /// zero bytes, followed by a few silent MPEG frames.
+    fn mp3_with_zero_language_lyrics(dir: &Path) -> PathBuf {
+        let body: &[u8] = b"\x00\x00\x00\x00\x00words";
+        let mut frame = b"USLT".to_vec();
+        frame.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        frame.extend_from_slice(&[0, 0]);
+        frame.extend_from_slice(body);
+        let mut bytes = b"ID3\x03\x00\x00".to_vec();
+        bytes.extend_from_slice(&[0, 0, 0, frame.len() as u8]);
+        bytes.extend_from_slice(&frame);
+        for _ in 0..8 {
+            bytes.extend_from_slice(&[0xFF, 0xFB, 0x90, 0x64]);
+            bytes.extend_from_slice(&[0; 413]);
+        }
+        let path = dir.join("track.mp3");
+        std::fs::write(&path, bytes).unwrap();
+        path
+    }
+
     #[test]
-    fn lyrics_with_a_language_of_zero_bytes_can_be_written_back() {
-        let mut tag = Tag::new(lofty::tag::TagType::Id3v2);
-        let mut lyrics = TagItem::new(ItemKey::Lyrics, ItemValue::Text("words".into()));
-        lyrics.set_lang([0; 3]);
-        tag.push(lyrics);
-        assert!(
-            tag.dump_to(&mut Vec::new(), WriteOptions::default())
-                .is_err()
-        );
-        repair_languages(&mut tag);
-        tag.dump_to(&mut Vec::new(), WriteOptions::default())
-            .unwrap();
-        let item = tag.get(ItemKey::Lyrics).unwrap();
-        assert_eq!(item.lang(), b"XXX");
-        assert_eq!(item.value().text(), Some("words"));
+    fn a_file_whose_lyrics_have_a_language_of_zero_bytes_can_be_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = mp3_with_zero_language_lyrics(dir.path());
+        remove_pictures(&path).unwrap();
+        let mut file = std::fs::File::open(&path).unwrap();
+        let mpeg = lofty::mpeg::MpegFile::read_from(&mut file, ParseOptions::new()).unwrap();
+        let lyrics: Vec<_> = mpeg.id3v2().unwrap().unsync_text().collect();
+        assert_eq!(lyrics.len(), 1);
+        assert_eq!(&lyrics[0].language, b"XXX");
+        assert_eq!(lyrics[0].content, "words");
     }
 
     /// A Vorbis comment crediting each artist by repeating `ARTIST`.
