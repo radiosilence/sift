@@ -307,17 +307,7 @@ pub fn write(
     }
     if let Some(data) = cover {
         tag.remove_picture_type(PictureType::CoverFront);
-        let mime = if data.starts_with(&[0x89, b'P', b'N', b'G']) {
-            MimeType::Png
-        } else {
-            MimeType::Jpeg
-        };
-        tag.push_picture(
-            Picture::unchecked(data.to_vec())
-                .pic_type(PictureType::CoverFront)
-                .mime_type(mime)
-                .build(),
-        );
+        tag.push_picture(front_cover(data));
     }
     tag.save_to_path(path, WriteOptions::default())
         .map_err(lofty(path))?;
@@ -815,6 +805,93 @@ pub fn embedded_cover(path: &Path) -> Option<Vec<u8>> {
     Some(pic.data().to_vec())
 }
 
+fn front_cover(data: &[u8]) -> Picture {
+    let mime = if data.starts_with(&[0x89, b'P', b'N', b'G']) {
+        MimeType::Png
+    } else {
+        MimeType::Jpeg
+    };
+    Picture::unchecked(data.to_vec())
+        .pic_type(PictureType::CoverFront)
+        .mime_type(mime)
+        .build()
+}
+
+/// A picture embedded in a file's tags.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Embedded {
+    /// What the picture is for, as lofty names it: `CoverFront`, `Other`, …
+    pub kind: String,
+    pub mime: Option<String>,
+    pub bytes: usize,
+    /// Read from the image itself; absent when it cannot be decoded.
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+}
+
+/// Every picture embedded in `path`, from every tag it carries.
+pub fn pictures(path: &Path) -> Result<Vec<Embedded>, MetaError> {
+    raise_allocation_limit();
+    let file = lofty::read_from_path(path).map_err(lofty(path))?;
+    Ok(file
+        .tags()
+        .iter()
+        .flat_map(|t| t.pictures())
+        .map(|p| {
+            let size = image::ImageReader::new(std::io::Cursor::new(p.data()))
+                .with_guessed_format()
+                .ok()
+                .and_then(|r| r.into_dimensions().ok());
+            Embedded {
+                kind: format!("{:?}", p.pic_type()),
+                mime: p.mime_type().map(|m| m.as_str().to_string()),
+                bytes: p.data().len(),
+                width: size.map(|(w, _)| w),
+                height: size.map(|(_, h)| h),
+            }
+        })
+        .collect())
+}
+
+/// Remove every picture embedded in `path`, from every tag, leaving the rest
+/// of the tags alone.
+pub fn remove_pictures(path: &Path) -> Result<(), MetaError> {
+    replace_pictures(path, None)
+}
+
+/// Make `cover` the only picture embedded in `path`, as its front cover.
+pub fn set_cover(path: &Path, cover: &[u8]) -> Result<(), MetaError> {
+    replace_pictures(path, Some(cover))
+}
+
+fn replace_pictures(path: &Path, cover: Option<&[u8]>) -> Result<(), MetaError> {
+    raise_allocation_limit();
+    let mut file = lofty::probe::Probe::open(path)
+        .map_err(lofty(path))?
+        .read()
+        .map_err(lofty(path))?;
+    let types: Vec<_> = file.tags().iter().map(|t| t.tag_type()).collect();
+    for t in types {
+        if let Some(tag) = file.tag_mut(t) {
+            while !tag.pictures().is_empty() {
+                tag.remove_picture(0);
+            }
+        }
+    }
+    if let Some(data) = cover {
+        let tag_type = file.primary_tag_type();
+        if file.tag(tag_type).is_none() {
+            file.insert_tag(Tag::new(tag_type));
+        }
+        file.tag_mut(tag_type)
+            .ok_or_else(|| MetaError::NoTag(path.to_path_buf()))?
+            .push_picture(front_cover(data));
+    }
+    file.save_to_path(path, WriteOptions::default())
+        .map_err(lofty(path))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -966,5 +1043,41 @@ mod tests {
         assert_eq!(t.date, None);
         set(&path, &[("artists".into(), Some("A; B ;".into()))]).unwrap();
         assert_eq!(read(&path).unwrap().artists, ["A", "B"]);
+    }
+
+    #[test]
+    fn a_cover_set_replaces_every_picture_and_removing_leaves_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.wav");
+        crate::library::tests::wav(&path, 44_100);
+        write(
+            &path,
+            &Tags {
+                title: "T".into(),
+                ..Default::default()
+            },
+            Some(b"not an image"),
+            false,
+        )
+        .unwrap();
+        let before = pictures(&path).unwrap();
+        assert_eq!(before.len(), 1);
+        assert_eq!((before[0].width, before[0].bytes), (None, 12));
+
+        let mut png = Vec::new();
+        image::DynamicImage::new_rgb8(3, 2)
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        set_cover(&path, &png).unwrap();
+        let after = pictures(&path).unwrap();
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].kind, "CoverFront");
+        assert_eq!(after[0].mime.as_deref(), Some("image/png"));
+        assert_eq!((after[0].width, after[0].height), (Some(3), Some(2)));
+        assert_eq!(read(&path).unwrap().title.as_deref(), Some("T"));
+
+        remove_pictures(&path).unwrap();
+        assert!(pictures(&path).unwrap().is_empty());
+        assert_eq!(read(&path).unwrap().title.as_deref(), Some("T"));
     }
 }
