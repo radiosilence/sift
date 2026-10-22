@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.9.1
+
+### Fixed
+
+- **Files whose lyrics or comments carry an invalid language can be written.** Some taggers write ID3v2 lyrics and comment frames with a language of zero bytes, which lofty refuses to write back, so every change to such a file failed. The language is now set to unknown (`XXX`) before saving.
+
 ## 0.9.0
 
 ### Added
