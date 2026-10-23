@@ -26,21 +26,22 @@ deunicode = "1.6.2"
 dirs = "7.0.0"
 ebur128 = "0.1.10"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+indexmap = { version = "2.14.2", features = ["serde"] }
 lofty = "0.25"
 regex = "1.13.1"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "query"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
-serde_yaml_ng = "0.10.0"
+serde-saphyr = { version = "2.0.0", default-features = false, features = ["serialize", "deserialize"] }
 strsim = "0.11.1"
 symphonia = { version = "0.6.1", default-features = false, features = ["flac", "wav", "aiff", "pcm", "alac", "isomp4", "aac", "mp3", "ogg", "vorbis", "id3v1", "id3v2"] }
 thiserror = "2"
-tokio = { version = "1.54.0", features = ["rt-multi-thread", "macros", "time", "sync", "fs"] }
+tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "time", "sync", "fs"] }
 tracing = "0.1.44"
 unicode-normalization = "0.1.26"
 
 [dev-dependencies]
 proptest = "1.12.0"
 tempfile = "3.27.0"
-tokio = { version = "1.54.0", features = ["full"] }
+tokio = { version = "1.54.1", features = ["full"] }

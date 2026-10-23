@@ -21,7 +21,7 @@ pub enum ConfigError {
     #[error("{path}: {source}")]
     Parse {
         path: PathBuf,
-        source: serde_yaml_ng::Error,
+        source: serde_saphyr::Error,
     },
     #[error("replace pattern {pattern:?}: {source}")]
     Regex {
@@ -40,7 +40,7 @@ pub enum ConfigError {
     #[error("{path}: {source}")]
     Serialize {
         path: PathBuf,
-        source: serde_yaml_ng::Error,
+        source: serde_saphyr::ser::Error,
     },
 }
 
@@ -200,7 +200,7 @@ struct Raw {
     paths: BTreeMap<String, String>,
     /// Ordered: beets applies these in file order, and so must we.
     #[serde(skip_serializing_if = "Option::is_none")]
-    replace: Option<serde_yaml_ng::Mapping>,
+    replace: Option<indexmap::IndexMap<String, String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     asciify_paths: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -351,12 +351,6 @@ impl Config {
             if let Some(map) = raw.replace {
                 cfg.replace = map
                     .into_iter()
-                    .filter_map(|(k, v)| {
-                        Some((
-                            k.as_str()?.to_string(),
-                            v.as_str().unwrap_or_default().to_string(),
-                        ))
-                    })
                     .map(|(p, r)| {
                         regex::Regex::new(&p)
                             .map(|re| (re, r))
@@ -518,7 +512,7 @@ pub fn migrate(from: &Path, to: &Path) -> Result<Vec<PathBuf>, ConfigError> {
             *t = translate(t);
         }
         raw.plugins = raw.plugins.known();
-        let text = serde_yaml_ng::to_string(&raw).map_err(|source| ConfigError::Serialize {
+        let text = serde_saphyr::to_string(&raw).map_err(|source| ConfigError::Serialize {
             path: dest.clone(),
             source,
         })?;
@@ -636,7 +630,7 @@ fn read_raw(path: &Path) -> Result<Raw, ConfigError> {
     if text.trim().is_empty() {
         return Ok(Raw::default());
     }
-    serde_yaml_ng::from_str(&text).map_err(|source| ConfigError::Parse {
+    serde_saphyr::from_str(&text).map_err(|source| ConfigError::Parse {
         path: path.into(),
         source,
     })
@@ -958,21 +952,18 @@ mod tests {
         let written = migrate(&from.path().join("config.yaml"), &to).unwrap();
         assert_eq!(written, [to.join("base.yaml"), to.join("config.yaml")]);
 
-        let base: serde_yaml_ng::Value =
-            serde_yaml_ng::from_str(&std::fs::read_to_string(to.join("base.yaml")).unwrap())
+        let base: serde_json::Value =
+            serde_saphyr::from_str(&std::fs::read_to_string(to.join("base.yaml")).unwrap())
                 .unwrap();
         let template =
             "%album artist%/$if(%year%,'('%year%') ',)%album%/$num(%tracknumber%,2) %title%";
         assert_eq!(base["paths"]["default"].as_str(), Some(template));
         assert!(base["paths"].get("singleton").is_none());
         assert!(base.get("lastgenre").is_none());
-        assert_eq!(
-            base["plugins"],
-            serde_yaml_ng::from_str::<serde_yaml_ng::Value>("[fetchart, discogs]").unwrap()
-        );
+        assert_eq!(base["plugins"], serde_json::json!(["fetchart", "discogs"]));
 
-        let config: serde_yaml_ng::Value =
-            serde_yaml_ng::from_str(&std::fs::read_to_string(to.join("config.yaml")).unwrap())
+        let config: serde_json::Value =
+            serde_saphyr::from_str(&std::fs::read_to_string(to.join("config.yaml")).unwrap())
                 .unwrap();
         assert_eq!(config["include"][0].as_str(), Some("base.yaml"));
         assert_eq!(config["directory"].as_str(), Some("/music"));
@@ -1060,8 +1051,8 @@ mod tests {
         .unwrap();
         let to = dir.path().join("out");
         migrate(&dir.path().join("config.yaml"), &to).unwrap();
-        let machine: serde_yaml_ng::Value =
-            serde_yaml_ng::from_str(&std::fs::read_to_string(to.join("sub/machine.yaml")).unwrap())
+        let machine: serde_json::Value =
+            serde_saphyr::from_str(&std::fs::read_to_string(to.join("sub/machine.yaml")).unwrap())
                 .unwrap();
         assert_eq!(machine["include"][0].as_str(), Some("../base.yaml"));
         assert!(Config::load(&to.join("config.yaml")).unwrap().original_date);
