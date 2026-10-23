@@ -1,3 +1,5 @@
+#![cfg(feature = "tagger")]
+
 //! Re-importing an album already in the library against a local server
 //! standing in for MusicBrainz.
 

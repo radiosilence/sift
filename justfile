@@ -4,6 +4,7 @@
 check:
     cargo fmt --all -- --check
     cargo clippy --all-targets -- -D warnings
+    cargo clippy --lib --no-default-features -- -D warnings
     cargo test --locked
     actionlint
 

@@ -1,3 +1,5 @@
+#![cfg(feature = "tagger")]
+
 //! The MusicBrainz client against a local server that answers from a script,
 //! so retries and pacing are exercised without touching the real service.
 

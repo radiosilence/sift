@@ -1,3 +1,5 @@
+#![cfg(feature = "tagger")]
+
 //! The Discogs client against a local server that answers from a script, the
 //! same shape as `tests/musicbrainz.rs`.
 

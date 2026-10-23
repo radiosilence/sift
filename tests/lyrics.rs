@@ -1,3 +1,5 @@
+#![cfg(feature = "tagger")]
+
 //! The LRCLIB client against a local server standing in for it.
 
 use sift::lyrics::{Client, Lyrics};
