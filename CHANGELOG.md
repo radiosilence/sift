@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.9.3
+
+### Added
+
+- **The format engine builds alone.** Everything but `sift::format` is behind the default `tagger` feature, so a program that only formats paths can set `default-features = false` and build none of the tagger's dependencies.
+
+### Security
+
+- **YAML is parsed by serde-saphyr instead of serde_yaml_ng.** serde_yaml_ng depends on the unmaintained `unsafe-libyaml` (RUSTSEC-2024-0449). `ConfigError::Parse` and `ConfigError::Serialize` now carry boxed serde-saphyr errors, and a non-string entry in `replace` is rejected instead of ignored.
+- Update tokio and other packages for security
+
 ## 0.9.2
 
 ### Fixed
