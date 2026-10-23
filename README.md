@@ -11,6 +11,14 @@ it is still imported as `sift`:
 sift = { package = "sift-music", version = "0.9" }
 ```
 
+The `tagger` feature, on by default, is everything but `sift::format`, the
+fb2k-style template engine. A program that only formats paths can turn it off
+and build none of the tagger's dependencies:
+
+```toml
+sift = { package = "sift-music", version = "0.9", default-features = false }
+```
+
 ```console
 $ mise use -g github:radiosilence/sift        # or brew install radiosilence/sift/sift,
                                               # or a static binary from the releases

@@ -1,3 +1,5 @@
+#![cfg(feature = "tagger")]
+
 //! Each artist on a collaboration credited in the files, against a local
 //! server standing in for MusicBrainz.
 

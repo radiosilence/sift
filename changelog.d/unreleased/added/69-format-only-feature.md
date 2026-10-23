@@ -1,0 +1,1 @@
+- **The format engine builds alone.** Everything but `sift::format` is behind the default `tagger` feature, so a program that only formats paths can set `default-features = false` and build none of the tagger's dependencies.

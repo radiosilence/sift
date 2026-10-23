@@ -288,6 +288,8 @@ jobs:
           shared-key: lint
           cache-on-failure: true
       - run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Clippy (format only)
+        run: cargo clippy --locked --lib --no-default-features -- -D warnings
 
   format:
     name: Check Formatting

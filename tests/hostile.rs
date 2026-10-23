@@ -1,3 +1,5 @@
+#![cfg(feature = "tagger")]
+
 //! Input sift does not control — tags, file contents, templates — thrown at
 //! it at random. None of it may panic, and no tag may move a file outside the
 //! library.
