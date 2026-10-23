@@ -21,7 +21,7 @@ pub enum ConfigError {
     #[error("{path}: {source}")]
     Parse {
         path: PathBuf,
-        source: serde_saphyr::Error,
+        source: Box<serde_saphyr::Error>,
     },
     #[error("replace pattern {pattern:?}: {source}")]
     Regex {
@@ -40,7 +40,7 @@ pub enum ConfigError {
     #[error("{path}: {source}")]
     Serialize {
         path: PathBuf,
-        source: serde_saphyr::ser::Error,
+        source: Box<serde_saphyr::ser::Error>,
     },
 }
 
@@ -514,7 +514,7 @@ pub fn migrate(from: &Path, to: &Path) -> Result<Vec<PathBuf>, ConfigError> {
         raw.plugins = raw.plugins.known();
         let text = serde_saphyr::to_string(&raw).map_err(|source| ConfigError::Serialize {
             path: dest.clone(),
-            source,
+            source: Box::new(source),
         })?;
         planned.push((dest, text));
     }
@@ -632,7 +632,7 @@ fn read_raw(path: &Path) -> Result<Raw, ConfigError> {
     }
     serde_saphyr::from_str(&text).map_err(|source| ConfigError::Parse {
         path: path.into(),
-        source,
+        source: Box::new(source),
     })
 }
 
