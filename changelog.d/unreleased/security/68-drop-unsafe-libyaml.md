@@ -1,0 +1,1 @@
+- **YAML is parsed by serde-saphyr instead of serde_yaml_ng.** serde_yaml_ng depends on the unmaintained `unsafe-libyaml` (RUSTSEC-2024-0449). tokio moves to 1.54.1, past RUSTSEC-2026-0384. `ConfigError::Parse` and `ConfigError::Serialize` now carry serde-saphyr error types, and a non-string entry in `replace` is rejected instead of ignored.
