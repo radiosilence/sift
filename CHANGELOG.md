@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.10.0
+
+### Added
+
+- **Split credits on a given separator.** `Known::splitting_on` splits each credit on a separator a person names, for collaborations whose artists the library holds nothing else by, which the known-artist split leaves whole.
+
 ## 0.9.3
 
 ### Added
