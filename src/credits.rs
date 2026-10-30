@@ -50,9 +50,24 @@ const MAX_PARTS: usize = 10;
 #[derive(Debug, Default, Clone)]
 pub struct Known {
     artists: HashMap<String, HashSet<PathBuf>>,
+    /// A separator a person has said joins artists in the credits being
+    /// split, which then needs no artist to be known.
+    separator: Option<String>,
 }
 
 impl Known {
+    /// Split every credit on `separator` instead of by the artists known:
+    /// for a credit whose parts the library holds nothing else by, as a
+    /// person reading it can tell where the names end. A blank separator
+    /// changes nothing.
+    pub fn splitting_on(mut self, separator: &str) -> Self {
+        let separator = separator.trim();
+        if !separator.is_empty() {
+            self.separator = Some(separator.to_string());
+        }
+        self
+    }
+
     /// Record `name` as an artist on the album in `dir`.
     pub fn add(&mut self, name: &str, dir: &Path) {
         let key = normalise(name);
@@ -102,7 +117,20 @@ impl Known {
 /// as an artist apart from the album in `dir`. Of the groupings that work,
 /// the one with fewest parts is taken, so a known "Frànçois & the Atlas
 /// Mountains" is never split further into an equally known "Frànçois".
+///
+/// With a separator given by [`Known::splitting_on`], the credit is split
+/// there instead, each part trimmed, and left alone when it does not hold
+/// the separator.
 pub fn split(credit: &str, known: &Known, dir: &Path) -> Option<Vec<String>> {
+    if let Some(separator) = &known.separator {
+        let names: Vec<String> = credit
+            .split(separator.as_str())
+            .map(tidy)
+            .filter(|n| !n.is_empty())
+            .map(String::from)
+            .collect();
+        return (names.len() > 1).then_some(names);
+    }
     let parts = pieces(credit);
     if parts.len() < 2 || parts.len() > MAX_PARTS {
         return None;
@@ -486,6 +514,32 @@ mod tests {
         );
         k.add("Lone Ranger", Path::new(HERE));
         assert_eq!(split("Lauer & Lone Ranger", &k, Path::new(HERE)), None);
+    }
+
+    #[test]
+    fn a_given_separator_splits_without_known_artists() {
+        let k = Known::default().splitting_on(" , ");
+        let here = Path::new(HERE);
+        assert_eq!(
+            split("Ilya Gadaev, it alone,safetypleace", &k, here),
+            Some(vec![
+                "Ilya Gadaev".to_string(),
+                "it alone".to_string(),
+                "safetypleace".to_string(),
+            ])
+        );
+        assert_eq!(
+            split("Earth & Fire", &k, here),
+            None,
+            "no separator, no split"
+        );
+        assert_eq!(split("Robyn, ", &k, here), None, "one name is not a split");
+        let plus = Known::default().splitting_on("+");
+        assert_eq!(
+            split("A + B", &plus, here),
+            Some(vec!["A".to_string(), "B".to_string()])
+        );
+        assert!(Known::default().splitting_on("  ").separator.is_none());
     }
 
     #[test]
