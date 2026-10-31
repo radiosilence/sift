@@ -1285,12 +1285,12 @@ mod tests {
         let seed = dir.path().join("seed.wav");
         crate::library::tests::wav(&path, 44_100);
         std::fs::hard_link(&path, &seed).unwrap();
-        set_lyrics(&path, "la").unwrap();
+        set(&path, &[("genre".into(), Some("Dub".into()))]).unwrap();
         assert_eq!(
             std::fs::metadata(&path).unwrap().ino(),
             std::fs::metadata(&seed).unwrap().ino()
         );
-        assert!(has_lyrics(&seed));
+        assert_eq!(read(&seed).unwrap().genre.as_deref(), Some("Dub"));
     }
 
     #[cfg(unix)]
@@ -1301,14 +1301,14 @@ mod tests {
         let link = dir.path().join("a.wav");
         crate::library::tests::wav(&target, 44_100);
         std::os::unix::fs::symlink(&target, &link).unwrap();
-        set_lyrics(&link, "la").unwrap();
+        set(&link, &[("genre".into(), Some("Dub".into()))]).unwrap();
         assert!(
             std::fs::symlink_metadata(&link)
                 .unwrap()
                 .file_type()
                 .is_symlink()
         );
-        assert!(has_lyrics(&target));
+        assert_eq!(read(&target).unwrap().genre.as_deref(), Some("Dub"));
     }
 
     #[test]
@@ -1341,14 +1341,13 @@ mod tests {
                 }),
                 replaygain: Some((gain, gain)),
                 changes: &[("genre".into(), Some("Dub".into()))],
-                lyrics: Some("la"),
+                lyrics: None,
             },
         )
         .unwrap();
         let t = read(&path).unwrap();
         assert_eq!(t.artists, ["A", "B"]);
         assert_eq!(t.genre.as_deref(), Some("Dub"));
-        assert!(has_lyrics(&path));
         assert!(has_album_gain(&path));
     }
 
