@@ -326,6 +326,32 @@ async fn a_refused_retag_plan_still_lists_each_file() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn an_import_that_fails_part_way_takes_back_the_copies_it_made() {
+    let root = tempfile::tempdir().unwrap();
+    let lib = root.path().join("lib");
+    let src = root.path().join("in");
+    for (n, title) in [(1, "Kenneth"), (2, "Crush")] {
+        let f = src.join(format!("{n}.wav"));
+        wav(&f);
+        tag(&f, "Monster", title, n);
+    }
+    // A dangling link reads as nothing there when planning, but the second
+    // track's copy cannot claim its name: the first copy must come back out.
+    let album = lib.join("R.E.M_").join("Monster");
+    std::fs::create_dir_all(&album).unwrap();
+    let link = album.join("02 Crush With Eyeliner.wav");
+    std::os::unix::fs::symlink(root.path().join("nowhere"), &link).unwrap();
+    let result = importer(&lib).await.import(&src, Some("rel")).await;
+    assert!(
+        matches!(result, Err(sift::ImportError::Io(_))),
+        "the second copy fails: {result:?}"
+    );
+    assert_eq!(walk(&lib), [link], "nothing but the link is left");
+    assert!(src.join("1.wav").exists() && src.join("2.wav").exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn a_read_only_source_is_copied_in_and_tagged() {
     use std::os::unix::fs::PermissionsExt;
     let root = tempfile::tempdir().unwrap();

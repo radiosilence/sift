@@ -284,6 +284,8 @@ pub async fn transfer(from: &Path, to: &Path, move_file: bool) -> std::io::Resul
 struct Claim<'a> {
     to: &'a Path,
     tmp: Option<std::path::PathBuf>,
+    /// Folders made for `to`, deepest first.
+    made: Vec<std::path::PathBuf>,
     kept: bool,
 }
 
@@ -298,11 +300,37 @@ impl Drop for Claim<'_> {
         if std::fs::metadata(self.to).is_ok_and(|m| m.len() == 0) {
             let _ = std::fs::remove_file(self.to);
         }
+        remove_made(&self.made);
+    }
+}
+
+/// Remove folders a transfer made, deepest first, each only if empty.
+fn remove_made(made: &[std::path::PathBuf]) {
+    for dir in made {
+        if std::fs::remove_dir(dir).is_err() {
+            break;
+        }
     }
 }
 
 /// [`transfer`], on the calling thread.
 pub(crate) fn transfer_blocking(from: &Path, to: &Path, move_file: bool) -> std::io::Result<()> {
+    transfer_making(from, to, move_file).map(drop)
+}
+
+/// [`transfer_blocking`], returning the folders it made for `to`,
+/// deepest first.
+fn transfer_making(
+    from: &Path,
+    to: &Path,
+    move_file: bool,
+) -> std::io::Result<Vec<std::path::PathBuf>> {
+    let made: Vec<std::path::PathBuf> = to
+        .ancestors()
+        .skip(1)
+        .take_while(|dir| !dir.as_os_str().is_empty() && !dir.exists())
+        .map(Path::to_path_buf)
+        .collect();
     if let Some(dir) = to.parent() {
         std::fs::create_dir_all(dir)?;
     }
@@ -313,13 +341,14 @@ pub(crate) fn transfer_blocking(from: &Path, to: &Path, move_file: bool) -> std:
     let mut claim = Claim {
         to,
         tmp: None,
+        made,
         kept: false,
     };
     if move_file {
         match std::fs::rename(from, to) {
             Ok(()) => {
                 claim.kept = true;
-                return Ok(());
+                return Ok(std::mem::take(&mut claim.made));
             }
             Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => {}
             Err(e) => return Err(e),
@@ -374,20 +403,31 @@ pub(crate) fn transfer_blocking(from: &Path, to: &Path, move_file: bool) -> std:
                     to.display()
                 );
             }
+            // The folders made for it go with it.
+            claim.kept = false;
             return Err(e);
         }
     }
-    Ok(())
+    Ok(std::mem::take(&mut claim.made))
 }
 
 /// The transfers made so far toward one change of the library, undone
 /// together if the change does not finish: an album half moved is worse
 /// than one not moved at all. Dropped before [`Journal::commit`], it undoes
-/// them, so a cancelled or failed change puts every file back where it was.
-/// Only locations are undone: tags written to a file along the way stay.
+/// them, so a cancelled or failed change puts every file back where it was,
+/// and removes the folders it made for them. Only locations are undone:
+/// tags written to a file along the way stay.
 #[derive(Default)]
 pub(crate) struct Journal {
-    done: Vec<(std::path::PathBuf, std::path::PathBuf, bool)>,
+    done: Vec<Done>,
+}
+
+/// One transfer, and the folders it made.
+struct Done {
+    from: std::path::PathBuf,
+    to: std::path::PathBuf,
+    moved: bool,
+    made: Vec<std::path::PathBuf>,
 }
 
 impl Journal {
@@ -398,9 +438,13 @@ impl Journal {
         to: &Path,
         move_file: bool,
     ) -> std::io::Result<()> {
-        transfer_blocking(from, to, move_file)?;
-        self.done
-            .push((from.to_path_buf(), to.to_path_buf(), move_file));
+        let made = transfer_making(from, to, move_file)?;
+        self.done.push(Done {
+            from: from.to_path_buf(),
+            to: to.to_path_buf(),
+            moved: move_file,
+            made,
+        });
         Ok(())
     }
 
@@ -408,8 +452,8 @@ impl Journal {
     pub(crate) fn moves(&self) -> impl Iterator<Item = (&Path, &Path)> {
         self.done
             .iter()
-            .filter(|(_, _, moved)| *moved)
-            .map(|(from, to, _)| (from.as_path(), to.as_path()))
+            .filter(|d| d.moved)
+            .map(|d| (d.from.as_path(), d.to.as_path()))
     }
 
     /// Keep every transfer.
@@ -421,24 +465,17 @@ impl Journal {
     /// from, a copy removed. Returns the files that could not be.
     fn undo(&mut self) -> Vec<std::path::PathBuf> {
         let mut stuck = Vec::new();
-        for (from, to, moved) in self.done.drain(..).rev() {
-            let undone = if moved {
-                transfer_blocking(&to, &from, true)
+        for d in self.done.drain(..).rev() {
+            let undone = if d.moved {
+                transfer_blocking(&d.to, &d.from, true)
             } else {
-                std::fs::remove_file(&to)
+                std::fs::remove_file(&d.to)
             };
             if undone.is_err() {
-                stuck.push(to);
+                stuck.push(d.to);
                 continue;
             }
-            // The album's folder, and its artist's, made for this change and
-            // empty again; a folder holding anything stays.
-            if let Some(dir) = to.parent()
-                && std::fs::remove_dir(dir).is_ok()
-                && let Some(parent) = dir.parent()
-            {
-                let _ = std::fs::remove_dir(parent);
-            }
+            remove_made(&d.made);
         }
         stuck
     }
@@ -653,6 +690,28 @@ mod tests {
             std::fs::read_dir(dir.path().join("lib")).unwrap().count(),
             0
         );
+    }
+
+    #[test]
+    fn undoing_removes_only_the_folders_a_transfer_made() {
+        let dir = tempfile::tempdir().unwrap();
+        let lib = dir.path().join("lib");
+        std::fs::create_dir_all(lib.join("Artist")).unwrap();
+        let (a, b) = (dir.path().join("a.flac"), dir.path().join("b.flac"));
+        std::fs::write(&a, b"a").unwrap();
+        std::fs::write(&b, b"b").unwrap();
+        let mut journal = Journal::default();
+        journal
+            .transfer(&a, &lib.join("Artist/Album/a.flac"), true)
+            .unwrap();
+        journal
+            .transfer(&b, &lib.join("New/Album/b.flac"), true)
+            .unwrap();
+        drop(journal);
+        assert!(lib.join("Artist").is_dir(), "it was there before");
+        assert!(!lib.join("Artist/Album").exists());
+        assert!(!lib.join("New").exists());
+        assert!(lib.is_dir());
     }
 
     #[test]

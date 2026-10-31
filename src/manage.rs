@@ -137,8 +137,9 @@ pub fn plan_move(cfg: &Config, album: &Album) -> Plan {
 
 /// Carry out a plan from [`plan_move`], keeping the index in step, then
 /// remove the directories it emptied (the album's, then its artist's). A
-/// directory is only ever removed empty. A move that fails puts back the
-/// ones made before it, so the album stays whole where it was.
+/// directory is only ever removed empty. A move that fails, an index that
+/// cannot be updated, or a dropped future puts every file back, so the
+/// album stays whole where it was and the index still agrees.
 pub async fn execute(lib: &mut Library, album: &Album, moves: &[Move]) -> Result<(), LibraryError> {
     let owned = moves.to_vec();
     let journal = tokio::task::spawn_blocking(move || {
