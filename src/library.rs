@@ -652,7 +652,10 @@ impl Library {
         // whose file has left the index, however, goes with it.
         for table in ["checks", "lyrics_misses"] {
             tx.execute(
-                &format!("DELETE FROM {table} WHERE path NOT IN (SELECT path FROM items)"),
+                &format!(
+                    "DELETE FROM {table} WHERE NOT EXISTS
+                     (SELECT 1 FROM items i WHERE i.path = {table}.path)"
+                ),
                 [],
             )?;
         }
