@@ -1003,10 +1003,21 @@ impl Importer {
                 break;
             }
         }
+        // A credit spelled differently from MusicBrainz's ("x" for "×")
+        // fails the artist phrase; the plain title by any of the artist's
+        // words still finds it, and distance decides. Only the top-scoring
+        // hits are kept: one sharing a single word of the credit scores
+        // about half, and the sort below would otherwise put it first.
+        let mut floor = 50;
+        if !hits.iter().any(|h| h.score >= floor) {
+            let _ = writeln!(log, "searching for {base:?} by any of {artist:?}");
+            hits = self.mb.search_releases_loosely(&artist, &base, 10).await?;
+            floor = 90;
+        }
         // An album usually has many pressings scoring alike; the ones with
         // as many tracks as the folder are looked up first, since the
         // lookups run out before the list does.
-        hits.retain(|h| h.score >= 50);
+        hits.retain(|h| h.score >= floor);
         hits.sort_by_key(|h| h.track_count.abs_diff(tracks.len()));
         let mut looked_up = 0;
         for hit in hits {
