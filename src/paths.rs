@@ -404,11 +404,7 @@ impl Journal {
 
     /// Put every file back, newest first: a moved file to where it came
     /// from, a copy removed. Returns the files that could not be.
-    pub(crate) fn undo(mut self) -> Vec<std::path::PathBuf> {
-        self.undo_all()
-    }
-
-    fn undo_all(&mut self) -> Vec<std::path::PathBuf> {
+    fn undo(&mut self) -> Vec<std::path::PathBuf> {
         let mut stuck = Vec::new();
         for (from, to, moved) in self.done.drain(..).rev() {
             let undone = if moved {
@@ -426,7 +422,7 @@ impl Journal {
 
 impl Drop for Journal {
     fn drop(&mut self) {
-        let stuck = self.undo_all();
+        let stuck = self.undo();
         if !stuck.is_empty() {
             tracing::error!(
                 "could not put back: {}",
