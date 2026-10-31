@@ -977,6 +977,17 @@ impl Importer {
             if let Ok(r) = self.mb.release(&id).await {
                 releases.push(r);
             }
+        } else if self.discogs.is_some()
+            && let Some(id) =
+                matching::consensus(tracks.iter().map(|t| t.discogs_album_id.as_deref()))
+        {
+            let _ = writeln!(log, "files are tagged with discogs release {id}");
+            match self.release(&format!("discogs:{id}")).await {
+                Ok(r) => releases.push(r),
+                Err(e) => {
+                    let _ = writeln!(log, "discogs release {id}: {e}");
+                }
+            }
         }
         let (artist, album) = self.query_terms(dir, tracks);
         // The plain title first: an edition suffix is in the tags far more
@@ -1435,6 +1446,7 @@ impl Importer {
             mb_release_group_id: mb_ids
                 .then(|| release.release_group.as_ref().map(|g| g.id.clone()))
                 .flatten(),
+            discogs_album_id: release.id.strip_prefix("discogs:").map(str::to_string),
         }
     }
 

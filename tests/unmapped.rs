@@ -1,6 +1,7 @@
 #![cfg(feature = "tagger")]
 
-//! Fields lofty has no generic key for survive every kind of sift write.
+//! Fields lofty has no generic key for survive every kind of sift write,
+//! and the one sift owns, the Discogs release id, round-trips in each format.
 
 use std::path::{Path, PathBuf};
 
@@ -78,5 +79,64 @@ fn unmapped_comments_survive_every_write() {
         meta::set_cover(&path, include_bytes!("fixtures/cover.png")).unwrap();
         assert_kept(&path);
         assert_eq!(meta::pictures(&path).unwrap().len(), 1, "{name}");
+    }
+}
+
+#[test]
+fn the_discogs_id_is_written_read_and_cleared_without_reordering_credits() {
+    let dir = tempfile::tempdir().unwrap();
+    for name in ["silence.flac", "silence.opus", "silence.mp3", "silence.m4a"] {
+        let vorbis = name.ends_with(".flac") || name.ends_with(".opus");
+        let path = if vorbis {
+            planted(dir.path(), name)
+        } else {
+            let path = dir.path().join(name);
+            std::fs::copy(Path::new(FIXTURES).join(name), &path).unwrap();
+            path
+        };
+        let mut tags = Tags {
+            title: "T".into(),
+            artist: "A & B".into(),
+            album: "Album".into(),
+            album_artist: "A".into(),
+            track: 1,
+            artists: vec!["A".into(), "B".into()],
+            discogs_album_id: Some("123".into()),
+            ..Default::default()
+        };
+        meta::write(&path, &tags, None, false).unwrap();
+        let read = meta::read(&path).unwrap();
+        assert_eq!(read.discogs_album_id.as_deref(), Some("123"), "{name}");
+        assert!(meta::changes(&read, &tags).is_empty(), "{name}");
+        if vorbis {
+            assert_kept(&path);
+        }
+
+        meta::set_replaygain(
+            &path,
+            sift::replaygain::Gain {
+                db: -1.0,
+                peak: 0.5,
+            },
+            sift::replaygain::Gain {
+                db: -1.0,
+                peak: 0.5,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            meta::read(&path).unwrap().discogs_album_id.as_deref(),
+            Some("123"),
+            "another write keeps it: {name}"
+        );
+
+        tags.discogs_album_id = None;
+        meta::write(&path, &tags, None, false).unwrap();
+        let read = meta::read(&path).unwrap();
+        assert_eq!(read.discogs_album_id, None, "{name}");
+        assert_eq!(read.artists, ["A", "B"], "{name}");
+        if vorbis {
+            assert_kept(&path);
+        }
     }
 }
