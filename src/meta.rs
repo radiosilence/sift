@@ -127,8 +127,14 @@ fn read_inner(path: &Path) -> Result<Track, MetaError> {
         bit_depth: props.bit_depth(),
         ..Default::default()
     };
-    if let Some(tag) = file.primary_tag().or_else(|| file.first_tag()) {
-        read_tag(&mut t, tag);
+    let mut file = file;
+    let tag_type = file
+        .primary_tag()
+        .or_else(|| file.first_tag())
+        .map(|t| t.tag_type());
+    if let Some(tag) = tag_type.and_then(|t| file.remove(t)) {
+        read_tag(&mut t, &tag);
+        t.discogs_album_id = discogs_album_id(tag);
     }
     Ok(t)
 }
@@ -181,12 +187,13 @@ fn read_tag(t: &mut Track, tag: &Tag) {
     t.country = s(ItemKey::ReleaseCountry);
     t.media = s(ItemKey::OriginalMediaType);
     t.mb_release_group_id = s(ItemKey::MusicBrainzReleaseGroupId);
-    t.discogs_album_id = discogs_album_id(tag);
 }
 
-/// beets' name for the Discogs release id. lofty has no generic key for
-/// it, so it is read and written in each format's own tag: a Vorbis
-/// comment, an ID3v2 `TXXX` frame, an MP4 freeform atom, an APE item.
+/// The Discogs release id's tag, named after beets' `discogs_albumid`.
+/// lofty has no generic key for it, so it is read and written in each
+/// format's own tag: a Vorbis comment, an ID3v2 `TXXX` frame, an MP4
+/// freeform atom, an APE item. Its name is matched in any case, as taggers
+/// match `TXXX` descriptions.
 const DISCOGS_ALBUM_ID: &str = "DISCOGS_ALBUMID";
 
 fn itunes(name: &str) -> lofty::mp4::AtomIdent<'_> {
@@ -198,25 +205,32 @@ fn itunes(name: &str) -> lofty::mp4::AtomIdent<'_> {
 
 /// The Discogs release id in `tag`, which lofty keeps among the items it
 /// has no generic key for, reachable through the format's own type.
-fn discogs_album_id(tag: &Tag) -> Option<String> {
+fn discogs_album_id(tag: Tag) -> Option<String> {
     if !tag.has_format_specific_items() {
         return None;
     }
     let id = match tag.tag_type() {
-        TagType::VorbisComments => VorbisComments::from(tag.clone())
+        TagType::VorbisComments => VorbisComments::from(tag)
             .get(DISCOGS_ALBUM_ID)
             .map(str::to_string),
-        TagType::Id3v2 => lofty::id3::v2::Id3v2Tag::from(tag.clone())
-            .get_user_text(DISCOGS_ALBUM_ID)
-            .map(str::to_string),
-        TagType::Mp4Ilst => lofty::mp4::Ilst::from(tag.clone())
+        TagType::Id3v2 => lofty::id3::v2::Id3v2Tag::from(tag)
+            .into_iter()
+            .find_map(|f| match f {
+                lofty::id3::v2::Frame::UserText(f)
+                    if f.description.eq_ignore_ascii_case(DISCOGS_ALBUM_ID) =>
+                {
+                    Some(f.content.into_owned())
+                }
+                _ => None,
+            }),
+        TagType::Mp4Ilst => lofty::mp4::Ilst::from(tag)
             .get(&itunes(DISCOGS_ALBUM_ID))
             .and_then(|a| a.data().next().cloned())
             .and_then(|d| match d {
                 lofty::mp4::AtomData::UTF8(v) | lofty::mp4::AtomData::UTF16(v) => Some(v),
                 _ => None,
             }),
-        TagType::Ape => lofty::ape::ApeTag::from(tag.clone())
+        TagType::Ape => lofty::ape::ApeTag::from(tag)
             .get(DISCOGS_ALBUM_ID)
             .and_then(|i| match i.value() {
                 ItemValue::Text(v) => Some(v.clone()),
@@ -409,8 +423,8 @@ fn edit_at(
 
 /// Save `tag` to `target`, with the Discogs release id set or removed when
 /// `discogs` is given. A Vorbis comment block always goes through lofty's
-/// own type, which keeps the comments lofty has no generic key for (beets'
-/// `DISCOGS_ALBUMID`, `ACOUSTID_ID`, anyone's custom fields); saved as a
+/// own type, which keeps the comments lofty has no generic key for
+/// (`DISCOGS_ALBUMID`, `ACOUSTID_ID`, anyone's custom fields); saved as a
 /// generic tag, it would write only the keys it knows. The other formats'
 /// generic save keeps those items itself.
 fn save(
@@ -444,7 +458,10 @@ fn save(
         }
         (TagType::Id3v2, Some(id)) => {
             let mut t = Id3v2Tag::from(tag);
-            t.remove_user_text(DISCOGS_ALBUM_ID);
+            t.retain(|f| {
+                !matches!(f, lofty::id3::v2::Frame::UserText(f)
+                    if f.description.eq_ignore_ascii_case(DISCOGS_ALBUM_ID))
+            });
             if let Some(id) = id {
                 t.insert_user_text(DISCOGS_ALBUM_ID.into(), id.into());
             }
