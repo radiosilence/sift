@@ -1,0 +1,1 @@
+- **Untagged folders are identified by their audio.** With the `chroma` plugin and an AcoustID application key, a folder no release matches strongly is fingerprinted and looked up on AcoustID, and the releases its recordings appear on are scored with what the audio says.
