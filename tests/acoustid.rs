@@ -117,7 +117,11 @@ fn wav(path: &Path, secs: u32) {
     b.extend_from_slice(&data.to_le_bytes());
     for n in 0..frames {
         let t = f64::from(n) / f64::from(rate);
-        let note = if (n / rate) % 2 == 0 { 440.0 } else { 660.0 };
+        let note = if (n / rate).is_multiple_of(2) {
+            440.0
+        } else {
+            660.0
+        };
         let v = (0.3 * (2.0 * std::f64::consts::PI * note * t).sin() * f64::from(i16::MAX)) as i16;
         b.extend_from_slice(&v.to_le_bytes());
         b.extend_from_slice(&v.to_le_bytes());
