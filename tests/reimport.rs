@@ -403,3 +403,53 @@ fn walk(dir: &Path) -> Vec<std::path::PathBuf> {
     }
     out
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_second_reimport_rewrites_nothing() {
+    use std::os::unix::fs::MetadataExt;
+    let root = tempfile::tempdir().unwrap();
+    let lib = root.path().join("lib");
+    let dir = lib.join("R.E.M_").join("Monster");
+    for (n, title) in [
+        (1, "What's the Frequency, Kenneth_"),
+        (2, "Crush With Eyeliner"),
+    ] {
+        let f = dir.join(format!("0{n} {title}.wav"));
+        wav(&f);
+        tag(&f, "Monster", title, n);
+    }
+    let importer = importer(&lib).await;
+    importer.reimport(&dir, Some("rel")).await.unwrap();
+    let inodes = |dir: &Path| {
+        let mut v: Vec<(String, u64)> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| {
+                let e = e.unwrap();
+                (
+                    e.file_name().to_string_lossy().into_owned(),
+                    e.metadata().unwrap().ino(),
+                )
+            })
+            .collect();
+        v.sort();
+        v
+    };
+    let before = inodes(&dir);
+    let outcome = importer.reimport(&dir, Some("rel")).await.unwrap();
+    assert!(matches!(outcome, Outcome::Imported { .. }), "{outcome:?}");
+    assert_eq!(
+        inodes(&dir),
+        before,
+        "every write goes through a renamed copy, so a rewrite changes the inode"
+    );
+
+    // An edit since does reach the file.
+    let edited = dir.join("02 Crush With Eyeliner.wav");
+    meta::set(&edited, &[("album".into(), Some("Monstre".into()))]).unwrap();
+    importer.reimport(&dir, Some("rel")).await.unwrap();
+    assert_eq!(
+        meta::read(&edited).unwrap().album.as_deref(),
+        Some("Monster")
+    );
+}

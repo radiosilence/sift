@@ -33,7 +33,7 @@ $ sift move --pretend                         # what re-filing would change
 $ sift duplicates --bin ~/music-bin           # spare copies out of the library
 $ sift modify -a album:untru album=Untrue      # fix tags, re-file what moves
 $ sift import -L artist:burial                # match library albums again
-$ sift mbsync year:2020..                     # refresh from MusicBrainz
+$ sift mbsync year:2020..                     # refresh from MusicBrainz or Discogs
 $ sift missing ; sift bad ; sift stats         # gaps, damaged audio, totals
 ```
 
@@ -129,7 +129,9 @@ when MusicBrainz has no match under `match.strong_rec_thresh` and the
 `discogs.user_token` or the `DISCOGS_TOKEN` environment variable, generated
 at <https://www.discogs.com/settings/developers>; `discogs.index_tracks`
 (default off) prefixes a medley's sub-tracks with the enclosing index
-track's title, as beets' option of the same name does.
+track's title, as beets' option of the same name does. An album matched on
+Discogs carries the release's number in `DISCOGS_ALBUMID`, so
+`mbsync` and a re-import go back to that release rather than search again.
 
 With the `chroma` plugin listed and an AcoustID application key in
 `acoustid.client` or `ACOUSTID_CLIENT` (registered at

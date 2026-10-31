@@ -1038,6 +1038,17 @@ impl Importer {
             if let Ok(r) = self.mb.release(&id).await {
                 releases.push(r);
             }
+        } else if self.discogs.is_some()
+            && let Some(id) =
+                matching::consensus(tracks.iter().map(|t| t.discogs_album_id.as_deref()))
+        {
+            let _ = writeln!(log, "files are tagged with discogs release {id}");
+            match self.release(&format!("discogs:{id}")).await {
+                Ok(r) => releases.push(r),
+                Err(e) => {
+                    let _ = writeln!(log, "discogs release {id}: {e}");
+                }
+            }
         }
         let (artist, album) = self.query_terms(dir, tracks);
         // The plain title first: an edition suffix is in the tags far more
@@ -1053,21 +1064,10 @@ impl Importer {
                 break;
             }
         }
-        // A credit spelled differently from MusicBrainz's ("x" for "×")
-        // fails the artist phrase; the plain title by any of the artist's
-        // words still finds it, and distance decides. Only the top-scoring
-        // hits are kept: one sharing a single word of the credit scores
-        // about half, and the sort below would otherwise put it first.
-        let mut floor = 50;
-        if !hits.iter().any(|h| h.score >= floor) {
-            let _ = writeln!(log, "searching for {base:?} by any of {artist:?}");
-            hits = self.mb.search_releases_loosely(&artist, &base, 10).await?;
-            floor = 90;
-        }
         // An album usually has many pressings scoring alike; the ones with
         // as many tracks as the folder are looked up first, since the
         // lookups run out before the list does.
-        hits.retain(|h| h.score >= floor);
+        hits.retain(|h| h.score >= 50);
         hits.sort_by_key(|h| h.track_count.abs_diff(tracks.len()));
         let mut looked_up = 0;
         for hit in hits {
@@ -1366,14 +1366,20 @@ impl Importer {
         );
         let cover: Option<std::sync::Arc<[u8]>> = cover_art.map(|c| c.bytes.into());
         // Owned for the blocking task; the log is written from `plan`.
-        let work: Vec<(PathBuf, PathBuf, bool, Tags)> = plan
+        // Whether each file, as read for the match, already had these tags.
+        // That read may be stale or carry edits not yet written, so it can
+        // only rule a check out: a file it says differs is written without
+        // reading it again.
+        let work: Vec<(PathBuf, PathBuf, bool, Tags, bool)> = plan
             .iter()
             .map(|d| {
+                let local = &tracks[d.local];
                 (
-                    tracks[d.local].path.clone(),
+                    local.path.clone(),
                     d.to.clone(),
                     d.stays,
                     d.tags.clone(),
+                    meta::changes(local, &d.tags).is_empty(),
                 )
             })
             .collect();
@@ -1399,24 +1405,40 @@ impl Importer {
                         let to = set_aside(&dir, &root, bin, &mut journal)?;
                         replaced.push((dir, to));
                     }
-                    if let Some((_, to, _, _)) = work.iter().find(|(_, to, _, _)| to.exists()) {
+                    if let Some((_, to, _, _, _)) = work.iter().find(|(_, to, _, _, _)| to.exists())
+                    {
                         return Err(ImportError::Exists(
                             to.parent().map(Path::to_path_buf).unwrap_or_default(),
                         ));
                     }
                 }
-                for (from, to, stays, tags) in &work {
+                // A file that already reads as it would be written is left
+                // alone: a re-import of a filed album costs reads only.
+                let write = |path: &Path, tags: &Tags, same: bool| -> Result<(), ImportError> {
+                    if !(same && meta::unchanged(path, tags, cover.as_deref())) {
+                        meta::write(path, tags, cover.as_deref(), preserve_mtime)?;
+                    }
+                    Ok(())
+                };
+                for (from, to, stays, tags, same) in &work {
                     // Moving: the source is ours to change, so tag it and
                     // move it. Copying: the source must come out untouched,
                     // so copy first and tag the copy.
                     if moving {
-                        meta::write(from, tags, cover.as_deref(), preserve_mtime)?;
+                        write(from, tags, *same)?;
                         if !stays {
                             journal.transfer(from, to, true)?;
                         }
                     } else {
-                        journal.transfer(from, to, false)?;
-                        meta::write(to, tags, cover.as_deref(), preserve_mtime)?;
+                        // Tagged before it takes its name: one copy, and it
+                        // never appears under its name before it is tagged.
+                        journal.copy_tagged(from, to, |tmp| -> Result<bool, ImportError> {
+                            if *same && meta::unchanged_at(tmp, to, tags, cover.as_deref()) {
+                                return Ok(true);
+                            }
+                            meta::write_at(tmp, to, tags, cover.as_deref())?;
+                            Ok(preserve_mtime)
+                        })?;
                     }
                 }
                 // A re-imported album that changed directory takes its
@@ -1541,6 +1563,7 @@ impl Importer {
             mb_release_group_id: mb_ids
                 .then(|| release.release_group.as_ref().map(|g| g.id.clone()))
                 .flatten(),
+            discogs_album_id: release.id.strip_prefix("discogs:").map(str::to_string),
         }
     }
 

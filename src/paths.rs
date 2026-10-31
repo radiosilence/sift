@@ -367,16 +367,25 @@ fn remove_made(made: &[std::path::PathBuf]) {
 
 /// [`transfer`], on the calling thread.
 pub(crate) fn transfer_blocking(from: &Path, to: &Path, move_file: bool) -> std::io::Result<()> {
-    transfer_making(from, to, move_file).map(drop)
+    transfer_making(from, to, move_file, untouched).map(drop)
+}
+
+/// A copy's hook that leaves it as copied.
+fn untouched(_: &Path) -> std::io::Result<bool> {
+    Ok(true)
 }
 
 /// [`transfer_blocking`], returning the folders it made for `to`,
-/// deepest first.
-fn transfer_making(
+/// deepest first. A copy is given to `tag` before it is renamed into
+/// place, so it never appears under its name unfinished; `tag` says
+/// whether the copy should keep the source's modification time. A move
+/// that renames the file never copies it, and does not call `tag`.
+fn transfer_making<E: From<std::io::Error>>(
     from: &Path,
     to: &Path,
     move_file: bool,
-) -> std::io::Result<Vec<std::path::PathBuf>> {
+    tag: impl FnOnce(&Path) -> Result<bool, E>,
+) -> Result<Vec<std::path::PathBuf>, E> {
     let made: Vec<std::path::PathBuf> = to
         .ancestors()
         .skip(1)
@@ -403,7 +412,7 @@ fn transfer_making(
                 return Ok(std::mem::take(&mut claim.made));
             }
             Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => {}
-            Err(e) => return Err(e),
+            Err(e) => return Err(e.into()),
         }
     }
     let tmp = claim.tmp.insert(scratch_beside(to));
@@ -412,17 +421,7 @@ fn transfer_making(
     let file = std::fs::File::open(&*tmp)?;
     let expected = from_meta.len();
     if copied != expected || file.metadata()?.len() != expected {
-        return Err(std::io::Error::other(format!(
-            "short copy of {}",
-            from.display()
-        )));
-    }
-    // A copy gets a fresh mtime; a move of the same file should never look
-    // newer than the original just because it crossed filesystems. Set
-    // through the read handle: the copy has the source's mode, which may
-    // not allow writing, and setting times needs only ownership.
-    if let Ok(modified) = from_meta.modified() {
-        file.set_modified(modified)?;
+        return Err(std::io::Error::other(format!("short copy of {}", from.display())).into());
     }
     // A copy filed into the library is the library's to tag: a source
     // made read-only (a share, a finished download) is given back its
@@ -433,6 +432,14 @@ fn transfer_making(
         let mut perms = from_meta.permissions();
         perms.set_mode(perms.mode() | 0o200);
         file.set_permissions(perms)?;
+    }
+    let keep_mtime = tag(tmp.as_path())?;
+    // A copy gets a fresh mtime; a move of the same file should never look
+    // newer than the original just because it crossed filesystems. Set
+    // through the read handle: the copy has the source's mode, which may
+    // not allow writing, and setting times needs only ownership.
+    if keep_mtime && let Ok(modified) = from_meta.modified() {
+        file.set_modified(modified)?;
     }
     file.sync_all()?;
     std::fs::rename(&*tmp, to)?;
@@ -457,7 +464,7 @@ fn transfer_making(
             }
             // The folders made for it go with it.
             claim.kept = false;
-            return Err(e);
+            return Err(e.into());
         }
     }
     Ok(std::mem::take(&mut claim.made))
@@ -490,11 +497,29 @@ impl Journal {
         to: &Path,
         move_file: bool,
     ) -> std::io::Result<()> {
-        let made = transfer_making(from, to, move_file)?;
+        let made = transfer_making(from, to, move_file, untouched)?;
         self.done.push(Done {
             from: from.to_path_buf(),
             to: to.to_path_buf(),
             moved: move_file,
+            made,
+        });
+        Ok(())
+    }
+
+    /// Copy `from` to `to`, with `tag` changing the copy before it takes
+    /// its name, as [`transfer_making`].
+    pub(crate) fn copy_tagged<E: From<std::io::Error>>(
+        &mut self,
+        from: &Path,
+        to: &Path,
+        tag: impl FnOnce(&Path) -> Result<bool, E>,
+    ) -> Result<(), E> {
+        let made = transfer_making(from, to, false, tag)?;
+        self.done.push(Done {
+            from: from.to_path_buf(),
+            to: to.to_path_buf(),
+            moved: false,
             made,
         });
         Ok(())
@@ -816,5 +841,40 @@ mod tests {
                 .unwrap()
                 .as_secs()
         );
+    }
+
+    #[test]
+    fn a_tagged_copy_is_changed_before_it_takes_its_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let from = dir.path().join("a.flac");
+        std::fs::write(&from, b"x").unwrap();
+        let to = dir.path().join("lib/a.flac");
+        let mut journal = Journal::default();
+        journal
+            .copy_tagged(&from, &to, |tmp| -> std::io::Result<bool> {
+                assert!(is_scratch(tmp));
+                assert_eq!(std::fs::metadata(&to).unwrap().len(), 0, "only claimed");
+                std::fs::write(tmp, b"tagged")?;
+                Ok(false)
+            })
+            .unwrap();
+        journal.commit();
+        assert_eq!(std::fs::read(&to).unwrap(), b"tagged");
+        assert_eq!(std::fs::read(&from).unwrap(), b"x");
+    }
+
+    #[test]
+    fn a_failed_tag_leaves_no_copy_claim_or_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let from = dir.path().join("a.flac");
+        std::fs::write(&from, b"x").unwrap();
+        let to = dir.path().join("lib/a.flac");
+        let mut journal = Journal::default();
+        let err = journal.copy_tagged(&from, &to, |_| -> std::io::Result<bool> {
+            Err(std::io::Error::other("no"))
+        });
+        assert!(err.is_err());
+        assert!(!dir.path().join("lib").exists());
+        assert_eq!(std::fs::read(&from).unwrap(), b"x");
     }
 }

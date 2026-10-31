@@ -80,8 +80,9 @@ enum Command {
         #[arg(short = 'l', long)]
         log: Option<PathBuf>,
     },
-    /// Refresh albums from the MusicBrainz release they were tagged with,
-    /// without matching again: for corrections made upstream since.
+    /// Refresh albums from the MusicBrainz or Discogs release they were
+    /// tagged with, without matching again: for corrections made upstream
+    /// since.
     Mbsync { query: Vec<String> },
     /// Show the candidates for a directory without changing anything.
     Match { path: PathBuf },
@@ -661,8 +662,22 @@ async fn run() -> anyhow::Result<ExitCode> {
                 .albums(&Query::parse(&query)?)?
                 .into_iter()
                 .filter_map(|a| {
-                    let id = a.items.first()?.track.mb_album_id.clone()?;
-                    Some((a.dir, Some(id)))
+                    let first = a.items.first()?;
+                    if let Some(id) = first.track.mb_album_id.clone() {
+                        return Some((a.dir, Some(id)));
+                    }
+                    // The index holds no Discogs id; the file does.
+                    let id = sift::meta::read(&first.track.path)
+                        .ok()?
+                        .discogs_album_id?;
+                    if cfg.discogs.is_none() {
+                        say!(
+                            "skipped {}: tagged with Discogs release {id}, and discogs is not configured",
+                            a.dir.display()
+                        );
+                        return None;
+                    }
+                    Some((a.dir, Some(format!("discogs:{id}"))))
                 })
                 .collect();
             imports(Importer::new(cfg), jobs, true, false, None).await
