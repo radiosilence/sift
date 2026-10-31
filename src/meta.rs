@@ -648,7 +648,15 @@ fn write_tags(tag: &mut Tag, tags: &Tags, cover: Option<&[u8]>) {
         tag.insert_text(ItemKey::FlagCompilation, "1".into());
     }
     if let Some(data) = cover {
-        tag.remove_picture_type(PictureType::CoverFront);
+        // MP4 has no picture types: lofty reads every `covr` as `Other`, so
+        // only removing them all stops a rewrite adding another copy.
+        if tag.tag_type() == TagType::Mp4Ilst {
+            while !tag.pictures().is_empty() {
+                tag.remove_picture(0);
+            }
+        } else {
+            tag.remove_picture_type(PictureType::CoverFront);
+        }
         tag.push_picture(front_cover(data));
     }
 }
@@ -885,7 +893,8 @@ pub struct TagChange {
 /// it does now, judged from a fresh read of its primary tag: a file whose
 /// tags live in another tag type (an MP3 with only APEv2) is not, since the
 /// write would create the primary one. With a cover, the file must carry
-/// exactly that front cover. A file that cannot be read is not.
+/// exactly that front cover (in MP4, which has no picture types, exactly
+/// that picture). A file that cannot be read is not.
 pub fn unchanged(path: &Path, tags: &Tags, cover: Option<&[u8]>) -> bool {
     raise_allocation_limit();
     let read = contained(path, || {
@@ -908,10 +917,12 @@ pub fn unchanged(path: &Path, tags: &Tags, cover: Option<&[u8]>) -> bool {
     let Some(cover) = cover else {
         return true;
     };
+    // MP4 has no picture types; there, every picture is the cover.
+    let mp4 = tag.tag_type() == TagType::Mp4Ilst;
     let mut fronts = tag
         .pictures()
         .iter()
-        .filter(|p| p.pic_type() == PictureType::CoverFront);
+        .filter(|p| mp4 || p.pic_type() == PictureType::CoverFront);
     fronts.next().is_some_and(|p| p.data() == cover) && fronts.next().is_none()
 }
 
