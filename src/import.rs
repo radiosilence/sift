@@ -326,14 +326,7 @@ impl Importer {
         if let Some(dir) = &cfg.cache_dir {
             mb = mb.with_cache(dir.join("musicbrainz"));
         }
-        let discogs = cfg.discogs.as_ref().map(|d| {
-            let mut discogs = Discogs::new(&d.token, &cfg.musicbrainz_contact);
-            if let Some(dir) = &cfg.cache_dir {
-                discogs = discogs.with_cache(dir.clone());
-            }
-            discogs
-        });
-        Self::with_clients(cfg, mb, discogs)
+        Self::with_musicbrainz(cfg, mb)
     }
 
     pub fn with_musicbrainz(cfg: Config, mb: MusicBrainz) -> Self {
@@ -664,16 +657,18 @@ impl Importer {
                 Err(e) => out.problems.push(format!("genres: {e}")),
             }
         }
-        let paths: Vec<PathBuf> = tracks.iter().map(|t| t.path.clone()).collect();
+        // Only a track with an artist and a title can be looked up.
+        let wanted: Vec<(&Track, &String, &String)> = tracks
+            .iter()
+            .filter_map(|t| Some((t, t.artist.as_ref()?, t.title.as_ref()?)))
+            .collect();
+        let paths: Vec<PathBuf> = wanted.iter().map(|(t, _, _)| t.path.clone()).collect();
         let has: Vec<bool> = tokio::task::spawn_blocking(move || {
             paths.iter().map(|p| meta::has_lyrics(p)).collect()
         })
         .await
         .expect("tag reader panicked");
-        for (t, has) in tracks.iter().zip(has) {
-            let (Some(artist), Some(title)) = (&t.artist, &t.title) else {
-                continue;
-            };
+        for ((t, artist, title), has) in wanted.into_iter().zip(has) {
             if has {
                 continue;
             }

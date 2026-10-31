@@ -74,9 +74,10 @@ pub fn prepare(bytes: &[u8], rules: &ArtRules) -> Option<Prepared> {
     })
 }
 
-/// The most a cover may take decoded: about a 5600×5600 RGBA image, well
-/// past any real cover. Resizing it takes roughly as much again.
-const MAX_DECODE_BYTES: u64 = 128 * 1024 * 1024;
+/// The most a cover may take decoded: an 8000×8000 RGBA image, past any
+/// cover the Cover Art Archive holds, and half of `image`'s own default.
+/// Resizing it takes roughly half as much again.
+const MAX_DECODE_BYTES: u64 = 256 * 1024 * 1024;
 
 /// The most a fetched cover may weigh: far past a real one, short of what a
 /// misbehaving server could send.
@@ -89,7 +90,9 @@ pub(crate) async fn read_capped(mut resp: reqwest::Response, max: usize) -> Opti
     if resp.content_length().is_some_and(|n| n > max as u64) {
         return None;
     }
-    let mut out = Vec::with_capacity(resp.content_length().map_or(0, |n| n as usize));
+    // Reserved from the length the server claims, but only so far: a claim
+    // is not bytes received.
+    let mut out = Vec::with_capacity(resp.content_length().map_or(0, |n| n as usize).min(8 << 20));
     while let Some(chunk) = resp.chunk().await.ok()? {
         if out.len() + chunk.len() > max {
             return None;
