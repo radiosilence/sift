@@ -581,6 +581,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_failed_transfer_leaves_no_claim_or_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let to = dir.path().join("lib/b.flac");
+        assert!(
+            transfer(&dir.path().join("gone.flac"), &to, true)
+                .await
+                .is_err()
+        );
+        assert!(
+            transfer(&dir.path().join("gone.flac"), &to, false)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            std::fs::read_dir(dir.path().join("lib")).unwrap().count(),
+            0
+        );
+    }
+
+    #[test]
+    fn a_journal_dropped_unfinished_puts_every_file_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (dir.path().join("a.flac"), dir.path().join("b.flac"));
+        std::fs::write(&a, b"a").unwrap();
+        std::fs::write(&b, b"b").unwrap();
+        let mut journal = Journal::default();
+        journal
+            .transfer(&a, &dir.path().join("lib/a.flac"), true)
+            .unwrap();
+        journal
+            .transfer(&b, &dir.path().join("lib/b.flac"), false)
+            .unwrap();
+        drop(journal);
+        assert_eq!(std::fs::read(&a).unwrap(), b"a");
+        assert_eq!(std::fs::read(&b).unwrap(), b"b");
+        assert_eq!(
+            std::fs::read_dir(dir.path().join("lib")).unwrap().count(),
+            0
+        );
+    }
+
+    #[test]
+    fn a_committed_journal_keeps_its_transfers() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.flac");
+        std::fs::write(&a, b"a").unwrap();
+        let mut journal = Journal::default();
+        journal
+            .transfer(&a, &dir.path().join("lib/a.flac"), true)
+            .unwrap();
+        journal.commit();
+        assert!(!a.exists());
+        assert!(dir.path().join("lib/a.flac").exists());
+    }
+
+    #[tokio::test]
     async fn transfer_moves_and_creates_directories() {
         let dir = tempfile::tempdir().unwrap();
         let from = dir.path().join("a.flac");

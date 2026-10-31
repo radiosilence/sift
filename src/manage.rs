@@ -680,6 +680,31 @@ replace:
     }
 
     #[tokio::test]
+    async fn a_move_that_fails_part_way_puts_the_album_back() {
+        let root = tempfile::tempdir().unwrap();
+        let cfg = config(root.path());
+        let lib_root = root.path().join("lib");
+        let old = lib_root.join("R.E.M_").join("Monster");
+        file(&old.join("a.wav"), "R.E.M.", "Monster", "Kenneth", 1);
+        file(&old.join("b.wav"), "R.E.M.", "Monster", "Crush", 2);
+        let mut lib = Library::in_memory().unwrap();
+        lib.update(&lib_root).unwrap();
+        let album = album_of(&lib, &old);
+        let Plan::Moves(moves) = plan_move(&cfg, &album) else {
+            panic!("expected moves");
+        };
+        // Taken after planning, as by an import running alongside.
+        std::fs::create_dir_all(moves[1].to.parent().unwrap()).unwrap();
+        std::fs::write(&moves[1].to, b"someone else").unwrap();
+        assert!(execute(&mut lib, &album, &moves).await.is_err());
+        assert!(old.join("a.wav").exists() && old.join("b.wav").exists());
+        assert!(!moves[0].to.exists());
+        assert_eq!(std::fs::read(&moves[1].to).unwrap(), b"someone else");
+        let r = lib.update(&lib_root).unwrap();
+        assert_eq!((r.removed, r.changed), (0, 0), "the index never moved");
+    }
+
+    #[tokio::test]
     async fn an_album_whose_destination_is_taken_is_left_alone() {
         let root = tempfile::tempdir().unwrap();
         let cfg = config(root.path());
