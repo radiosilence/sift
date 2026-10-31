@@ -323,3 +323,48 @@ async fn a_refused_retag_plan_still_lists_each_file() {
     assert_eq!(plan.files.len(), 2);
     assert!(plan.files.iter().all(|f| !f.changes.is_empty()));
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn an_import_that_fails_part_way_takes_back_the_copies_it_made() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let lib = root.path().join("lib");
+    let src = root.path().join("in");
+    for (n, title) in [(1, "Kenneth"), (2, "Crush")] {
+        let f = src.join(format!("{n}.wav"));
+        wav(&f);
+        tag(&f, "Monster", title, n);
+    }
+    // A copy keeps the source's mode, so its tags cannot be written.
+    let locked = src.join("2.wav");
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o444)).unwrap();
+    if std::fs::OpenOptions::new()
+        .write(true)
+        .open(&locked)
+        .is_ok()
+    {
+        return; // running as root, which writes anything
+    }
+    let result = importer(&lib).await.import(&src, Some("rel")).await;
+    assert!(result.is_err(), "{result:?}");
+    assert_eq!(
+        walk(&lib),
+        Vec::<std::path::PathBuf>::new(),
+        "no copy is left"
+    );
+    assert!(src.join("1.wav").exists() && locked.exists());
+}
+
+fn walk(dir: &Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            out.extend(walk(&p));
+        } else {
+            out.push(p);
+        }
+    }
+    out
+}
