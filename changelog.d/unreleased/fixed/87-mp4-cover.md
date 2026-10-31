@@ -1,0 +1,1 @@
+- **Rewriting an MP4's cover replaces it.** Every import or `mbsync` write with a cover used to add another copy of it to `.m4a` files.
