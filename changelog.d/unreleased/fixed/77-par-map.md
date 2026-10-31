@@ -1,0 +1,1 @@
+- **ReplayGain no longer writes one track's gain into another file.** A track that crashed the decoder used to shift the remaining results onto the wrong files; it now fails the album. `sift bad` reports such a file as damaged instead of dropping it, and one long file no longer leaves the other threads idle.
