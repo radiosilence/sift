@@ -664,9 +664,9 @@ mod tests {
                 .await
                 .is_err()
         );
-        assert_eq!(
-            std::fs::read_dir(dir.path().join("lib")).unwrap().count(),
-            0
+        assert!(
+            !dir.path().join("lib").exists(),
+            "nor the folder made for it"
         );
     }
 
@@ -686,9 +686,9 @@ mod tests {
         drop(journal);
         assert_eq!(std::fs::read(&a).unwrap(), b"a");
         assert_eq!(std::fs::read(&b).unwrap(), b"b");
-        assert_eq!(
-            std::fs::read_dir(dir.path().join("lib")).unwrap().count(),
-            0
+        assert!(
+            !dir.path().join("lib").exists(),
+            "the folder it made goes too"
         );
     }
 
