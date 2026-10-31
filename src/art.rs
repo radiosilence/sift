@@ -125,6 +125,36 @@ mod tests {
         }
     }
 
+    /// One HTTP response, raw, from a local server.
+    async fn serve(response: &'static [u8]) -> reqwest::Response {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0; 1024];
+            let _ = socket.read(&mut buf).await;
+            let _ = socket.write_all(response).await;
+        });
+        reqwest::get(format!("http://{addr}/")).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_body_over_the_cap_is_refused_by_its_length_or_as_it_arrives() {
+        let declared = serve(b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\n0123456789A").await;
+        assert_eq!(read_capped(declared, 10).await, None);
+        let chunked = serve(
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n6\r\n012345\r\n5\r\n6789A\r\n0\r\n\r\n",
+        )
+        .await;
+        assert_eq!(read_capped(chunked, 10).await, None);
+        let within = serve(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\n0123456789").await;
+        assert_eq!(
+            read_capped(within, 10).await.as_deref(),
+            Some(&b"0123456789"[..])
+        );
+    }
+
     #[test]
     fn percent_ratio_accepts_within_tolerance_and_rejects_outside() {
         let r = rules(0, 0, Some(Ratio::Percent(10.0)));
