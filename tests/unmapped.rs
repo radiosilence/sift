@@ -7,7 +7,8 @@ use std::path::{Path, PathBuf};
 use lofty::config::{ParseOptions, WriteOptions};
 use lofty::file::AudioFile;
 use lofty::flac::FlacFile;
-use lofty::ogg::{OggPictureStorage, OpusFile, VorbisComments};
+use lofty::ogg::tag::VorbisComments;
+use lofty::ogg::{OggPictureStorage, OpusFile};
 use lofty::tag::TagExt;
 use sift::meta::{self, Tags};
 

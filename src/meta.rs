@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use lofty::config::{ParseOptions, WriteOptions};
 use lofty::file::{AudioFile, TaggedFileExt};
-use lofty::ogg::VorbisComments;
+use lofty::ogg::tag::VorbisComments;
 use lofty::picture::{MimeType, Picture, PictureType};
 use lofty::tag::{Accessor, ItemKey, ItemValue, Tag, TagExt, TagItem, TagType};
 
@@ -357,7 +357,7 @@ fn edit_at(
 /// type, which keeps the comments lofty has no generic key for (beets'
 /// `DISCOGS_ALBUMID`, `ACOUSTID_ID`, anyone's custom fields); saved as a
 /// generic tag, it would write only the keys it knows.
-fn save(tag: Tag, target: &Path) -> Result<(), lofty::error::LoftyError> {
+fn save(tag: Tag, target: &Path) -> Result<(), lofty::error::FileEncodingError> {
     if tag.tag_type() == TagType::VorbisComments {
         VorbisComments::from(tag).save_to_path(target, WriteOptions::default())
     } else {
