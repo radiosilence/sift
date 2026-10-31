@@ -47,12 +47,17 @@ impl AcoustIdError {
     /// nothing about the next.
     pub fn stops_all(&self) -> bool {
         match self {
-            // A timeout is one slow answer; a refused connection is all of them.
+            // A refused connection is all of them; a timeout may be one
+            // slow answer (see `is_timeout`).
             Self::Http(e) => e.is_connect(),
             Self::Unavailable(_) => true,
             // AcoustID's code for an invalid application key.
             Self::Refused { code, .. } => *code == Some(4),
         }
+    }
+
+    pub fn is_timeout(&self) -> bool {
+        matches!(self, Self::Http(e) if e.is_timeout())
     }
 }
 

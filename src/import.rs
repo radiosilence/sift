@@ -377,8 +377,8 @@ impl Importer {
 
     /// What AcoustID says each of `tracks` is, in order; empty for a file
     /// it could not fingerprint or does not know. Failures are logged, and
-    /// one that would fail every lookup (no connection, a bad key) stops
-    /// them: the import goes on without.
+    /// one that would fail every lookup (no connection, a bad key, a second
+    /// timeout in a row) stops them: the import goes on without.
     async fn listen(
         &self,
         acoustid: &crate::acoustid::AcoustId,
@@ -402,6 +402,7 @@ impl Importer {
             Vec::new()
         });
         let mut heard = vec![crate::acoustid::Identified::default(); tracks.len()];
+        let mut timeouts = 0;
         for (i, print) in prints.into_iter().enumerate() {
             let print = match print {
                 Ok(Ok(p)) => p,
@@ -411,10 +412,16 @@ impl Importer {
                 }
             };
             match acoustid.lookup(&print).await {
-                Ok(found) => heard[i] = found,
+                Ok(found) => {
+                    heard[i] = found;
+                    timeouts = 0;
+                }
                 Err(e) => {
                     let _ = writeln!(log, "acoustid, {}: {e}", tracks[i].path.display());
-                    if e.stops_all() {
+                    // One slow answer is let go; two in a row is a service
+                    // that has stopped answering, and each costs the timeout.
+                    timeouts = if e.is_timeout() { timeouts + 1 } else { 0 };
+                    if e.stops_all() || timeouts == 2 {
                         break;
                     }
                 }
