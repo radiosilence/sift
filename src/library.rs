@@ -734,16 +734,25 @@ impl Library {
                 report.failed.push((path.clone(), why));
                 continue;
             }
-            let Ok(m) = std::fs::metadata(path) else {
-                self.forget(path)?;
-                report.removed += 1;
-                continue;
+            let m = match std::fs::metadata(path) {
+                Ok(m) => m,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    self.forget(path)?;
+                    report.removed += 1;
+                    continue;
+                }
+                // Not stat'd this time, but not gone: its rows stay.
+                Err(e) => {
+                    report
+                        .failed
+                        .push((path.clone(), format!("{}: {e}", path.display())));
+                    continue;
+                }
             };
-            let known: bool = self.conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM items WHERE path = ?1)",
-                [path.to_string_lossy()],
-                |r| r.get(0),
-            )?;
+            let known: bool = self
+                .conn
+                .prepare_cached("SELECT EXISTS(SELECT 1 FROM items WHERE path = ?1)")?
+                .query_row([path.to_string_lossy()], |r| r.get(0))?;
             if known {
                 report.changed += 1;
             } else {
@@ -897,10 +906,10 @@ impl Library {
     /// re-import), whose files a scan finds as new: it keeps the date it
     /// first arrived.
     pub fn set_added(&self, dir: &Path, added: i64) -> Result<(), LibraryError> {
-        let prefix = format!("{}/", dir.to_string_lossy().trim_end_matches('/'));
+        let (from, to) = under_bounds(dir);
         self.conn.execute(
-            "UPDATE items SET added = ?2 WHERE substr(path, 1, length(?1)) = ?1",
-            params![prefix, added],
+            "UPDATE items SET added = ?3 WHERE path >= ?1 AND path < ?2",
+            params![from, to, added],
         )?;
         Ok(())
     }
@@ -977,14 +986,8 @@ impl Library {
     ) -> Result<Vec<Album>, LibraryError> {
         let mut items = Vec::new();
         for dir in dirs {
-            // Every path under `dir/` sorts from `dir/` to just before
-            // `dir0`, '0' following '/': a range the primary key answers.
-            let dir_str = dir.to_string_lossy();
-            let dir_str = dir_str.trim_end_matches('/');
-            let found = self.select(
-                "WHERE path >= ?1 AND path < ?2",
-                [format!("{dir_str}/"), format!("{dir_str}0")],
-            )?;
+            let (from, to) = under_bounds(dir);
+            let found = self.select("WHERE path >= ?1 AND path < ?2", [from, to])?;
             items.extend(
                 found
                     .into_iter()
@@ -993,6 +996,14 @@ impl Library {
         }
         Ok(group(items))
     }
+}
+
+/// The range of indexed paths under `dir`, at any depth: from `dir/` to just
+/// before `dir0`, as '0' follows '/'. A range the primary key answers.
+fn under_bounds(dir: &Path) -> (String, String) {
+    let dir = dir.to_string_lossy();
+    let dir = dir.trim_end_matches('/');
+    (format!("{dir}/"), format!("{dir}0"))
 }
 
 /// Items gathered into the directories that hold them, each in disc and

@@ -290,8 +290,14 @@ pub async fn modify(
     if pretend || changes.is_empty() {
         return Ok(report);
     }
-    for f in &files {
-        meta::set(f, changes).map_err(|e| LibraryError::Io(f.clone(), std::io::Error::other(e)))?;
+    for (i, f) in files.iter().enumerate() {
+        if let Err(e) = meta::set(f, changes) {
+            // The index follows the files already changed before stopping;
+            // if it cannot, the next scan catches up, and the write error is
+            // the one to report.
+            let _ = lib.refresh(&files[..i]);
+            return Err(LibraryError::Io(f.clone(), std::io::Error::other(e)));
+        }
     }
     lib.refresh(&files)?;
     let dirs: std::collections::HashSet<PathBuf> = files
