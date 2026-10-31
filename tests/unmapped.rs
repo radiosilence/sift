@@ -7,8 +7,8 @@ use std::path::{Path, PathBuf};
 use lofty::config::{ParseOptions, WriteOptions};
 use lofty::file::AudioFile;
 use lofty::flac::FlacFile;
+use lofty::ogg::OpusFile;
 use lofty::ogg::tag::VorbisComments;
-use lofty::ogg::{OggPictureStorage, OpusFile};
 use lofty::tag::TagExt;
 use sift::meta::{self, Tags};
 
@@ -77,6 +77,6 @@ fn unmapped_comments_survive_every_write() {
 
         meta::set_cover(&path, include_bytes!("fixtures/cover.png")).unwrap();
         assert_kept(&path);
-        assert_eq!(comments(&path).pictures().len(), 1);
+        assert_eq!(meta::pictures(&path).unwrap().len(), 1, "{name}");
     }
 }
