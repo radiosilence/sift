@@ -510,7 +510,7 @@ impl Library {
             let results = batch
                 .iter()
                 .zip(read)
-                .filter_map(|((p, stat, is_new), r)| Some((p, *stat, *is_new, r?)));
+                .filter_map(|((p, stat, is_new), r)| Some((p, *stat, *is_new, r.ok()?)));
             let tx = self.conn.transaction()?;
             {
                 let mut upsert = tx.prepare(UPSERT)?;
@@ -635,12 +635,15 @@ impl Library {
             for (i, v) in batch.iter().zip(checked) {
                 // A panic is more often the decoder's fault than the file's:
                 // reported, but not kept, so a fixed decoder checks it again.
-                let Some(v) = v else {
-                    out.push((
-                        i.track.path.clone(),
-                        Verdict::Bad("the decoder panicked on this file".into()),
-                    ));
-                    continue;
+                let v = match v {
+                    Ok(v) => v,
+                    Err(panic) => {
+                        out.push((
+                            i.track.path.clone(),
+                            Verdict::Bad(format!("the decoder panicked: {panic}")),
+                        ));
+                        continue;
+                    }
                 };
                 tx.execute(
                     "INSERT OR REPLACE INTO checks (path, size, mtime, verdict) VALUES (?1, ?2, ?3, ?4)",

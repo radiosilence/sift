@@ -94,7 +94,7 @@ pub fn album(paths: &[PathBuf], workers: usize) -> Result<(Vec<Gain>, Gain), Str
     let mut tracks = Vec::new();
     for (path, m) in paths.iter().zip(measured) {
         let (meter, peak) = m
-            .unwrap_or_else(|| Err("the decoder panicked on this file".into()))
+            .unwrap_or_else(|panic| Err(format!("the decoder panicked: {panic}")))
             .map_err(|e| format!("{}: {e}", path.display()))?;
         let loudness = meter.loudness_global().map_err(|e| e.to_string())?;
         tracks.push(Gain {
