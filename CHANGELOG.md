@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.10.1
+
+### Added
+
+- **Albums matched on Discogs keep their release id.** It is written as `DISCOGS_ALBUMID`, so `mbsync` and a re-import go back to that Discogs release instead of searching again.
+- **Untagged folders are identified by their audio.** With the `chroma` plugin and an AcoustID application key, a folder no release matches strongly is fingerprinted and looked up on AcoustID, and the releases its recordings appear on are scored with what the audio says.
+
+### Changed
+
+- **Re-importing an album rewrites only the files that change.** `mbsync` and `import -L` leave a file alone when its tags and front cover already match, so refreshing a library mostly reads.
+- **Copying an album into the library writes each track once.** The tags go into the copy before it takes its name, which halves the disk work on filesystems without cloning and keeps a library scan from catching a track untagged.
+
+### Fixed
+
+- **Tag writes can no longer damage audio when interrupted.** Each write edits a copy of the file and renames it over the original, so a crash or a full disk leaves one whole file. Symlinked and hard-linked files, and files in folders that cannot be written, are still written in place. Enriching an album writes each file once instead of up to five times.
+- **ReplayGain no longer writes one track's gain into another file.** A track that crashed the decoder used to shift the remaining results onto the wrong files; it now fails the album. `sift bad` reports such a file as damaged instead of dropping it, and one long file no longer leaves the other threads idle.
+- **A failed import or move puts the album back.** Copies made before a failure are removed, moved files return to where they were, and a copy set aside for a replacing import is restored. Transfers interrupted by a dropped request no longer leave empty placeholders or temporary files, and the command line now shows the warnings the library logs.
+- **The index and the response caches no longer grow without bound.** Check verdicts and lyrics misses follow a moved file and go with a deleted one, so `sift bad` does not decode a whole library again after `sift move`. Scanning one root no longer drops the rows of another whose name it prefixes, and an unreadable folder is reported without its rows being dropped. Cached MusicBrainz and Discogs responses past their lifetime are deleted, and stale scratch copies from interrupted writes are removed during a scan.
+- **Library-wide commands no longer redo per-track work.** Planning a move lists each folder once, not once per track; sorting, duplicate detection and the lyrics and gain checks stop repeating work on every comparison or file; and `modify` reads back only the files it changed.
+- **Imports decode, copy and wait less.** A cover is decoded only when it must be resized, under a memory limit, and fetched images are capped at 64 MiB. A slow response no longer holds up other MusicBrainz or Discogs requests, an importer reuses one lyrics client, and tag reads and writes during enrichment run off the async runtime.
+- **Releases credited differently from the tags are found.** When the usual searches find nothing, MusicBrainz is searched once more by title with any word of the artist, so a credit spelled "x" in the tags and "×" on MusicBrainz no longer leaves an album without candidates.
+- **Tag writes keep the Vorbis comments sift does not know.** Writing to a FLAC, Ogg or Opus file no longer deletes fields such as `DISCOGS_ALBUMID`, `ACOUSTID_ID` or custom fields added by other taggers.
+- **Rewriting an MP4's cover replaces it.** Every import or `mbsync` write with a cover used to add another copy of it to `.m4a` files.
+
 ## 0.10.0
 
 ### Added
