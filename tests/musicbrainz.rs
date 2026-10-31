@@ -141,7 +141,7 @@ async fn genres_come_from_the_release_group_when_the_release_has_none() {
 }
 
 #[tokio::test]
-async fn a_loose_search_needs_the_title_and_any_word_of_the_artist() {
+async fn a_loose_search_needs_the_title_and_any_telling_word_of_the_artist() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}/ws/2", listener.local_addr().unwrap());
     let server = tokio::spawn(async move {
@@ -160,7 +160,7 @@ async fn a_loose_search_needs_the_title_and_any_word_of_the_artist() {
         String::from_utf8(req).unwrap()
     });
     let mb = MusicBrainz::with_base(&base, "test");
-    mb.search_releases_loosely("Duchamp x François & OR", "Revenant", 5)
+    mb.search_releases_loosely("The Duchamp x François & the OR Mountains", "Revenant", 5)
         .await
         .unwrap();
     let req = server.await.unwrap();
@@ -176,7 +176,7 @@ async fn a_loose_search_needs_the_title_and_any_word_of_the_artist() {
     let query: String = percent_decode(&query);
     assert_eq!(
         query,
-        "release:\"Revenant\" AND artist:(duchamp x françois or)"
+        "release:\"Revenant\" AND artist:(duchamp francois or mountains)"
     );
 }
 
@@ -194,4 +194,19 @@ fn percent_decode(s: &str) -> String {
         }
     }
     String::from_utf8(out).unwrap()
+}
+
+#[tokio::test]
+async fn a_loose_search_with_no_telling_word_asks_nothing() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}/ws/2", listener.local_addr().unwrap());
+    drop(listener);
+    let mb = MusicBrainz::with_base(&base, "test");
+    let found = tokio::time::timeout(
+        Duration::from_secs(1),
+        mb.search_releases_loosely("The & X", "Album", 5),
+    )
+    .await
+    .expect("no request is made");
+    assert!(found.unwrap().is_empty());
 }

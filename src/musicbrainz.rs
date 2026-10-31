@@ -165,17 +165,22 @@ impl MusicBrainz {
         album: &str,
         limit: usize,
     ) -> Result<Vec<ReleaseHit>, MbError> {
-        // Lower-cased, since an "AND" or "OR" in a credit would otherwise
-        // be read as an operator.
-        let words: Vec<String> = various(artist)
-            .split(|c: char| !c.is_alphanumeric())
-            .filter(|w| !w.is_empty())
-            .map(str::to_lowercase)
+        // Normalised, so no operator ("AND" is lower-cased) or other Lucene
+        // syntax reaches the query; words most credits share would let any
+        // artist in, and a credit of nothing else searches nothing.
+        let normalised = crate::matching::normalise(various(artist));
+        let words: Vec<&str> = normalised
+            .split(' ')
+            .filter(|w| w.chars().count() > 1 && !matches!(*w, "and" | "of" | "the"))
             .collect();
-        let mut query = format!("release:\"{}\"", lucene(album));
-        if !words.is_empty() {
-            query.push_str(&format!(" AND artist:({})", words.join(" ")));
+        if words.is_empty() {
+            return Ok(Vec::new());
         }
+        let query = format!(
+            "release:\"{}\" AND artist:({})",
+            lucene(album),
+            words.join(" ")
+        );
         self.search(&query, limit).await
     }
 
