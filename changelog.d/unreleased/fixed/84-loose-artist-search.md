@@ -1,0 +1,1 @@
+- **Releases credited differently from the tags are found.** When the usual searches find nothing, MusicBrainz is searched once more by title with any word of the artist, so a credit spelled "x" in the tags and "×" on MusicBrainz no longer leaves an album without candidates.
