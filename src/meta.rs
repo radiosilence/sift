@@ -354,8 +354,8 @@ fn edit_at(
 }
 
 /// Save `tag` to `target`. A Vorbis comment block goes through lofty's own
-/// type, which keeps the comments lofty has no generic key for (beets'
-/// `DISCOGS_ALBUMID`, `ACOUSTID_ID`, anyone's custom fields); saved as a
+/// type, which keeps the comments lofty has no generic key for
+/// (`DISCOGS_ALBUMID`, `ACOUSTID_ID`, anyone's custom fields); saved as a
 /// generic tag, it would write only the keys it knows.
 fn save(tag: Tag, target: &Path) -> Result<(), lofty::error::FileEncodingError> {
     if tag.tag_type() == TagType::VorbisComments {
