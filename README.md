@@ -130,7 +130,7 @@ when MusicBrainz has no match under `match.strong_rec_thresh` and the
 at <https://www.discogs.com/settings/developers>; `discogs.index_tracks`
 (default off) prefixes a medley's sub-tracks with the enclosing index
 track's title, as beets' option of the same name does. An album matched on
-Discogs carries the release's number in `DISCOGS_ALBUMID`, beets' field, so
+Discogs carries the release's number in `DISCOGS_ALBUMID`, so
 `mbsync` and a re-import go back to that release rather than search again.
 
 Path templates are fb2k-style — the template language koan uses, whose engine

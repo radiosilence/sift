@@ -140,3 +140,19 @@ fn the_discogs_id_is_written_read_and_cleared_without_reordering_credits() {
         }
     }
 }
+
+#[test]
+fn rewriting_an_mp4_cover_replaces_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("silence.m4a");
+    std::fs::copy(Path::new(FIXTURES).join("silence.m4a"), &path).unwrap();
+    let tags = Tags {
+        title: "T".into(),
+        ..Default::default()
+    };
+    let cover = include_bytes!("fixtures/cover.png");
+    meta::write(&path, &tags, Some(cover), false).unwrap();
+    meta::write(&path, &tags, Some(cover), false).unwrap();
+    assert_eq!(meta::pictures(&path).unwrap().len(), 1);
+    assert!(meta::unchanged(&path, &tags, Some(cover)));
+}

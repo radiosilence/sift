@@ -1260,14 +1260,20 @@ impl Importer {
         );
         let cover: Option<std::sync::Arc<[u8]>> = cover_art.map(|c| c.bytes.into());
         // Owned for the blocking task; the log is written from `plan`.
-        let work: Vec<(PathBuf, PathBuf, bool, Tags)> = plan
+        // Whether each file, as read for the match, already had these tags.
+        // That read may be stale or carry edits not yet written, so it can
+        // only rule a check out: a file it says differs is written without
+        // reading it again.
+        let work: Vec<(PathBuf, PathBuf, bool, Tags, bool)> = plan
             .iter()
             .map(|d| {
+                let local = &tracks[d.local];
                 (
-                    tracks[d.local].path.clone(),
+                    local.path.clone(),
                     d.to.clone(),
                     d.stays,
                     d.tags.clone(),
+                    meta::changes(local, &d.tags).is_empty(),
                 )
             })
             .collect();
@@ -1293,7 +1299,8 @@ impl Importer {
                         let to = set_aside(&dir, &root, bin, &mut journal)?;
                         replaced.push((dir, to));
                     }
-                    if let Some((_, to, _, _)) = work.iter().find(|(_, to, _, _)| to.exists()) {
+                    if let Some((_, to, _, _, _)) = work.iter().find(|(_, to, _, _, _)| to.exists())
+                    {
                         return Err(ImportError::Exists(
                             to.parent().map(Path::to_path_buf).unwrap_or_default(),
                         ));
@@ -1301,26 +1308,26 @@ impl Importer {
                 }
                 // A file that already reads as it would be written is left
                 // alone: a re-import of a filed album costs reads only.
-                let write = |path: &Path, tags: &Tags| -> Result<(), ImportError> {
-                    if !meta::unchanged(path, tags, cover.as_deref()) {
+                let write = |path: &Path, tags: &Tags, same: bool| -> Result<(), ImportError> {
+                    if !(same && meta::unchanged(path, tags, cover.as_deref())) {
                         meta::write(path, tags, cover.as_deref(), preserve_mtime)?;
                     }
                     Ok(())
                 };
-                for (from, to, stays, tags) in &work {
+                for (from, to, stays, tags, same) in &work {
                     // Moving: the source is ours to change, so tag it and
                     // move it. Copying: the source must come out untouched,
                     // so copy first and tag the copy.
                     if moving {
-                        write(from, tags)?;
+                        write(from, tags, *same)?;
                         if !stays {
                             journal.transfer(from, to, true)?;
                         }
                     } else {
-                        // Tagged before it takes its name: one copy, and
-                        // never seen in the library untagged.
+                        // Tagged before it takes its name: one copy, and it
+                        // never appears under its name before it is tagged.
                         journal.copy_tagged(from, to, |tmp| -> Result<bool, ImportError> {
-                            if meta::unchanged_at(tmp, to, tags, cover.as_deref()) {
+                            if *same && meta::unchanged_at(tmp, to, tags, cover.as_deref()) {
                                 return Ok(true);
                             }
                             meta::write_at(tmp, to, tags, cover.as_deref())?;
