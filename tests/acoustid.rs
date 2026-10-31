@@ -95,6 +95,7 @@ async fn a_refused_lookup_says_why() {
         .await
         .unwrap_err();
     assert!(err.to_string().contains("invalid API key"), "{err}");
+    assert!(err.stops_all(), "a bad key fails every lookup");
 }
 
 /// `secs` of a chord at 44.1 kHz, 16-bit stereo.

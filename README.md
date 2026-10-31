@@ -140,8 +140,8 @@ Each file's first two minutes are fingerprinted, AcoustID names the
 MusicBrainz recordings, and the releases most of the files appear on become
 candidates. A file heard as a release's track costs nothing for its title,
 which is what lets an untagged folder match at all. Lookups are paced at
-three a second and kept in the cache; a failed one leaves the import to the
-tags.
+three a second, so a large box set takes a while, and are kept in the
+cache; a failed one leaves that file to its tags.
 
 Path templates are fb2k-style — the template language koan uses, whose engine
 this crate carries. A beets template (`$albumartist/%if{$year,($year) }$album`)

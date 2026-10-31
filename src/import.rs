@@ -376,8 +376,9 @@ impl Importer {
     }
 
     /// What AcoustID says each of `tracks` is, in order; empty for a file
-    /// it could not fingerprint or does not know. Lookups stop at the
-    /// first failure, which is logged: the import goes on without them.
+    /// it could not fingerprint or does not know. Failures are logged, and
+    /// one that would fail every lookup (no connection, a bad key) stops
+    /// them: the import goes on without.
     async fn listen(
         &self,
         acoustid: &crate::acoustid::AcoustId,
@@ -389,6 +390,7 @@ impl Importer {
             .map(|t| (t.path.clone(), t.duration))
             .collect();
         let workers = std::thread::available_parallelism().map_or(2, |n| n.get());
+        let _ = writeln!(log, "fingerprinting {} files for AcoustID", tracks.len());
         let prints = tokio::task::spawn_blocking(move || {
             crate::par::map(&files, workers, |(path, duration)| {
                 crate::acoustid::fingerprint(path, *duration)
@@ -397,7 +399,6 @@ impl Importer {
         .await
         .unwrap_or_default();
         let mut heard = vec![crate::acoustid::Identified::default(); tracks.len()];
-        let _ = writeln!(log, "fingerprinting {} files for AcoustID", tracks.len());
         for (i, print) in prints.into_iter().enumerate() {
             let print = match print {
                 Ok(Ok(p)) => p,
@@ -409,8 +410,10 @@ impl Importer {
             match acoustid.lookup(&print).await {
                 Ok(found) => heard[i] = found,
                 Err(e) => {
-                    let _ = writeln!(log, "acoustid: {e}");
-                    break;
+                    let _ = writeln!(log, "acoustid, {}: {e}", tracks[i].path.display());
+                    if e.stops_all() {
+                        break;
+                    }
                 }
             }
         }

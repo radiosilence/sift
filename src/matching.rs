@@ -310,7 +310,14 @@ pub fn score_with(
         None => None,
     };
 
-    let pairs = pair_by_number(local, release).unwrap_or_else(|| {
+    // The audio outranks the numbers: a misnumbered file heard as its track
+    // would otherwise be paired with another and charged for it.
+    let numbered = if heard.iter().any(|h| !h.is_empty()) {
+        None
+    } else {
+        pair_by_number(local, release)
+    };
+    let pairs = numbered.unwrap_or_else(|| {
         pair_by_cost(local.len(), remote.len(), |l, r| {
             let (t, len) = cost(l, r);
             W_TITLE * t + W_LENGTH * len + fingerprint(l, r).map_or(0.0, |f| W_FINGERPRINT * f)
@@ -516,6 +523,21 @@ mod tests {
         assert!(right.distance <= plain);
         // The files carry an album and an artist, so those still count.
         assert!(right.parts.album == score(&local, &release()).parts.album);
+    }
+
+    #[test]
+    fn misnumbered_files_are_paired_by_what_they_sound_like() {
+        // Numbered 1, 2, 3 in the wrong order.
+        let local = vec![
+            track("", Some(1), 37),
+            track("", Some(2), 59),
+            track("", Some(3), 321),
+        ];
+        let m = score_with(&local, &release(), &heard(&[&["r3"], &["r1"], &["r2"]]));
+        let mut pairs = m.pairs.clone();
+        pairs.sort();
+        assert_eq!(pairs, [(0, 2), (1, 0), (2, 1)]);
+        assert!(m.distance < 0.04, "{}", m.distance);
     }
 
     #[test]

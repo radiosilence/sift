@@ -35,8 +35,21 @@ const TTL: Duration = Duration::from_secs(30 * 24 * 3600);
 pub enum AcoustIdError {
     #[error("AcoustID request failed: {0}")]
     Http(#[from] reqwest::Error),
-    #[error("AcoustID refused the lookup: {0}")]
-    Refused(String),
+    #[error("AcoustID refused the lookup: {message}")]
+    Refused { code: Option<u32>, message: String },
+}
+
+impl AcoustIdError {
+    /// Whether the next lookup would fail the same way: the service is
+    /// unreachable, or the key is wrong. A refusal of one fingerprint says
+    /// nothing about the next.
+    pub fn stops_all(&self) -> bool {
+        match self {
+            Self::Http(_) => true,
+            // AcoustID's code for an invalid application key.
+            Self::Refused { code, .. } => *code == Some(4),
+        }
+    }
 }
 
 /// A file's fingerprint, ready to look up.
@@ -167,6 +180,8 @@ struct Response {
 
 #[derive(Deserialize)]
 struct ErrorBody {
+    #[serde(default)]
+    code: Option<u32>,
     message: String,
 }
 
@@ -228,11 +243,12 @@ impl AcoustId {
             ("fingerprint", fp.encoded.as_str()),
         ];
         let cached = self.cache.as_ref().map(|c| (c, c.path("lookup", &form)));
-        let body = match &cached {
+        let hit = match &cached {
             Some((cache, file)) => cache.read(file, TTL).await,
             None => None,
         };
-        let body = match body {
+        let fetched = hit.is_none();
+        let body = match hit {
             Some(body) => body,
             None => {
                 {
@@ -251,14 +267,19 @@ impl AcoustId {
                 body.to_vec()
             }
         };
-        let resp: Response = serde_json::from_slice(&body)
-            .map_err(|e| AcoustIdError::Refused(format!("unreadable answer: {e}")))?;
+        let resp: Response = serde_json::from_slice(&body).map_err(|e| AcoustIdError::Refused {
+            code: None,
+            message: format!("unreadable answer: {e}"),
+        })?;
         if resp.status != "ok" {
-            return Err(AcoustIdError::Refused(
-                resp.error.map_or(resp.status, |e| e.message),
-            ));
+            let (code, message) = resp
+                .error
+                .map_or((None, resp.status), |e| (e.code, e.message));
+            return Err(AcoustIdError::Refused { code, message });
         }
-        if let Some((cache, file)) = cached {
+        // Only a fresh answer is kept: rewriting a cached one would renew
+        // it, and it would never expire.
+        if fetched && let Some((cache, file)) = cached {
             cache.write(&file, &body).await;
         }
         let mut out = Identified::default();
