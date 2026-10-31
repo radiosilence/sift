@@ -43,6 +43,7 @@ tagger = [
     "dep:symphonia",
     "dep:tokio",
     "dep:tracing",
+    "dep:tracing-subscriber",
     "dep:unicode-normalization",
 ]
 
@@ -68,6 +69,8 @@ symphonia = { version = "0.6.1", default-features = false, features = ["flac", "
 thiserror = "2"
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "macros", "time", "sync", "fs"], optional = true }
 tracing = { version = "0.1.44", optional = true }
+# Only the binary installs a subscriber; library callers bring their own.
+tracing-subscriber = { version = "0.3.23", default-features = false, features = ["fmt", "std", "ansi"], optional = true }
 unicode-normalization = { version = "0.1.26", optional = true }
 
 [dev-dependencies]

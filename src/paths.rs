@@ -348,7 +348,19 @@ pub(crate) fn transfer_blocking(from: &Path, to: &Path, move_file: bool) -> std:
     std::fs::rename(&*tmp, to)?;
     claim.kept = true;
     if move_file {
-        std::fs::remove_file(from)?;
+        // The new name must be on disk before the old one goes, or a crash
+        // between the two could keep the unlink and lose the rename.
+        if let Some(dir) = to.parent()
+            && let Ok(dir) = std::fs::File::open(dir)
+        {
+            let _ = dir.sync_all();
+        }
+        // A source that cannot be removed is still whole: the move did not
+        // happen, so the copy goes rather than leave the file in two places.
+        if let Err(e) = std::fs::remove_file(from) {
+            let _ = std::fs::remove_file(to);
+            return Err(e);
+        }
     }
     Ok(())
 }
@@ -356,7 +368,8 @@ pub(crate) fn transfer_blocking(from: &Path, to: &Path, move_file: bool) -> std:
 /// The transfers made so far toward one change of the library, undone
 /// together if the change does not finish: an album half moved is worse
 /// than one not moved at all. Dropped before [`Journal::commit`], it undoes
-/// them, so a cancelled or failed change puts every file back.
+/// them, so a cancelled or failed change puts every file back where it was.
+/// Only locations are undone: tags written to a file along the way stay.
 #[derive(Default)]
 pub(crate) struct Journal {
     done: Vec<(std::path::PathBuf, std::path::PathBuf, bool)>,

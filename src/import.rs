@@ -1145,76 +1145,59 @@ impl Importer {
     ) -> Result<PathBuf, ImportError> {
         let in_place = matches!(filing, Filing::InPlace);
         let plan = self.destinations(tracks, entries, release, in_place)?;
-        // Every transfer from here is undone if the album is not filed whole,
-        // including a copy set aside for it.
-        let mut journal = paths::Journal::default();
-
         // Every destination already there, each the same recording as its
         // source, is this album filed once before: a repeated import (a
         // retry, a second request queued behind the first) succeeds and
         // moves nothing. Anything short of that is a conflict, and nothing
-        // is overwritten either way.
-        let mut present: Vec<bool> = plan.iter().map(|d| d.occupied).collect();
-        if let Filing::Replacing(bin) = filing {
-            let mut taken: Vec<PathBuf> = plan
-                .iter()
-                .zip(&present)
-                .filter(|(_, p)| **p)
-                .filter_map(|(d, _)| d.to.parent().map(Path::to_path_buf))
-                .collect();
-            taken.sort();
-            taken.dedup();
-            let (root, bin) = (self.cfg.directory.clone(), bin.to_path_buf());
-            let (j, set) = tokio::task::spawn_blocking(move || {
-                let set: Result<Vec<_>, ImportError> = taken
-                    .into_iter()
-                    .map(|dir| {
-                        let to = set_aside(&dir, &root, &bin, &mut journal)?;
-                        Ok((dir, to))
+        // is overwritten either way. A replacing import sets those copies
+        // aside instead, once the cover is in hand.
+        let present: Vec<bool> = plan.iter().map(|d| d.occupied).collect();
+        let bin = match filing {
+            Filing::Replacing(bin) => Some(bin.to_path_buf()),
+            _ => None,
+        };
+        if bin.is_none() {
+            if !in_place && present.iter().all(|p| *p) && !plan.is_empty() {
+                let same = plan.iter().all(|d| {
+                    meta::read(&d.to).is_ok_and(|there| {
+                        let here = &tracks[d.local];
+                        there.format == here.format
+                            && (there.duration.as_secs_f64() - here.duration.as_secs_f64()).abs()
+                                < 1.0
                     })
-                    .collect();
-                (journal, set)
-            })
-            .await
-            .expect("set aside panicked");
-            journal = j;
-            for (dir, to) in set? {
-                let _ = writeln!(log, "replaced: {} moved to {}", dir.display(), to.display());
-            }
-            present = plan.iter().map(|d| d.to.exists()).collect();
-        }
-        if !in_place && present.iter().all(|p| *p) && !plan.is_empty() {
-            let same = plan.iter().all(|d| {
-                meta::read(&d.to).is_ok_and(|there| {
-                    let here = &tracks[d.local];
-                    there.format == here.format
-                        && (there.duration.as_secs_f64() - here.duration.as_secs_f64()).abs() < 1.0
-                })
-            });
-            let dir = plan[0]
-                .to
-                .parent()
-                .map(Path::to_path_buf)
-                .unwrap_or_default();
-            if same {
-                journal.commit();
-                let _ = writeln!(
-                    log,
-                    "already in the library as {}; nothing moved",
-                    dir.display()
-                );
-                return Ok(dir);
-            }
-        }
-        if let Some(i) = present.iter().position(|p| *p) {
-            return Err(ImportError::Exists(
-                plan[i]
+                });
+                let dir = plan[0]
                     .to
                     .parent()
                     .map(Path::to_path_buf)
-                    .unwrap_or_default(),
-            ));
+                    .unwrap_or_default();
+                if same {
+                    let _ = writeln!(
+                        log,
+                        "already in the library as {}; nothing moved",
+                        dir.display()
+                    );
+                    return Ok(dir);
+                }
+            }
+            if let Some(i) = present.iter().position(|p| *p) {
+                return Err(ImportError::Exists(
+                    plan[i]
+                        .to
+                        .parent()
+                        .map(Path::to_path_buf)
+                        .unwrap_or_default(),
+                ));
+            }
         }
+        let mut taken: Vec<PathBuf> = plan
+            .iter()
+            .zip(&present)
+            .filter(|(_, p)| **p)
+            .filter_map(|(d, _)| d.to.parent().map(Path::to_path_buf))
+            .collect();
+        taken.sort();
+        taken.dedup();
 
         let cover_art = if self.cfg.fetch_art {
             self.cover(release, tracks).await
@@ -1244,18 +1227,33 @@ impl Importer {
             .collect();
         let moving = self.cfg.move_files || in_place;
         let preserve_mtime = self.cfg.import_added;
+        let root = self.cfg.directory.clone();
         let source = source_dir.to_path_buf();
         let new_dir = plan
             .first()
             .and_then(|d| d.to.parent())
             .map(Path::to_path_buf);
-        // One blocking task files the whole album, so a dropped import
-        // future cannot stop it half way: it finishes, or its journal puts
-        // every file back.
-        {
+        // One blocking task sets aside and files the whole album, so a
+        // dropped import future cannot stop it half way: it finishes, or
+        // its journal puts every file back where it was. Tags already
+        // written to a moved file's source stay written.
+        let replaced = {
             let work = work.clone();
             let new_dir = new_dir.clone();
-            tokio::task::spawn_blocking(move || -> Result<(), ImportError> {
+            tokio::task::spawn_blocking(move || -> Result<Vec<(PathBuf, PathBuf)>, ImportError> {
+                let mut journal = paths::Journal::default();
+                let mut replaced = Vec::new();
+                if let Some(bin) = &bin {
+                    for dir in taken {
+                        let to = set_aside(&dir, &root, bin, &mut journal)?;
+                        replaced.push((dir, to));
+                    }
+                    if let Some((_, to, _, _)) = work.iter().find(|(_, to, _, _)| to.exists()) {
+                        return Err(ImportError::Exists(
+                            to.parent().map(Path::to_path_buf).unwrap_or_default(),
+                        ));
+                    }
+                }
                 for (from, to, stays, tags) in &work {
                     // Moving: the source is ours to change, so tag it and
                     // move it. Copying: the source must come out untouched,
@@ -1288,10 +1286,13 @@ impl Importer {
                 {
                     let _ = std::fs::remove_dir(parent);
                 }
-                Ok(())
+                Ok(replaced)
             })
             .await
-            .expect("filing panicked")?;
+            .expect("filing panicked")?
+        };
+        for (dir, to) in replaced {
+            let _ = writeln!(log, "replaced: {} moved to {}", dir.display(), to.display());
         }
         for (from, to, _, _) in &work {
             let _ = writeln!(
