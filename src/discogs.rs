@@ -53,8 +53,8 @@ pub struct Discogs {
     token: String,
     base: String,
     gate: Mutex<Gate>,
-    /// Responses kept on disk, same cache directory as MusicBrainz's but
-    /// with a `discogs-` prefixed filename, so the two never collide.
+    /// Responses kept on disk, in files named with a `discogs-` prefix, so
+    /// the directory can be shared with other caches.
     cache: Option<crate::cache::Cache>,
 }
 
@@ -80,7 +80,12 @@ impl Discogs {
 
     /// Keep responses under `dir`.
     pub fn with_cache(mut self, dir: std::path::PathBuf) -> Self {
-        self.cache = Some(crate::cache::Cache::new(dir, "discogs-", RELEASE_TTL));
+        self.cache = Some(crate::cache::Cache::new(
+            dir,
+            "discogs-",
+            false,
+            RELEASE_TTL,
+        ));
         self
     }
 

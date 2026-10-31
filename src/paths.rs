@@ -260,6 +260,23 @@ pub(crate) fn is_scratch(path: &Path) -> bool {
         .is_some_and(|n| n.starts_with(".sift-") && n.ends_with(".tmp"))
 }
 
+/// How long ago a scratch file was made. Its modification time says
+/// nothing of that, since copies carry their source's; the inode change
+/// time is set by creation and rename, and nothing sets it back.
+pub(crate) fn scratch_age(meta: &std::fs::Metadata) -> Option<std::time::Duration> {
+    #[cfg(unix)]
+    let made = {
+        use std::os::unix::fs::MetadataExt;
+        std::time::UNIX_EPOCH.checked_add(std::time::Duration::new(
+            u64::try_from(meta.ctime()).ok()?,
+            u32::try_from(meta.ctime_nsec()).ok()?,
+        ))?
+    };
+    #[cfg(not(unix))]
+    let made = meta.created().ok()?;
+    made.elapsed().ok()
+}
+
 /// Move (or copy) `from` to `to`, creating directories, never replacing an
 /// existing file.
 ///

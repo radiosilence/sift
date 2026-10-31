@@ -376,13 +376,13 @@ fn mtime_nanos(meta: &std::fs::Metadata) -> i64 {
 
 /// How long a scratch copy may sit before it counts as left by an edit
 /// that never finished rather than one still running.
-const STALE_SCRATCH: std::time::Duration = std::time::Duration::from_secs(3600);
+const STALE_SCRATCH: Duration = Duration::from_secs(3600);
 
 /// Every audio file under `root`, skipping hidden entries (`.part` downloads,
 /// macOS `._` resource forks, `.Trash`), and the directories below `root`
 /// that could not be read, with why. A scratch copy left by an interrupted
 /// tag write or transfer is removed on the way.
-fn audio_files(root: &Path) -> Result<Walk, LibraryError> {
+fn audio_files(root: &Path, stale: Duration) -> Result<Walk, LibraryError> {
     let mut out = Vec::new();
     let mut unread = Vec::new();
     let mut stack = vec![root.to_path_buf()];
@@ -403,10 +403,9 @@ fn audio_files(root: &Path) -> Result<Walk, LibraryError> {
                 if crate::paths::is_scratch(&path)
                     && entry
                         .metadata()
-                        .and_then(|m| m.modified())
                         .ok()
-                        .and_then(|t| t.elapsed().ok())
-                        .is_some_and(|age| age > STALE_SCRATCH)
+                        .and_then(|m| crate::paths::scratch_age(&m))
+                        .is_some_and(|age| age > stale)
                 {
                     let _ = std::fs::remove_file(&path);
                 }
@@ -493,7 +492,8 @@ impl Library {
 
     /// Bring the index in line with the files under `root`: read files that
     /// are new or whose size or modification time changed, and drop rows for
-    /// files that are gone. Reads run on every core; a first scan of a large
+    /// files that are gone. Scratch copies left under `root` by interrupted
+    /// writes are removed. Reads run on every core; a first scan of a large
     /// library is bound by the disk.
     pub fn update(&mut self, root: &Path) -> Result<ScanReport, LibraryError> {
         let known: HashMap<String, (u64, i64)> = {
@@ -520,7 +520,7 @@ impl Library {
         let mut report = ScanReport::default();
         let mut seen = std::collections::HashSet::new();
         let mut to_read = Vec::new();
-        let Walk { files, unread } = audio_files(root)?;
+        let Walk { files, unread } = audio_files(root, STALE_SCRATCH)?;
         report.failed.extend(unread.iter().cloned());
         for path in files {
             let Some(key) = path.to_str().map(str::to_string) else {
@@ -1101,21 +1101,19 @@ pub(crate) mod tests {
     #[test]
     fn a_stale_scratch_copy_is_swept_and_a_fresh_one_left() {
         let root = tempfile::tempdir().unwrap();
-        let (stale, fresh) = (
-            root.path().join(".sift-1-1.tmp"),
-            root.path().join(".sift-1-2.tmp"),
-        );
-        std::fs::write(&stale, b"x").unwrap();
-        std::fs::write(&fresh, b"x").unwrap();
+        let scratch = root.path().join(".sift-1-1.tmp");
+        std::fs::write(&scratch, b"x").unwrap();
+        // A copy carries its source's mtime: an old one says nothing.
         std::fs::File::options()
             .write(true)
-            .open(&stale)
+            .open(&scratch)
             .unwrap()
             .set_modified(SystemTime::now() - 2 * STALE_SCRATCH)
             .unwrap();
-        Library::in_memory().unwrap().update(root.path()).unwrap();
-        assert!(!stale.exists());
-        assert!(fresh.exists());
+        audio_files(root.path(), STALE_SCRATCH).unwrap();
+        assert!(scratch.exists(), "made just now");
+        audio_files(root.path(), Duration::ZERO).unwrap();
+        assert!(!scratch.exists());
     }
 
     #[test]

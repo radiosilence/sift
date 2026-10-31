@@ -64,7 +64,7 @@ impl MusicBrainz {
 
     /// Keep responses under `dir`.
     pub fn with_cache(mut self, dir: std::path::PathBuf) -> Self {
-        self.cache = Some(crate::cache::Cache::new(dir, "mb-", RELEASE_TTL));
+        self.cache = Some(crate::cache::Cache::new(dir, "mb-", true, RELEASE_TTL));
         self
     }
 

@@ -10,13 +10,15 @@ pub(crate) struct Cache {
     dir: PathBuf,
     /// Before each file's name, so two services can share a directory.
     prefix: &'static str,
+    /// Also prune files named as before prefixes: sixteen hex digits.
+    legacy: bool,
 }
 
 impl Cache {
     /// Responses in `dir`, older ones pruned once per process in the
     /// background: nothing reads a response past its time to live, so
     /// without pruning the directory only grows.
-    pub(crate) fn new(dir: PathBuf, prefix: &'static str, keep: Duration) -> Self {
+    pub(crate) fn new(dir: PathBuf, prefix: &'static str, legacy: bool, keep: Duration) -> Self {
         static PRUNED: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
         let first = {
             let mut pruned = PRUNED.lock().unwrap_or_else(|e| e.into_inner());
@@ -26,7 +28,11 @@ impl Cache {
             }
             first
         };
-        let cache = Self { dir, prefix };
+        let cache = Self {
+            dir,
+            prefix,
+            legacy,
+        };
         if first {
             let c = cache.clone();
             std::thread::spawn(move || c.prune(keep));
@@ -92,16 +98,22 @@ impl Cache {
             let path = entry.path();
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            let ours = name.starts_with(self.prefix) && name.ends_with(".json");
-            if !ours && !crate::paths::is_scratch(&path) {
+            let legacy = self.legacy
+                && name.strip_suffix(".json").is_some_and(|stem| {
+                    stem.len() == 16 && stem.bytes().all(|b| b.is_ascii_hexdigit())
+                });
+            let ours = (name.starts_with(self.prefix) && name.ends_with(".json")) || legacy;
+            let scratch = crate::paths::is_scratch(&path);
+            if !ours && !scratch {
                 continue;
             }
-            let old = entry
-                .metadata()
-                .and_then(|m| m.modified())
-                .ok()
-                .and_then(|t| t.elapsed().ok())
-                .is_some_and(|age| age > keep);
+            let Ok(meta) = entry.metadata() else { continue };
+            let age = if scratch {
+                crate::paths::scratch_age(&meta)
+            } else {
+                meta.modified().ok().and_then(|t| t.elapsed().ok())
+            };
+            let old = age.is_some_and(|age| age > keep);
             if old {
                 let _ = std::fs::remove_file(&path);
             }
@@ -118,6 +130,7 @@ mod tests {
         let c = Cache {
             dir: "/c".into(),
             prefix: "x-",
+            legacy: false,
         };
         let a = c.path("release/1", &[("inc", "recordings")]);
         assert_eq!(a, c.path("release/1", &[("inc", "recordings")]));
@@ -136,14 +149,18 @@ mod tests {
         let c = Cache {
             dir: dir.path().into(),
             prefix: "x-",
+            legacy: true,
         };
         let file = c.path("a", &[]);
         c.write(&file, b"{}").await;
         assert_eq!(c.read(&file, Duration::from_secs(60)).await.unwrap(), b"{}");
         let other = dir.path().join("y-1.json");
+        let unprefixed = dir.path().join("0123456789abcdef.json");
         std::fs::write(&other, b"{}").unwrap();
+        std::fs::write(&unprefixed, b"{}").unwrap();
         c.prune(Duration::ZERO);
         assert!(!file.exists(), "expired");
+        assert!(!unprefixed.exists(), "named as before prefixes");
         assert!(other.exists(), "another cache's file is left alone");
     }
 }
