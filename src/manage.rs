@@ -292,8 +292,10 @@ pub async fn modify(
     }
     for (i, f) in files.iter().enumerate() {
         if let Err(e) = meta::set(f, changes) {
-            // The index follows the files already changed before stopping.
-            lib.refresh(&files[..i])?;
+            // The index follows the files already changed before stopping;
+            // if it cannot, the next scan catches up, and the write error is
+            // the one to report.
+            let _ = lib.refresh(&files[..i]);
             return Err(LibraryError::Io(f.clone(), std::io::Error::other(e)));
         }
     }
