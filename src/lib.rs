@@ -28,6 +28,8 @@ pub mod meta;
 #[cfg(feature = "tagger")]
 pub mod musicbrainz;
 #[cfg(feature = "tagger")]
+mod par;
+#[cfg(feature = "tagger")]
 pub mod paths;
 #[cfg(feature = "tagger")]
 pub mod replaygain;

@@ -1190,12 +1190,16 @@ impl Importer {
                 ));
             }
         }
-        let mut taken: Vec<PathBuf> = plan
-            .iter()
-            .zip(&present)
-            .filter(|(_, p)| **p)
-            .filter_map(|(d, _)| d.to.parent().map(Path::to_path_buf))
-            .collect();
+        // The folders a replacing import sets aside.
+        let mut taken: Vec<PathBuf> = match bin {
+            Some(_) => plan
+                .iter()
+                .zip(&present)
+                .filter(|(_, p)| **p)
+                .filter_map(|(d, _)| d.to.parent().map(Path::to_path_buf))
+                .collect(),
+            None => Vec::new(),
+        };
         taken.sort();
         taken.dedup();
 
@@ -1214,6 +1218,7 @@ impl Importer {
             }
         );
         let cover: Option<std::sync::Arc<[u8]>> = cover_art.map(|c| c.bytes.into());
+        // Owned for the blocking task; the log is written from `plan`.
         let work: Vec<(PathBuf, PathBuf, bool, Tags)> = plan
             .iter()
             .map(|d| {
@@ -1238,7 +1243,6 @@ impl Importer {
         // its journal puts every file back where it was. Tags already
         // written to a moved file's source stay written.
         let replaced = {
-            let work = work.clone();
             let new_dir = new_dir.clone();
             tokio::task::spawn_blocking(move || -> Result<Vec<(PathBuf, PathBuf)>, ImportError> {
                 let mut journal = paths::Journal::default();
@@ -1294,12 +1298,13 @@ impl Importer {
         for (dir, to) in replaced {
             let _ = writeln!(log, "replaced: {} moved to {}", dir.display(), to.display());
         }
-        for (from, to, _, _) in &work {
+        for d in &plan {
+            let from = &tracks[d.local].path;
             let _ = writeln!(
                 log,
                 "{} → {}",
                 from.strip_prefix(source_dir).unwrap_or(from).display(),
-                to.display()
+                d.to.display()
             );
         }
         for t in unmatched(tracks, entries) {
