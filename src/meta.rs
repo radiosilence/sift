@@ -99,12 +99,7 @@ fn raise_allocation_limit() {
 /// whatever was reading a whole folder.
 pub fn read(path: &Path) -> Result<Track, MetaError> {
     raise_allocation_limit();
-    std::panic::catch_unwind(|| read_inner(path)).unwrap_or_else(|_| {
-        Err(MetaError::Lofty {
-            path: path.to_path_buf(),
-            source: "the tag parser panicked on this file".into(),
-        })
-    })
+    contained(path, || read_inner(path))
 }
 
 fn read_inner(path: &Path) -> Result<Track, MetaError> {
@@ -311,7 +306,7 @@ fn edit(
 
 /// `f`, with a panic inside the tag parser or writer reported as this
 /// file's error.
-fn contained(path: &Path, f: impl FnOnce() -> Result<(), MetaError>) -> Result<(), MetaError> {
+fn contained<T>(path: &Path, f: impl FnOnce() -> Result<T, MetaError>) -> Result<T, MetaError> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or_else(|_| {
         Err(MetaError::Lofty {
             path: path.to_path_buf(),
@@ -1033,13 +1028,7 @@ pub struct Embedded {
 /// Every picture embedded in `path`, from every tag it carries.
 pub fn pictures(path: &Path) -> Result<Vec<Embedded>, MetaError> {
     raise_allocation_limit();
-    let file = std::panic::catch_unwind(|| lofty::read_from_path(path).map_err(lofty(path)))
-        .unwrap_or_else(|_| {
-            Err(MetaError::Lofty {
-                path: path.to_path_buf(),
-                source: "the tag library panicked on this file".into(),
-            })
-        })?;
+    let file = contained(path, || lofty::read_from_path(path).map_err(lofty(path)))?;
     Ok(file
         .tags()
         .iter()

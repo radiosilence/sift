@@ -201,14 +201,9 @@ fn existing_case(root: &Path, path: &Path, listings: &mut Listings) -> std::path
         // On a case-sensitive disk a directory of exactly this name is the
         // answer, for one stat. On a case-insensitive one it "exists" in any
         // case, and the question is how it is spelled, so the listing is
-        // read; but a name that is not there in any case needs no listing.
-        let here = out.join(name);
-        if CASE_SENSITIVE && here.is_dir() {
-            out.push(name);
-            continue;
-        }
-        if !CASE_SENSITIVE && !here.exists() {
-            absent = true;
+        // read. Whether a disk folds case is known only per platform, not per
+        // volume, so a missing exact name still means reading the listing.
+        if CASE_SENSITIVE && out.join(name).is_dir() {
             out.push(name);
             continue;
         }
