@@ -200,6 +200,14 @@ async fn main() -> ExitCode {
 
 async fn run() -> anyhow::Result<ExitCode> {
     let cli = Cli::parse();
+    // Warnings the library logs (files it could not put back, files written
+    // in place) are meant for the person at the terminal.
+    tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::WARN)
+        .with_writer(std::io::stderr)
+        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
+        .without_time()
+        .init();
     // Before the config: completions are generated where there may be none.
     if let Command::Completions { shell } = cli.command {
         clap_complete::generate(shell, &mut Cli::command(), "sift", &mut std::io::stdout());

@@ -243,6 +243,23 @@ fn truncate(s: &str, max: usize) -> String {
     s[..end].trim_end().to_string()
 }
 
+/// A hidden, unique name beside `path` for a file being written: short,
+/// since a name already at the length limit has no room for a suffix, and
+/// hidden, so a library scan skips it.
+pub(crate) fn scratch_beside(path: &Path) -> std::path::PathBuf {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    path.with_file_name(format!(".sift-{}-{n}.tmp", std::process::id()))
+}
+
+/// Whether `path` is a file [`scratch_beside`] named: it belongs to a write
+/// in progress, so it never moves with an album's other files.
+pub(crate) fn is_scratch(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.starts_with(".sift-") && n.ends_with(".tmp"))
+}
+
 /// Move (or copy) `from` to `to`, creating directories, never replacing an
 /// existing file.
 ///
@@ -252,67 +269,232 @@ fn truncate(s: &str, max: usize) -> String {
 /// to a temporary sibling, synced, length-checked and renamed into place, so
 /// a crash leaves either the old state or the whole file, never a truncated
 /// one under the real name.
+///
+/// The work runs on a blocking thread and finishes even if this future is
+/// dropped; a failure removes the temporary file and the claim.
 pub async fn transfer(from: &Path, to: &Path, move_file: bool) -> std::io::Result<()> {
-    if let Some(dir) = to.parent() {
-        tokio::fs::create_dir_all(dir).await?;
+    let (from, to) = (from.to_path_buf(), to.to_path_buf());
+    tokio::task::spawn_blocking(move || transfer_blocking(&from, &to, move_file))
+        .await
+        .expect("transfer panicked")
+}
+
+/// What a failed transfer leaves behind to remove: its claim on the
+/// destination, while still empty, and its temporary copy.
+struct Claim<'a> {
+    to: &'a Path,
+    tmp: Option<std::path::PathBuf>,
+    /// Folders made for `to`, deepest first.
+    made: Vec<std::path::PathBuf>,
+    kept: bool,
+}
+
+impl Drop for Claim<'_> {
+    fn drop(&mut self) {
+        if self.kept {
+            return;
+        }
+        if let Some(tmp) = &self.tmp {
+            let _ = std::fs::remove_file(tmp);
+        }
+        if std::fs::metadata(self.to).is_ok_and(|m| m.len() == 0) {
+            let _ = std::fs::remove_file(self.to);
+        }
+        remove_made(&self.made);
     }
-    tokio::fs::OpenOptions::new()
+}
+
+/// Remove folders a transfer made, deepest first, each only if empty.
+fn remove_made(made: &[std::path::PathBuf]) {
+    for dir in made {
+        if std::fs::remove_dir(dir).is_err() {
+            break;
+        }
+    }
+}
+
+/// [`transfer`], on the calling thread.
+pub(crate) fn transfer_blocking(from: &Path, to: &Path, move_file: bool) -> std::io::Result<()> {
+    transfer_making(from, to, move_file).map(drop)
+}
+
+/// [`transfer_blocking`], returning the folders it made for `to`,
+/// deepest first.
+fn transfer_making(
+    from: &Path,
+    to: &Path,
+    move_file: bool,
+) -> std::io::Result<Vec<std::path::PathBuf>> {
+    let made: Vec<std::path::PathBuf> = to
+        .ancestors()
+        .skip(1)
+        .take_while(|dir| !dir.as_os_str().is_empty() && !dir.exists())
+        .map(Path::to_path_buf)
+        .collect();
+    if let Some(dir) = to.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
-        .open(to)
-        .await?;
-    let result = async {
-        if move_file {
-            match tokio::fs::rename(from, to).await {
-                Ok(()) => return Ok(()),
-                Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => {}
-                Err(e) => return Err(e),
+        .open(to)?;
+    let mut claim = Claim {
+        to,
+        tmp: None,
+        made,
+        kept: false,
+    };
+    if move_file {
+        match std::fs::rename(from, to) {
+            Ok(()) => {
+                claim.kept = true;
+                return Ok(std::mem::take(&mut claim.made));
             }
+            Err(e) if e.kind() == std::io::ErrorKind::CrossesDevices => {}
+            Err(e) => return Err(e),
         }
-        let tmp = to.with_file_name(format!(
-            ".{}.sift-{}.tmp",
-            to.file_name().unwrap_or_default().to_string_lossy(),
-            std::process::id()
-        ));
-        let from_meta = tokio::fs::metadata(from).await?;
-        let copied = tokio::fs::copy(from, &tmp).await?;
-        let file = tokio::fs::File::open(&tmp).await?;
-        file.sync_all().await?;
-        let expected = from_meta.len();
-        if copied != expected || file.metadata().await?.len() != expected {
-            let _ = tokio::fs::remove_file(&tmp).await;
-            return Err(std::io::Error::other(format!(
-                "short copy of {}",
-                from.display()
-            )));
+    }
+    let tmp = claim.tmp.insert(scratch_beside(to));
+    let from_meta = std::fs::metadata(from)?;
+    let copied = std::fs::copy(from, &*tmp)?;
+    let file = std::fs::File::open(&*tmp)?;
+    let expected = from_meta.len();
+    if copied != expected || file.metadata()?.len() != expected {
+        return Err(std::io::Error::other(format!(
+            "short copy of {}",
+            from.display()
+        )));
+    }
+    // A copy gets a fresh mtime; a move of the same file should never look
+    // newer than the original just because it crossed filesystems. Set
+    // through the read handle: the copy has the source's mode, which may
+    // not allow writing, and setting times needs only ownership.
+    if let Ok(modified) = from_meta.modified() {
+        file.set_modified(modified)?;
+    }
+    // A copy filed into the library is the library's to tag: a source
+    // made read-only (a share, a finished download) is given back its
+    // owner's write permission. A move keeps the file as it was.
+    #[cfg(unix)]
+    if !move_file {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = from_meta.permissions();
+        perms.set_mode(perms.mode() | 0o200);
+        file.set_permissions(perms)?;
+    }
+    file.sync_all()?;
+    std::fs::rename(&*tmp, to)?;
+    claim.kept = true;
+    if move_file {
+        // The new name must be on disk before the old one goes, or a crash
+        // between the two could keep the unlink and lose the rename.
+        if let Some(dir) = to.parent()
+            && let Ok(dir) = std::fs::File::open(dir)
+        {
+            let _ = dir.sync_all();
         }
-        tokio::fs::rename(&tmp, to).await?;
-        // A copy gets a fresh mtime; a move of the same file should never
-        // look newer than the original just because it crossed filesystems.
-        if let Ok(modified) = from_meta.modified() {
-            let to = to.to_path_buf();
-            tokio::task::spawn_blocking(move || {
-                std::fs::File::options()
-                    .write(true)
-                    .open(&to)?
-                    .set_modified(modified)
-            })
-            .await
-            .expect("mtime setter panicked")?;
+        // A source that cannot be removed is still whole: the move did not
+        // happen, so the copy goes rather than leave the file in two places.
+        if let Err(e) = std::fs::remove_file(from) {
+            if std::fs::remove_file(to).is_err() {
+                tracing::error!(
+                    "{} could not be moved and is now also at {}",
+                    from.display(),
+                    to.display()
+                );
+            }
+            // The folders made for it go with it.
+            claim.kept = false;
+            return Err(e);
         }
-        if move_file {
-            tokio::fs::remove_file(from).await?;
-        }
+    }
+    Ok(std::mem::take(&mut claim.made))
+}
+
+/// The transfers made so far toward one change of the library, undone
+/// together if the change does not finish: an album half moved is worse
+/// than one not moved at all. Dropped before [`Journal::commit`], it undoes
+/// them, so a cancelled or failed change puts every file back where it was,
+/// and removes the folders it made for them. Only locations are undone:
+/// tags written to a file along the way stay.
+#[derive(Default)]
+pub(crate) struct Journal {
+    done: Vec<Done>,
+}
+
+/// One transfer, and the folders it made.
+struct Done {
+    from: std::path::PathBuf,
+    to: std::path::PathBuf,
+    moved: bool,
+    made: Vec<std::path::PathBuf>,
+}
+
+impl Journal {
+    /// [`transfer_blocking`], recorded to be undone.
+    pub(crate) fn transfer(
+        &mut self,
+        from: &Path,
+        to: &Path,
+        move_file: bool,
+    ) -> std::io::Result<()> {
+        let made = transfer_making(from, to, move_file)?;
+        self.done.push(Done {
+            from: from.to_path_buf(),
+            to: to.to_path_buf(),
+            moved: move_file,
+            made,
+        });
         Ok(())
     }
-    .await;
-    if result.is_err() {
-        // Release the claim, but only if it is still the empty placeholder.
-        if tokio::fs::metadata(to).await.is_ok_and(|m| m.len() == 0) {
-            let _ = tokio::fs::remove_file(to).await;
+
+    /// Each move made, in order.
+    pub(crate) fn moves(&self) -> impl Iterator<Item = (&Path, &Path)> {
+        self.done
+            .iter()
+            .filter(|d| d.moved)
+            .map(|d| (d.from.as_path(), d.to.as_path()))
+    }
+
+    /// Keep every transfer.
+    pub(crate) fn commit(mut self) {
+        self.done.clear();
+    }
+
+    /// Put every file back, newest first: a moved file to where it came
+    /// from, a copy removed. Returns the files that could not be.
+    fn undo(&mut self) -> Vec<std::path::PathBuf> {
+        let mut stuck = Vec::new();
+        for d in self.done.drain(..).rev() {
+            let undone = if d.moved {
+                transfer_blocking(&d.to, &d.from, true)
+            } else {
+                std::fs::remove_file(&d.to)
+            };
+            if undone.is_err() {
+                stuck.push(d.to);
+                continue;
+            }
+            remove_made(&d.made);
+        }
+        stuck
+    }
+}
+
+impl Drop for Journal {
+    fn drop(&mut self) {
+        let stuck = self.undo();
+        if !stuck.is_empty() {
+            tracing::error!(
+                "could not put back: {}",
+                stuck
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
         }
     }
-    result
 }
 
 #[cfg(test)]
@@ -466,6 +648,84 @@ mod tests {
         assert!(transfer(&from, &to, true).await.is_err());
         assert_eq!(std::fs::read(&to).unwrap(), b"precious");
         assert!(from.exists());
+    }
+
+    #[tokio::test]
+    async fn a_failed_transfer_leaves_no_claim_or_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let to = dir.path().join("lib/b.flac");
+        assert!(
+            transfer(&dir.path().join("gone.flac"), &to, true)
+                .await
+                .is_err()
+        );
+        assert!(
+            transfer(&dir.path().join("gone.flac"), &to, false)
+                .await
+                .is_err()
+        );
+        assert!(
+            !dir.path().join("lib").exists(),
+            "nor the folder made for it"
+        );
+    }
+
+    #[test]
+    fn a_journal_dropped_unfinished_puts_every_file_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (dir.path().join("a.flac"), dir.path().join("b.flac"));
+        std::fs::write(&a, b"a").unwrap();
+        std::fs::write(&b, b"b").unwrap();
+        let mut journal = Journal::default();
+        journal
+            .transfer(&a, &dir.path().join("lib/a.flac"), true)
+            .unwrap();
+        journal
+            .transfer(&b, &dir.path().join("lib/b.flac"), false)
+            .unwrap();
+        drop(journal);
+        assert_eq!(std::fs::read(&a).unwrap(), b"a");
+        assert_eq!(std::fs::read(&b).unwrap(), b"b");
+        assert!(
+            !dir.path().join("lib").exists(),
+            "the folder it made goes too"
+        );
+    }
+
+    #[test]
+    fn undoing_removes_only_the_folders_a_transfer_made() {
+        let dir = tempfile::tempdir().unwrap();
+        let lib = dir.path().join("lib");
+        std::fs::create_dir_all(lib.join("Artist")).unwrap();
+        let (a, b) = (dir.path().join("a.flac"), dir.path().join("b.flac"));
+        std::fs::write(&a, b"a").unwrap();
+        std::fs::write(&b, b"b").unwrap();
+        let mut journal = Journal::default();
+        journal
+            .transfer(&a, &lib.join("Artist/Album/a.flac"), true)
+            .unwrap();
+        journal
+            .transfer(&b, &lib.join("New/Album/b.flac"), true)
+            .unwrap();
+        drop(journal);
+        assert!(lib.join("Artist").is_dir(), "it was there before");
+        assert!(!lib.join("Artist/Album").exists());
+        assert!(!lib.join("New").exists());
+        assert!(lib.is_dir());
+    }
+
+    #[test]
+    fn a_committed_journal_keeps_its_transfers() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.flac");
+        std::fs::write(&a, b"a").unwrap();
+        let mut journal = Journal::default();
+        journal
+            .transfer(&a, &dir.path().join("lib/a.flac"), true)
+            .unwrap();
+        journal.commit();
+        assert!(!a.exists());
+        assert!(dir.path().join("lib/a.flac").exists());
     }
 
     #[tokio::test]

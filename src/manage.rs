@@ -121,7 +121,7 @@ pub fn plan_move(cfg: &Config, album: &Album) -> Plan {
             let path = entry.path();
             if !entry.file_type().is_ok_and(|t| t.is_file())
                 || meta::is_audio(&path)
-                || meta::is_scratch(&path)
+                || paths::is_scratch(&path)
             {
                 continue;
             }
@@ -137,24 +137,42 @@ pub fn plan_move(cfg: &Config, album: &Album) -> Plan {
 
 /// Carry out a plan from [`plan_move`], keeping the index in step, then
 /// remove the directories it emptied (the album's, then its artist's). A
-/// directory is only ever removed empty.
+/// directory is only ever removed empty. A move that fails, an index that
+/// cannot be updated, or a dropped future puts every file back, so the
+/// album stays whole where it was and the index still agrees.
 pub async fn execute(lib: &mut Library, album: &Album, moves: &[Move]) -> Result<(), LibraryError> {
-    for m in moves {
-        paths::transfer(&m.from, &m.to, true)
-            .await
-            .map_err(|e| LibraryError::Io(m.from.clone(), e))?;
-        lib.rename(&m.from, &m.to)?;
-    }
-    if std::fs::remove_dir(&album.dir).is_ok()
-        && let Some(parent) = album.dir.parent()
+    let owned = moves.to_vec();
+    let journal = tokio::task::spawn_blocking(move || {
+        let mut journal = paths::Journal::default();
+        for m in &owned {
+            journal
+                .transfer(&m.from, &m.to, true)
+                .map_err(|e| LibraryError::Io(m.from.clone(), e))?;
+        }
+        Ok::<_, LibraryError>(journal)
+    })
+    .await
+    .expect("move panicked")?;
+    // The index follows before the moves are kept: if it cannot, the
+    // journal puts the files back and both still agree.
+    lib.rename_all(moves.iter().map(|m| (m.from.as_path(), m.to.as_path())))?;
+    journal.commit();
+    remove_emptied(&album.dir);
+    Ok(())
+}
+
+/// Remove `dir`, and then its parent, each only if empty.
+fn remove_emptied(dir: &Path) {
+    if std::fs::remove_dir(dir).is_ok()
+        && let Some(parent) = dir.parent()
     {
         let _ = std::fs::remove_dir(parent);
     }
-    Ok(())
 }
 
 /// Move an album into `bin`, at its path relative to the library root, and
 /// drop it from the index. Nothing is deleted: putting it back is a move.
+/// A move that fails puts back the ones made before it.
 pub async fn bin(
     lib: &mut Library,
     library_root: &Path,
@@ -178,23 +196,26 @@ pub async fn bin(
             std::io::Error::from(std::io::ErrorKind::AlreadyExists),
         ));
     }
-    let entries =
-        std::fs::read_dir(&album.dir).map_err(|e| LibraryError::Io(album.dir.clone(), e))?;
-    for entry in entries.flatten() {
-        let from = entry.path();
-        if !entry.file_type().is_ok_and(|t| t.is_file()) || meta::is_scratch(&from) {
-            continue;
+    let (dir, to) = (album.dir.clone(), dest.clone());
+    let journal = tokio::task::spawn_blocking(move || {
+        let entries = std::fs::read_dir(&dir).map_err(|e| LibraryError::Io(dir.clone(), e))?;
+        let mut journal = paths::Journal::default();
+        for entry in entries.flatten() {
+            let from = entry.path();
+            if !entry.file_type().is_ok_and(|t| t.is_file()) || paths::is_scratch(&from) {
+                continue;
+            }
+            journal
+                .transfer(&from, &to.join(entry.file_name()), true)
+                .map_err(|e| LibraryError::Io(from.clone(), e))?;
         }
-        paths::transfer(&from, &dest.join(entry.file_name()), true)
-            .await
-            .map_err(|e| LibraryError::Io(from.clone(), e))?;
-        lib.forget(&from)?;
-    }
-    if std::fs::remove_dir(&album.dir).is_ok()
-        && let Some(parent) = album.dir.parent()
-    {
-        let _ = std::fs::remove_dir(parent);
-    }
+        Ok::<_, LibraryError>(journal)
+    })
+    .await
+    .expect("move panicked")?;
+    lib.forget_all(journal.moves().map(|(from, _)| from))?;
+    journal.commit();
+    remove_emptied(&album.dir);
     Ok(dest)
 }
 
@@ -657,6 +678,31 @@ replace:
             (0, 0, 0),
             "the index followed the moves"
         );
+    }
+
+    #[tokio::test]
+    async fn a_move_that_fails_part_way_puts_the_album_back() {
+        let root = tempfile::tempdir().unwrap();
+        let cfg = config(root.path());
+        let lib_root = root.path().join("lib");
+        let old = lib_root.join("R.E.M_").join("Monster");
+        file(&old.join("a.wav"), "R.E.M.", "Monster", "Kenneth", 1);
+        file(&old.join("b.wav"), "R.E.M.", "Monster", "Crush", 2);
+        let mut lib = Library::in_memory().unwrap();
+        lib.update(&lib_root).unwrap();
+        let album = album_of(&lib, &old);
+        let Plan::Moves(moves) = plan_move(&cfg, &album) else {
+            panic!("expected moves");
+        };
+        // Taken after planning, as by an import running alongside.
+        std::fs::create_dir_all(moves[1].to.parent().unwrap()).unwrap();
+        std::fs::write(&moves[1].to, b"someone else").unwrap();
+        assert!(execute(&mut lib, &album, &moves).await.is_err());
+        assert!(old.join("a.wav").exists() && old.join("b.wav").exists());
+        assert!(!moves[0].to.exists());
+        assert_eq!(std::fs::read(&moves[1].to).unwrap(), b"someone else");
+        let r = lib.update(&lib_root).unwrap();
+        assert_eq!((r.removed, r.changed), (0, 0), "the index never moved");
     }
 
     #[tokio::test]

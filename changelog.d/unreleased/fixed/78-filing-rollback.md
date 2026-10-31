@@ -1,0 +1,1 @@
+- **A failed import or move puts the album back.** Copies made before a failure are removed, moved files return to where they were, and a copy set aside for a replacing import is restored. Transfers interrupted by a dropped request no longer leave empty placeholders or temporary files, and the command line now shows the warnings the library logs.

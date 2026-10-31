@@ -367,21 +367,9 @@ fn probe(
 /// the original.
 struct Scratch(PathBuf);
 
-/// Whether `path` is the copy an edit in progress writes to. It belongs to
-/// that edit, so it never moves with the album's other files.
-pub(crate) fn is_scratch(path: &Path) -> bool {
-    path.file_name()
-        .and_then(|n| n.to_str())
-        .is_some_and(|n| n.starts_with(".sift-") && n.ends_with(".tmp"))
-}
-
 impl Scratch {
     fn beside(path: &Path) -> std::io::Result<Self> {
-        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        // Short and hidden: a name already at the length limit has no room
-        // for a suffix, and a library scan skips dotfiles.
-        let tmp = path.with_file_name(format!(".sift-{}-{n}.tmp", std::process::id()));
+        let tmp = crate::paths::scratch_beside(path);
         // Not claimed with `create_new` first: copying onto an existing
         // file stops macOS cloning it.
         let scratch = Self(tmp);
