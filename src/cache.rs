@@ -100,7 +100,7 @@ impl Cache {
             let name = name.to_string_lossy();
             let legacy = self.legacy
                 && name.strip_suffix(".json").is_some_and(|stem| {
-                    stem.len() == 16 && stem.bytes().all(|b| b.is_ascii_hexdigit())
+                    stem.len() == 16 && stem.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
                 });
             let ours = (name.starts_with(self.prefix) && name.ends_with(".json")) || legacy;
             let scratch = crate::paths::is_scratch(&path);
