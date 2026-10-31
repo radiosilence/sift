@@ -49,8 +49,9 @@ paces itself against each, but some of that depends on how it is run.
   budget is shared with everyone else.
 - **Keep the cache.** Responses are kept under the cache directory
   (`~/Library/Caches/sift` on macOS, `~/.cache/sift` on Linux) for a day
-  for searches and a week for releases. Deleting it makes the next import of
-  the same albums ask again.
+  for searches and a week for releases, and anything older than a week is
+  deleted the first time a process uses the cache. Deleting it makes the next
+  import of the same albums ask again.
 - **Embedding the library:** reuse one `Importer` for the process rather than
   building one per album, since each holds its own pacing gate, and set
   `Config::musicbrainz_contact` to your own project URL or email so
@@ -195,7 +196,9 @@ instead of disambiguated.
   of every file; it holds nothing the files do not, and beets' own
   `library.db` is never read or written, since its schema is beets'
   internals. Queries are evaluated in Rust rather than translated to SQL, so
-  their semantics are beets' exactly.
+  their semantics are beets' exactly. The one thing a scan writes to the
+  library is a deletion: hidden `.sift-*.tmp` copies more than an hour old,
+  left by a tag write or move that was interrupted.
 - **Changing the library is album-at-a-time and planned first.** `move` and
   `duplicates --bin` check every destination before any file moves and leave
   an album alone rather than move part of it. Duplicates are moved to a bin,
