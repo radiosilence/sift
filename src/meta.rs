@@ -259,8 +259,12 @@ enum Scope {
 /// split it into two files with different tags. Such a file keeps the risk
 /// of an interrupted write.
 ///
-/// Two edits of one file at once no longer damage it, but the later rename
-/// wins and the earlier edit is lost.
+/// An edit that finds the file replaced or moved before its rename (by
+/// another edit, or by the album being moved) fails rather than write: the
+/// other change is not lost, and no copy reappears at the old path.
+///
+/// Where the folder cannot be written but the file can, there is nowhere
+/// to make the copy, and the file is edited in place, as a linked one is.
 fn edit(
     path: &Path,
     scope: Scope,
@@ -286,7 +290,20 @@ fn edit(
         });
         return contained(path, || edit_at(path, path, scope, mtime, f));
     }
-    let tmp = Scratch::beside(path)?;
+    let tmp = match Scratch::beside(path) {
+        Ok(tmp) => tmp,
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            static SAID: std::sync::Once = std::sync::Once::new();
+            SAID.call_once(|| {
+                tracing::warn!(
+                    "cannot write in {}; files in read-only folders have their tags written in place",
+                    path.parent().unwrap_or(path).display()
+                );
+            });
+            return contained(path, || edit_at(path, path, scope, mtime, f));
+        }
+        Err(e) => return Err(lofty(path)(e)),
+    };
     contained(path, || edit_at(&tmp.0, path, scope, mtime, f))?;
     tmp.replace(path, &original)
 }
@@ -297,7 +314,7 @@ fn contained(path: &Path, f: impl FnOnce() -> Result<(), MetaError>) -> Result<(
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or_else(|_| {
         Err(MetaError::Lofty {
             path: path.to_path_buf(),
-            source: "the tag parser panicked on this file".into(),
+            source: "the tag library panicked on this file".into(),
         })
     })
 }
@@ -358,7 +375,7 @@ pub(crate) fn is_scratch(path: &Path) -> bool {
 }
 
 impl Scratch {
-    fn beside(path: &Path) -> Result<Self, MetaError> {
+    fn beside(path: &Path) -> std::io::Result<Self> {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // Short and hidden: a name already at the length limit has no room
@@ -367,7 +384,7 @@ impl Scratch {
         // Not claimed with `create_new` first: copying onto an existing
         // file stops macOS cloning it.
         let scratch = Self(tmp);
-        std::fs::copy(path, &scratch.0).map_err(lofty(path))?;
+        std::fs::copy(path, &scratch.0)?;
         Ok(scratch)
     }
 
@@ -375,15 +392,32 @@ impl Scratch {
     fn replace(mut self, path: &Path, original: &std::fs::Metadata) -> Result<(), MetaError> {
         let file = std::fs::File::open(&self.0).map_err(lofty(path))?;
         // Copies belong to whoever made them; best effort, as only root may
-        // give a file away.
+        // give a file away, though the group alone may still be set.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{MetadataExt, fchown};
+            if fchown(&file, Some(original.uid()), Some(original.gid())).is_err() {
+                let _ = fchown(&file, None, Some(original.gid()));
+            }
+        }
+        file.sync_all().map_err(lofty(path))?;
+        // The file must still be the one that was copied: one replaced by
+        // another edit, or moved away with its album, is not overwritten.
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
-            let _ = std::os::unix::fs::fchown(&file, Some(original.uid()), Some(original.gid()));
+            let same = std::fs::metadata(path)
+                .is_ok_and(|now| (now.dev(), now.ino()) == (original.dev(), original.ino()));
+            if !same {
+                return Err(MetaError::Lofty {
+                    path: path.to_path_buf(),
+                    source: "the file was replaced or moved while its tags were being written"
+                        .into(),
+                });
+            }
         }
         #[cfg(not(unix))]
         let _ = original;
-        file.sync_all().map_err(lofty(path))?;
         std::fs::rename(&self.0, path).map_err(lofty(path))?;
         self.0 = PathBuf::new();
         if let Some(dir) = path.parent()
