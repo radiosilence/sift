@@ -59,23 +59,24 @@ fn tags_of(t: &Track) -> Tags {
     }
 }
 
-fn destination(cfg: &Config, t: &Track) -> Result<PathBuf, String> {
+fn destination(cfg: &Config, t: &Track, listings: &mut paths::Listings) -> Result<PathBuf, String> {
     let rel = paths::render(cfg, &tags_of(t), t, None).map_err(|e| e.to_string())?;
     let ext = t
         .path
         .extension()
         .map(|e| e.to_string_lossy().to_lowercase())
         .unwrap_or_default();
-    paths::under(&cfg.directory, &format!("{rel}.{ext}")).map_err(|e| e.to_string())
+    paths::under_with(&cfg.directory, &format!("{rel}.{ext}"), listings).map_err(|e| e.to_string())
 }
 
 /// Where the current rules put `album`.
 pub fn plan_move(cfg: &Config, album: &Album) -> Plan {
     let mut moves = Vec::new();
     let mut claimed: HashMap<String, &Path> = HashMap::new();
+    let mut listings = paths::Listings::default();
     for item in &album.items {
         let from = &item.track.path;
-        let to = match destination(cfg, &item.track) {
+        let to = match destination(cfg, &item.track, &mut listings) {
             Ok(to) => to,
             Err(e) => return Plan::Refused(format!("{}: {e}", from.display())),
         };

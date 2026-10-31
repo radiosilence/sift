@@ -858,6 +858,7 @@ impl Importer {
         let planned = self.destinations(&tracks, &entries, Some(&release), true);
         // A refused plan still shows each file's changes, and the path each
         // would take where one could be made, so the clash can be fixed.
+        let mut listings = paths::Listings::default();
         let files = entries
             .iter()
             .enumerate()
@@ -866,7 +867,7 @@ impl Importer {
                 let to = match &planned {
                     Ok(plan) => Some((plan[i].to.clone(), plan[i].stays)),
                     Err(_) => self
-                        .destination(local, tags, Some(&release))
+                        .destination(local, tags, Some(&release), &mut listings)
                         .ok()
                         .map(|to| (to.clone(), same_file(&local.path, &to))),
                 };
@@ -1086,6 +1087,7 @@ impl Importer {
         local: &Track,
         tags: &Tags,
         release: Option<&Release>,
+        listings: &mut paths::Listings,
     ) -> Result<PathBuf, ImportError> {
         let rel = paths::render(&self.cfg, tags, local, release)?;
         // Not `with_extension`: it cuts at the last dot, and titles have dots.
@@ -1094,7 +1096,11 @@ impl Importer {
             .extension()
             .map(|e| e.to_string_lossy().to_lowercase())
             .unwrap_or_default();
-        Ok(paths::under(&self.cfg.directory, &format!("{rel}.{ext}"))?)
+        Ok(paths::under_with(
+            &self.cfg.directory,
+            &format!("{rel}.{ext}"),
+            listings,
+        )?)
     }
 
     /// Where each `(file, tags)` would be filed, refused if two would land
@@ -1109,9 +1115,10 @@ impl Importer {
     ) -> Result<Vec<Destination>, ImportError> {
         let mut plan = Vec::with_capacity(entries.len());
         let mut claimed = std::collections::HashMap::new();
+        let mut listings = paths::Listings::default();
         for (l, tags) in entries {
             let local = &tracks[*l];
-            let to = self.destination(local, tags, release)?;
+            let to = self.destination(local, tags, release, &mut listings)?;
             if let Some(other) = claimed.insert(paths::collision_key(&to), *l) {
                 return Err(ImportError::Conflict(format!(
                     "{} and {} would both be filed as {}",

@@ -1,5 +1,6 @@
 //! Where a track goes, and getting it there.
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use unicode_normalization::UnicodeNormalization;
@@ -124,6 +125,16 @@ pub enum PathError {
 /// renderer already prevents this; tags are untrusted input, so it is checked
 /// again where it matters.
 pub fn under(root: &Path, rel: &str) -> Result<std::path::PathBuf, PathError> {
+    under_with(root, rel, &mut Listings::default())
+}
+
+/// [`under`], reading each directory's listing at most once per `listings`:
+/// planning an album asks about the same artist folder for every track.
+pub(crate) fn under_with(
+    root: &Path,
+    rel: &str,
+    listings: &mut Listings,
+) -> Result<std::path::PathBuf, PathError> {
     let path = root.join(rel);
     let clean = path.components().all(|c| {
         matches!(
@@ -136,7 +147,33 @@ pub fn under(root: &Path, rel: &str) -> Result<std::path::PathBuf, PathError> {
     if !clean || !path.starts_with(root) {
         return Err(PathError::Escapes(path));
     }
-    Ok(existing_case(root, &path))
+    Ok(existing_case(root, &path, listings))
+}
+
+/// Directory listings, each name folded for comparison, kept for one plan.
+/// A plan creates nothing, so a listing stays true while it is made; it is
+/// not kept longer, since filing creates folders a later plan must see.
+#[derive(Default)]
+pub(crate) struct Listings(HashMap<std::path::PathBuf, Vec<(String, std::ffi::OsString)>>);
+
+impl Listings {
+    fn of(&mut self, dir: &Path) -> &[(String, std::ffi::OsString)] {
+        self.0.entry(dir.to_path_buf()).or_insert_with(|| {
+            std::fs::read_dir(dir)
+                .map(|entries| {
+                    entries
+                        .flatten()
+                        .map(|e| (fold(&e.file_name()), e.file_name()))
+                        .collect()
+                })
+                .unwrap_or_default()
+        })
+    }
+}
+
+/// A name as case-insensitive disks compare it.
+fn fold(n: &std::ffi::OsStr) -> String {
+    n.to_string_lossy().nfc().collect::<String>().to_lowercase()
 }
 
 /// `path` with each directory below `root` spelled as one already on disk
@@ -147,7 +184,7 @@ pub fn under(root: &Path, rel: &str) -> Result<std::path::PathBuf, PathError> {
 /// case-insensitive one it makes the second import collide with the first.
 /// Reusing the folder that is already there keeps an artist in one place, in
 /// the spelling it was first filed under.
-fn existing_case(root: &Path, path: &Path) -> std::path::PathBuf {
+fn existing_case(root: &Path, path: &Path, listings: &mut Listings) -> std::path::PathBuf {
     let Ok(rel) = path.strip_prefix(root) else {
         return path.to_path_buf();
     };
@@ -163,25 +200,28 @@ fn existing_case(root: &Path, path: &Path) -> std::path::PathBuf {
         }
         // On a case-sensitive disk a directory of exactly this name is the
         // answer, for one stat. On a case-insensitive one it "exists" in any
-        // case, and the question is how it is spelled, so the listing is read.
-        if CASE_SENSITIVE && out.join(name).is_dir() {
+        // case, and the question is how it is spelled, so the listing is
+        // read; but a name that is not there in any case needs no listing.
+        let here = out.join(name);
+        if CASE_SENSITIVE && here.is_dir() {
             out.push(name);
             continue;
         }
-        let fold =
-            |n: &std::ffi::OsStr| n.to_string_lossy().nfc().collect::<String>().to_lowercase();
+        if !CASE_SENSITIVE && !here.exists() {
+            absent = true;
+            out.push(name);
+            continue;
+        }
         let want = fold(name);
         // Names first: only an entry that matches is asked whether it is a
-        // directory, so a listing of thousands of artists costs one read.
-        let dirs: Vec<std::ffi::OsString> = std::fs::read_dir(&out)
-            .map(|entries| {
-                entries
-                    .flatten()
-                    .filter(|e| fold(&e.file_name()) == want && e.path().is_dir())
-                    .map(|e| e.file_name())
-                    .collect()
-            })
-            .unwrap_or_default();
+        // directory.
+        let dirs: Vec<std::ffi::OsString> = listings
+            .of(&out)
+            .iter()
+            .filter(|(folded, _)| *folded == want)
+            .map(|(_, n)| n.clone())
+            .filter(|n| out.join(n).is_dir())
+            .collect();
         absent = dirs.is_empty();
         let spelled = dirs
             .iter()
