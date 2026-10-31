@@ -1,0 +1,1 @@
+- **Re-importing an album rewrites only the files that change.** `mbsync` and `import -L` leave a file alone when its tags and front cover already match, so refreshing a library mostly reads.
