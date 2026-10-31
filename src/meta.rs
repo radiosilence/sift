@@ -65,6 +65,8 @@ pub struct Track {
     pub country: Option<String>,
     pub media: Option<String>,
     pub mb_release_group_id: Option<String>,
+    /// The Discogs release the album was matched to, as a number.
+    pub discogs_album_id: Option<String>,
     pub duration: Duration,
     /// `FLAC`, `MP3`, `AAC`… as beets' `$format` spells it.
     pub format: String,
@@ -179,6 +181,50 @@ fn read_tag(t: &mut Track, tag: &Tag) {
     t.country = s(ItemKey::ReleaseCountry);
     t.media = s(ItemKey::OriginalMediaType);
     t.mb_release_group_id = s(ItemKey::MusicBrainzReleaseGroupId);
+    t.discogs_album_id = discogs_album_id(tag);
+}
+
+/// beets' name for the Discogs release id. lofty has no generic key for
+/// it, so it is read and written in each format's own tag: a Vorbis
+/// comment, an ID3v2 `TXXX` frame, an MP4 freeform atom, an APE item.
+const DISCOGS_ALBUM_ID: &str = "DISCOGS_ALBUMID";
+
+fn itunes(name: &str) -> lofty::mp4::AtomIdent<'_> {
+    lofty::mp4::AtomIdent::Freeform {
+        mean: "com.apple.iTunes".into(),
+        name: name.into(),
+    }
+}
+
+/// The Discogs release id in `tag`, which lofty keeps among the items it
+/// has no generic key for, reachable through the format's own type.
+fn discogs_album_id(tag: &Tag) -> Option<String> {
+    if !tag.has_format_specific_items() {
+        return None;
+    }
+    let id = match tag.tag_type() {
+        TagType::VorbisComments => VorbisComments::from(tag.clone())
+            .get(DISCOGS_ALBUM_ID)
+            .map(str::to_string),
+        TagType::Id3v2 => lofty::id3::v2::Id3v2Tag::from(tag.clone())
+            .get_user_text(DISCOGS_ALBUM_ID)
+            .map(str::to_string),
+        TagType::Mp4Ilst => lofty::mp4::Ilst::from(tag.clone())
+            .get(&itunes(DISCOGS_ALBUM_ID))
+            .and_then(|a| a.data().next().cloned())
+            .and_then(|d| match d {
+                lofty::mp4::AtomData::UTF8(v) | lofty::mp4::AtomData::UTF16(v) => Some(v),
+                _ => None,
+            }),
+        TagType::Ape => lofty::ape::ApeTag::from(tag.clone())
+            .get(DISCOGS_ALBUM_ID)
+            .and_then(|i| match i.value() {
+                ItemValue::Text(v) => Some(v.clone()),
+                _ => None,
+            }),
+        _ => None,
+    };
+    id.filter(|v| !v.trim().is_empty())
 }
 
 fn format_name(ft: lofty::file::FileType) -> &'static str {
@@ -227,13 +273,17 @@ pub struct Tags {
     pub mb_artist_ids: Vec<String>,
     pub mb_album_artist_ids: Vec<String>,
     pub mb_release_group_id: Option<String>,
+    pub discogs_album_id: Option<String>,
 }
 
 /// Which tags an [`edit`] saves.
 #[derive(Clone, Copy)]
-enum Scope {
+enum Scope<'a> {
     /// The primary tag only; any other tag the file carries is left as it is.
     Primary,
+    /// The primary tag, with the Discogs release id, which lofty has no
+    /// generic key for, set or (`None`) removed as well.
+    Written { discogs_album_id: Option<&'a str> },
     /// Every tag the file carries.
     All,
 }
@@ -264,7 +314,7 @@ enum Scope {
 /// to make the copy, and the file is edited in place, as a linked one is.
 fn edit(
     path: &Path,
-    scope: Scope,
+    scope: Scope<'_>,
     keep_mtime: bool,
     f: impl FnOnce(&mut lofty::file::TaggedFile) -> Result<(), MetaError>,
 ) -> Result<(), MetaError> {
@@ -321,7 +371,7 @@ fn contained<T>(path: &Path, f: impl FnOnce() -> Result<T, MetaError>) -> Result
 fn edit_at(
     target: &Path,
     path: &Path,
-    scope: Scope,
+    scope: Scope<'_>,
     mtime: Option<std::time::SystemTime>,
     f: impl FnOnce(&mut lofty::file::TaggedFile) -> Result<(), MetaError>,
 ) -> Result<(), MetaError> {
@@ -329,7 +379,7 @@ fn edit_at(
     let mut file = probe(target, path)?.read().map_err(lofty(path))?;
     f(&mut file)?;
     let types: Vec<TagType> = match scope {
-        Scope::Primary => vec![file.primary_tag_type()],
+        Scope::Primary | Scope::Written { .. } => vec![file.primary_tag_type()],
         Scope::All => file
             .tags()
             .iter()
@@ -341,7 +391,11 @@ fn edit_at(
         let tag = file
             .remove(tag_type)
             .ok_or_else(|| MetaError::NoTag(path.to_path_buf()))?;
-        save(tag, target).map_err(lofty(path))?;
+        let discogs = match scope {
+            Scope::Written { discogs_album_id } => Some(discogs_album_id),
+            _ => None,
+        };
+        save(tag, target, discogs).map_err(lofty(path))?;
     }
     if let Some(modified) = mtime {
         std::fs::File::options()
@@ -353,15 +407,72 @@ fn edit_at(
     Ok(())
 }
 
-/// Save `tag` to `target`. A Vorbis comment block goes through lofty's own
-/// type, which keeps the comments lofty has no generic key for (beets'
+/// Save `tag` to `target`, with the Discogs release id set or removed when
+/// `discogs` is given. A Vorbis comment block always goes through lofty's
+/// own type, which keeps the comments lofty has no generic key for (beets'
 /// `DISCOGS_ALBUMID`, `ACOUSTID_ID`, anyone's custom fields); saved as a
-/// generic tag, it would write only the keys it knows.
-fn save(tag: Tag, target: &Path) -> Result<(), lofty::error::FileEncodingError> {
-    if tag.tag_type() == TagType::VorbisComments {
-        VorbisComments::from(tag).save_to_path(target, WriteOptions::default())
-    } else {
-        tag.save_to_path(target, WriteOptions::default())
+/// generic tag, it would write only the keys it knows. The other formats'
+/// generic save keeps those items itself.
+fn save(
+    tag: Tag,
+    target: &Path,
+    discogs: Option<Option<&str>>,
+) -> Result<(), lofty::error::FileEncodingError> {
+    use lofty::ape::{ApeItem, ApeTag};
+    use lofty::id3::v2::Id3v2Tag;
+    use lofty::mp4::{Atom, AtomData, Ilst};
+    let opts = WriteOptions::default();
+    match (tag.tag_type(), discogs) {
+        (TagType::VorbisComments, None) => VorbisComments::from(tag).save_to_path(target, opts),
+        (TagType::VorbisComments, Some(id)) => {
+            let mut vc = VorbisComments::from(tag);
+            match id {
+                Some(id) => vc.insert(DISCOGS_ALBUM_ID.into(), id.into()),
+                // `remove` reorders what is left, which would reverse a
+                // repeated `ARTIST`.
+                None => {
+                    let kept: Vec<_> = vc
+                        .take_items()
+                        .filter(|(k, _)| !k.eq_ignore_ascii_case(DISCOGS_ALBUM_ID))
+                        .collect();
+                    for (k, v) in kept {
+                        vc.push(k, v);
+                    }
+                }
+            }
+            vc.save_to_path(target, opts)
+        }
+        (TagType::Id3v2, Some(id)) => {
+            let mut t = Id3v2Tag::from(tag);
+            t.remove_user_text(DISCOGS_ALBUM_ID);
+            if let Some(id) = id {
+                t.insert_user_text(DISCOGS_ALBUM_ID.into(), id.into());
+            }
+            t.save_to_path(target, opts)
+        }
+        (TagType::Mp4Ilst, Some(id)) => {
+            let mut t = Ilst::from(tag);
+            // `insert` adds to an atom already there rather than replace it.
+            t.remove(&itunes(DISCOGS_ALBUM_ID)).for_each(drop);
+            if let Some(id) = id {
+                t.insert(Atom::new(
+                    itunes(DISCOGS_ALBUM_ID),
+                    AtomData::UTF8(id.into()),
+                ));
+            }
+            t.save_to_path(target, opts)
+        }
+        (TagType::Ape, Some(id)) => {
+            let mut t = ApeTag::from(tag);
+            t.remove(DISCOGS_ALBUM_ID);
+            if let Some(id) = id
+                && let Ok(item) = ApeItem::new(DISCOGS_ALBUM_ID.into(), ItemValue::Text(id.into()))
+            {
+                t.insert(item);
+            }
+            t.save_to_path(target, opts)
+        }
+        _ => tag.save_to_path(target, opts),
     }
 }
 
@@ -465,7 +576,10 @@ pub fn write(
     cover: Option<&[u8]>,
     preserve_mtime: bool,
 ) -> Result<(), MetaError> {
-    edit(path, Scope::Primary, preserve_mtime, |file| {
+    let scope = Scope::Written {
+        discogs_album_id: tags.discogs_album_id.as_deref(),
+    };
+    edit(path, scope, preserve_mtime, |file| {
         write_tags(primary(file, path)?, tags, cover);
         Ok(())
     })
@@ -697,6 +811,7 @@ impl Track {
             mb_artist_ids: tags.mb_artist_ids.clone(),
             mb_album_artist_ids: tags.mb_album_artist_ids.clone(),
             mb_release_group_id: tags.mb_release_group_id.clone(),
+            discogs_album_id: tags.discogs_album_id.clone(),
             ..self.clone()
         }
     }
@@ -824,6 +939,11 @@ pub fn diff(old: &Track, new: &Track) -> Vec<TagChange> {
             "mb_releasegroupid",
             old.mb_release_group_id.clone(),
             new.mb_release_group_id.clone(),
+        ),
+        (
+            "discogs_albumid",
+            old.discogs_album_id.clone(),
+            new.discogs_album_id.clone(),
         ),
     ];
     pairs
