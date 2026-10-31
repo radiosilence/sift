@@ -1,4 +1,6 @@
 #[cfg(feature = "tagger")]
+pub mod acoustid;
+#[cfg(feature = "tagger")]
 pub mod art;
 #[cfg(feature = "tagger")]
 mod cache;

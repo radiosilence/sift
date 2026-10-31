@@ -133,6 +133,18 @@ track's title, as beets' option of the same name does. An album matched on
 Discogs carries the release's number in `DISCOGS_ALBUMID`, so
 `mbsync` and a re-import go back to that release rather than search again.
 
+With the `chroma` plugin listed and an AcoustID application key in
+`acoustid.client` or `ACOUSTID_CLIENT` (registered at
+<https://acoustid.org/new-application>; beets' `acoustid.apikey` is a user key
+for submissions and does not work for lookups), a folder no candidate
+matches strongly is identified by its audio, as beets' `chroma` plugin does.
+Each file's first two minutes are fingerprinted, AcoustID names the
+MusicBrainz recordings, and the releases most of the files appear on become
+candidates. A file heard as a release's track costs nothing for its title,
+which is what lets an untagged folder match at all. Lookups are paced at
+three a second, so a large box set takes a while, and are kept in the
+cache; a failed one leaves that file to its tags.
+
 Path templates are fb2k-style — the template language koan uses, whose engine
 this crate carries. A beets template (`$albumartist/%if{$year,($year) }$album`)
 is translated on load, so an existing config files albums where beets would
