@@ -992,6 +992,13 @@ impl Importer {
                 break;
             }
         }
+        // A credit spelled differently from MusicBrainz's ("x" for "×")
+        // fails the artist phrase; the title alone, with the artist's words
+        // only ranking the hits, still finds it, and distance decides.
+        if !hits.iter().any(|h| h.score >= 50) && !artist.is_empty() {
+            let _ = writeln!(log, "searching for {base:?} by any of {artist:?}");
+            hits = self.mb.search_releases_loosely(&artist, &base, 10).await?;
+        }
         // An album usually has many pressings scoring alike; the ones with
         // as many tracks as the folder are looked up first, since the
         // lookups run out before the list does.

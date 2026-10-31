@@ -147,19 +147,42 @@ impl MusicBrainz {
         album: &str,
         limit: usize,
     ) -> Result<Vec<ReleaseHit>, MbError> {
-        // Taggers abbreviate; MusicBrainz credits every compilation to one
-        // artist spelled in full.
-        let artist = match crate::matching::normalise(artist).as_str() {
-            "va" | "v a" | "various" | "various artist" => "Various Artists",
-            _ => artist,
-        };
+        let artist = various(artist);
         let mut query = format!("release:\"{}\"", lucene(album));
         if !artist.is_empty() {
             query.push_str(&format!(" AND artist:\"{}\"", lucene(artist)));
         }
+        self.search(&query, limit).await
+    }
+
+    /// Releases with this exact title by an artist sharing any word with
+    /// `artist`, best first: for a credit the tags spell differently, such
+    /// as "x" where MusicBrainz has "×", which the phrase in
+    /// [`Self::search_releases`] misses.
+    pub async fn search_releases_loosely(
+        &self,
+        artist: &str,
+        album: &str,
+        limit: usize,
+    ) -> Result<Vec<ReleaseHit>, MbError> {
+        // Lower-cased, since an "AND" or "OR" in a credit would otherwise
+        // be read as an operator.
+        let words: Vec<String> = various(artist)
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|w| !w.is_empty())
+            .map(str::to_lowercase)
+            .collect();
+        let mut query = format!("release:\"{}\"", lucene(album));
+        if !words.is_empty() {
+            query.push_str(&format!(" AND artist:({})", words.join(" ")));
+        }
+        self.search(&query, limit).await
+    }
+
+    async fn search(&self, query: &str, limit: usize) -> Result<Vec<ReleaseHit>, MbError> {
         let limit = limit.to_string();
         let found: SearchResults = self
-            .get("release", &[("query", &query), ("limit", &limit)])
+            .get("release", &[("query", query), ("limit", &limit)])
             .await?;
         Ok(found.releases)
     }
@@ -359,6 +382,15 @@ impl MbError {
             Self::Http(e) => e.is_timeout() || e.is_connect() || e.status().is_some_and(retryable),
             Self::Decode(_) => false,
         }
+    }
+}
+
+/// Taggers abbreviate; MusicBrainz credits every compilation to one artist
+/// spelled in full.
+fn various(artist: &str) -> &str {
+    match crate::matching::normalise(artist).as_str() {
+        "va" | "v a" | "various" | "various artist" => "Various Artists",
+        _ => artist,
     }
 }
 

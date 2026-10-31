@@ -139,3 +139,59 @@ async fn genres_come_from_the_release_group_when_the_release_has_none() {
         "top three, none under a third of the top's votes"
     );
 }
+
+#[tokio::test]
+async fn a_loose_search_needs_the_title_and_any_word_of_the_artist() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}/ws/2", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        let (mut sock, _) = listener.accept().await.unwrap();
+        let mut req = Vec::new();
+        let mut buf = [0u8; 4096];
+        while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+            let read = sock.read(&mut buf).await.unwrap();
+            req.extend_from_slice(&buf[..read]);
+        }
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{EMPTY}",
+            EMPTY.len()
+        );
+        sock.write_all(resp.as_bytes()).await.unwrap();
+        String::from_utf8(req).unwrap()
+    });
+    let mb = MusicBrainz::with_base(&base, "test");
+    mb.search_releases_loosely("Duchamp x François & OR", "Revenant", 5)
+        .await
+        .unwrap();
+    let req = server.await.unwrap();
+    let line = req.lines().next().unwrap();
+    let query = line
+        .split_once("query=")
+        .unwrap()
+        .1
+        .split(['&', ' '])
+        .next()
+        .unwrap();
+    let query = query.replace('+', " ");
+    let query: String = percent_decode(&query);
+    assert_eq!(
+        query,
+        "release:\"Revenant\" AND artist:(duchamp x françois or)"
+    );
+}
+
+fn percent_decode(s: &str) -> String {
+    let mut out = Vec::new();
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            out.push(u8::from_str_radix(&s[i + 1..i + 3], 16).unwrap());
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).unwrap()
+}
