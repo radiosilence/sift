@@ -544,9 +544,38 @@ impl Library {
             seen.insert(key);
         }
 
-        // Read and commit a batch at a time, so memory stays flat however
-        // large the library, and an interrupted first scan keeps what it
-        // had read.
+        self.read_into(&to_read, &mut report)?;
+
+        let tx = self.conn.transaction()?;
+        {
+            let root = root.to_string_lossy();
+            let mut forget = tx.prepare("DELETE FROM unreadable WHERE path = ?1")?;
+            for path in failed.keys() {
+                if path.starts_with(root.as_ref()) && !seen.contains(path) {
+                    forget.execute([path])?;
+                }
+            }
+            let mut delete = tx.prepare("DELETE FROM items WHERE path = ?1")?;
+            for path in known.keys() {
+                if path.starts_with(root.as_ref()) && !seen.contains(path) {
+                    delete.execute([path])?;
+                    report.removed += 1;
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(report)
+    }
+
+    /// Read each `(file, (size, mtime), is new)` and record what it holds,
+    /// or why it could not be read. A batch at a time is read and
+    /// committed, so memory stays flat however large the library, and an
+    /// interrupted first scan keeps what it had read.
+    fn read_into(
+        &mut self,
+        to_read: &[(PathBuf, (u64, i64), bool)],
+        report: &mut ScanReport,
+    ) -> Result<(), LibraryError> {
         let workers = self.workers;
         let added = now_secs();
         for batch in to_read.chunks(BATCH) {
@@ -613,24 +642,34 @@ impl Library {
             tx.commit()?;
         }
 
-        let tx = self.conn.transaction()?;
-        {
-            let root = root.to_string_lossy();
-            let mut forget = tx.prepare("DELETE FROM unreadable WHERE path = ?1")?;
-            for path in failed.keys() {
-                if path.starts_with(root.as_ref()) && !seen.contains(path) {
-                    forget.execute([path])?;
-                }
+        Ok(())
+    }
+
+    /// Read `paths` again after sift changed them, without walking the
+    /// library: what [`Library::update`] would record for them. A path no
+    /// longer there is dropped.
+    pub fn refresh(&mut self, paths: &[PathBuf]) -> Result<ScanReport, LibraryError> {
+        let mut report = ScanReport::default();
+        let mut to_read = Vec::new();
+        for path in paths {
+            let Ok(m) = std::fs::metadata(path) else {
+                self.forget(path)?;
+                report.removed += 1;
+                continue;
+            };
+            let known: bool = self.conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM items WHERE path = ?1)",
+                [path.to_string_lossy()],
+                |r| r.get(0),
+            )?;
+            if known {
+                report.changed += 1;
+            } else {
+                report.added += 1;
             }
-            let mut delete = tx.prepare("DELETE FROM items WHERE path = ?1")?;
-            for path in known.keys() {
-                if path.starts_with(root.as_ref()) && !seen.contains(path) {
-                    delete.execute([path])?;
-                    report.removed += 1;
-                }
-            }
+            to_read.push((path.clone(), (m.len(), mtime_nanos(&m)), !known));
         }
-        tx.commit()?;
+        self.read_into(&to_read, &mut report)?;
         Ok(report)
     }
 

@@ -292,7 +292,7 @@ pub async fn modify(
     for f in &files {
         meta::set(f, changes).map_err(|e| LibraryError::Io(f.clone(), std::io::Error::other(e)))?;
     }
-    lib.update(&cfg.directory)?;
+    lib.refresh(&files)?;
     let dirs: std::collections::HashSet<PathBuf> = files
         .iter()
         .filter_map(|f| f.parent().map(Path::to_path_buf))
