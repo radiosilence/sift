@@ -1,0 +1,1 @@
+- **Library-wide commands no longer redo per-track work.** Planning a move lists each folder once, not once per track; sorting, duplicate detection and the lyrics and gain checks stop repeating work on every comparison or file; and `modify` reads back only the files it changed.
