@@ -297,10 +297,7 @@ pub async fn modify(
         .iter()
         .filter_map(|f| f.parent().map(Path::to_path_buf))
         .collect();
-    for album in lib.albums(&crate::library::Query::default())? {
-        if !dirs.contains(&album.dir) {
-            continue;
-        }
+    for album in lib.albums_in(dirs.iter().map(PathBuf::as_path))? {
         match plan_move(cfg, &album) {
             Plan::InPlace => {}
             Plan::Refused(why) => report.left.push((album.dir.clone(), why)),

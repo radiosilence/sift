@@ -422,18 +422,43 @@ fn mtime_nanos(meta: &std::fs::Metadata) -> i64 {
         .unwrap_or_default()
 }
 
+/// How long a scratch copy may sit before it counts as left by an edit
+/// that never finished rather than one still running.
+const STALE_SCRATCH: Duration = Duration::from_secs(3600);
+
 /// Every audio file under `root`, skipping hidden entries (`.part` downloads,
-/// macOS `._` resource forks, `.Trash`).
-fn audio_files(root: &Path) -> Result<Vec<PathBuf>, LibraryError> {
+/// macOS `._` resource forks, `.Trash`), and the directories below `root`
+/// that could not be read, with why. A scratch copy left by an interrupted
+/// tag write or transfer is removed on the way.
+fn audio_files(root: &Path, stale: Duration) -> Result<Walk, LibraryError> {
     let mut out = Vec::new();
+    let mut unread = Vec::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
-        let entries = std::fs::read_dir(&dir).map_err(|e| LibraryError::Io(dir.clone(), e))?;
-        for entry in entries.flatten() {
-            if entry.file_name().to_string_lossy().starts_with('.') {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) if dir == root => return Err(LibraryError::Io(dir, e)),
+            // Gone since it was listed (an album moved mid-scan), or not ours
+            // to read: the rest of the library is still scanned.
+            Err(e) => {
+                unread.push((dir.clone(), format!("{}: {e}", dir.display())));
                 continue;
             }
+        };
+        for entry in entries.flatten() {
             let path = entry.path();
+            if entry.file_name().to_string_lossy().starts_with('.') {
+                if crate::paths::is_scratch(&path)
+                    && entry
+                        .metadata()
+                        .ok()
+                        .and_then(|m| crate::paths::scratch_age(&m))
+                        .is_some_and(|age| age > stale)
+                {
+                    let _ = std::fs::remove_file(&path);
+                }
+                continue;
+            }
             match entry.file_type() {
                 Ok(t) if t.is_dir() => stack.push(path),
                 Ok(t) if t.is_file() && meta::is_audio(&path) => out.push(path),
@@ -441,7 +466,36 @@ fn audio_files(root: &Path) -> Result<Vec<PathBuf>, LibraryError> {
             }
         }
     }
-    Ok(out)
+    Ok(Walk { files: out, unread })
+}
+
+struct Walk {
+    files: Vec<PathBuf>,
+    unread: Vec<(PathBuf, String)>,
+}
+
+/// Rows keyed by a file's path, each of which follows the file when it moves
+/// and goes when it leaves.
+const PATH_TABLES: [&str; 4] = ["items", "checks", "lyrics_misses", "unreadable"];
+
+/// Move every row for `from` to `to`, replacing any stale row already there.
+fn rename_rows(conn: &Connection, from: &Path, to: &Path) -> rusqlite::Result<()> {
+    for table in PATH_TABLES {
+        conn.prepare_cached(&format!(
+            "UPDATE OR REPLACE {table} SET path = ?2 WHERE path = ?1"
+        ))?
+        .execute(params![from.to_string_lossy(), to.to_string_lossy()])?;
+    }
+    Ok(())
+}
+
+/// Drop every row for `path`.
+fn forget_rows(conn: &Connection, path: &str) -> rusqlite::Result<()> {
+    for table in PATH_TABLES {
+        conn.prepare_cached(&format!("DELETE FROM {table} WHERE path = ?1"))?
+            .execute([path])?;
+    }
+    Ok(())
 }
 
 impl Library {
@@ -486,7 +540,8 @@ impl Library {
 
     /// Bring the index in line with the files under `root`: read files that
     /// are new or whose size or modification time changed, and drop rows for
-    /// files that are gone. Reads run on every core; a first scan of a large
+    /// files that are gone. Scratch copies left under `root` by interrupted
+    /// writes are removed. Reads run on every core; a first scan of a large
     /// library is bound by the disk.
     pub fn update(&mut self, root: &Path) -> Result<ScanReport, LibraryError> {
         let known: HashMap<String, (u64, i64)> = {
@@ -513,7 +568,9 @@ impl Library {
         let mut report = ScanReport::default();
         let mut seen = std::collections::HashSet::new();
         let mut to_read = Vec::new();
-        for path in audio_files(root)? {
+        let Walk { files, unread } = audio_files(root, STALE_SCRATCH)?;
+        report.failed.extend(unread.iter().cloned());
+        for path in files {
             let Some(key) = path.to_str().map(str::to_string) else {
                 let why = format!("{}: path is not valid UTF-8", path.display());
                 report.failed.push((path, why));
@@ -546,21 +603,32 @@ impl Library {
 
         self.read_into(&to_read, &mut report)?;
 
-        let tx = self.conn.transaction()?;
-        {
-            let root = root.to_string_lossy();
-            let mut forget = tx.prepare("DELETE FROM unreadable WHERE path = ?1")?;
-            for path in failed.keys() {
-                if path.starts_with(root.as_ref()) && !seen.contains(path) {
-                    forget.execute([path])?;
-                }
+        // A file under `root` that the walk did not see has left, unless it
+        // is under a directory that could not be read this time.
+        let gone = |path: &str| {
+            let p = Path::new(path);
+            p.starts_with(root)
+                && !seen.contains(path)
+                && !unread.iter().any(|(dir, _)| p.starts_with(dir))
+        };
+        let mut recorded: Vec<String> = Vec::new();
+        for table in ["checks", "lyrics_misses"] {
+            let mut stmt = self.conn.prepare(&format!("SELECT path FROM {table}"))?;
+            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+            for path in rows {
+                recorded.push(path?);
             }
-            let mut delete = tx.prepare("DELETE FROM items WHERE path = ?1")?;
-            for path in known.keys() {
-                if path.starts_with(root.as_ref()) && !seen.contains(path) {
-                    delete.execute([path])?;
-                    report.removed += 1;
-                }
+        }
+        let tx = self.conn.transaction()?;
+        for path in failed.keys().chain(&recorded) {
+            if gone(path) {
+                forget_rows(&tx, path)?;
+            }
+        }
+        for path in known.keys() {
+            if gone(path) {
+                forget_rows(&tx, path)?;
+                report.removed += 1;
             }
         }
         tx.commit()?;
@@ -645,9 +713,8 @@ impl Library {
         Ok(())
     }
 
-    /// Read `paths` again after sift changed them, without walking the
-    /// library: what [`Library::update`] would record for them. A path no
-    /// longer there is dropped.
+    /// Read each of `paths` again after sift changed them, without walking
+    /// the library. A path no longer there is dropped.
     pub fn refresh(&mut self, paths: &[PathBuf]) -> Result<ScanReport, LibraryError> {
         let mut report = ScanReport::default();
         let mut to_read = Vec::new();
@@ -769,49 +836,42 @@ impl Library {
 
     /// Drop a file that left the library.
     pub fn forget(&self, path: &Path) -> Result<(), LibraryError> {
-        self.conn.execute(
-            "DELETE FROM items WHERE path = ?1",
-            [path.to_string_lossy()],
-        )?;
+        let tx = self.conn.unchecked_transaction()?;
+        forget_rows(&tx, &path.to_string_lossy())?;
+        tx.commit()?;
         Ok(())
     }
 
-    /// Record that a file moved.
+    /// Record that a file moved. Its check verdict and lyrics miss move
+    /// with it: they are keyed by size and mtime, which a move keeps.
     pub fn rename(&self, from: &Path, to: &Path) -> Result<(), LibraryError> {
-        self.conn.execute(
-            "UPDATE items SET path = ?2 WHERE path = ?1",
-            params![from.to_string_lossy(), to.to_string_lossy()],
-        )?;
+        let tx = self.conn.unchecked_transaction()?;
+        rename_rows(&tx, from, to)?;
+        tx.commit()?;
         Ok(())
     }
 
-    /// Record that files moved, all at once.
+    /// [`Library::rename`] for many files, in one transaction.
     pub fn rename_all<'a>(
         &mut self,
         moves: impl IntoIterator<Item = (&'a Path, &'a Path)>,
     ) -> Result<(), LibraryError> {
         let tx = self.conn.transaction()?;
-        {
-            let mut rename = tx.prepare("UPDATE items SET path = ?2 WHERE path = ?1")?;
-            for (from, to) in moves {
-                rename.execute(params![from.to_string_lossy(), to.to_string_lossy()])?;
-            }
+        for (from, to) in moves {
+            rename_rows(&tx, from, to)?;
         }
         tx.commit()?;
         Ok(())
     }
 
-    /// Drop files that left the library, all at once.
+    /// [`Library::forget`] for many files, in one transaction.
     pub fn forget_all<'a>(
         &mut self,
         paths: impl IntoIterator<Item = &'a Path>,
     ) -> Result<(), LibraryError> {
         let tx = self.conn.transaction()?;
-        {
-            let mut forget = tx.prepare("DELETE FROM items WHERE path = ?1")?;
-            for path in paths {
-                forget.execute([path.to_string_lossy()])?;
-            }
+        for path in paths {
+            forget_rows(&tx, &path.to_string_lossy())?;
         }
         tx.commit()?;
         Ok(())
@@ -831,12 +891,17 @@ impl Library {
     }
 
     fn all(&self) -> Result<Vec<Item>, LibraryError> {
-        let mut stmt = self.conn.prepare(
+        self.select("", [])
+    }
+
+    /// Items whose rows match `filter`, a `WHERE` clause or nothing.
+    fn select(&self, filter: &str, args: impl rusqlite::Params) -> Result<Vec<Item>, LibraryError> {
+        let mut stmt = self.conn.prepare(&format!(
             "SELECT path, size, mtime, added, title, artist, album, albumartist, track,
                 tracktotal, disc, disctotal, date, genre, mb_trackid, mb_albumid, format,
-                bitrate, samplerate, bitdepth, length, original_date, compilation FROM items",
-        )?;
-        let rows = stmt.query_map([], |r| {
+                bitrate, samplerate, bitdepth, length, original_date, compilation FROM items {filter}"
+        ))?;
+        let rows = stmt.query_map(args, |r| {
             Ok(Item {
                 size: r.get::<_, i64>(1)? as u64,
                 mtime: r.get(2)?,
@@ -882,26 +947,58 @@ impl Library {
     /// Albums matching `query`: directories of items, each item in disc and
     /// track order.
     pub fn albums(&self, query: &Query) -> Result<Vec<Album>, LibraryError> {
-        let mut dirs: BTreeMap<PathBuf, Vec<Item>> = BTreeMap::new();
-        for item in self.all()? {
-            let dir = item
-                .track
-                .path
-                .parent()
-                .map(Path::to_path_buf)
-                .unwrap_or_default();
-            dirs.entry(dir).or_default().push(item);
-        }
-        let albums: Vec<Album> = dirs
+        let albums: Vec<Album> = group(self.all()?)
             .into_iter()
-            .map(|(dir, mut items)| {
-                items.sort_by_key(|i| (i.track.disc, i.track.track));
-                Album { dir, items }
-            })
             .filter(|a| query.matches_album(a))
             .collect();
         Ok(sort_by_fields(albums, &sort_keys(query), Album::field))
     }
+
+    /// The albums in `dirs`, each in disc and track order, read without the
+    /// rest of the index.
+    pub fn albums_in<'a>(
+        &self,
+        dirs: impl IntoIterator<Item = &'a Path>,
+    ) -> Result<Vec<Album>, LibraryError> {
+        let mut items = Vec::new();
+        for dir in dirs {
+            // Every path under `dir/` sorts from `dir/` to just before
+            // `dir0`, '0' following '/': a range the primary key answers.
+            let dir_str = dir.to_string_lossy();
+            let dir_str = dir_str.trim_end_matches('/');
+            let found = self.select(
+                "WHERE path >= ?1 AND path < ?2",
+                [format!("{dir_str}/"), format!("{dir_str}0")],
+            )?;
+            items.extend(
+                found
+                    .into_iter()
+                    .filter(|i| i.track.path.parent() == Some(dir)),
+            );
+        }
+        Ok(group(items))
+    }
+}
+
+/// Items gathered into the directories that hold them, each in disc and
+/// track order.
+fn group(items: Vec<Item>) -> Vec<Album> {
+    let mut dirs: BTreeMap<PathBuf, Vec<Item>> = BTreeMap::new();
+    for item in items {
+        let dir = item
+            .track
+            .path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_default();
+        dirs.entry(dir).or_default().push(item);
+    }
+    dirs.into_iter()
+        .map(|(dir, mut items)| {
+            items.sort_by_key(|i| (i.track.disc, i.track.track));
+            Album { dir, items }
+        })
+        .collect()
 }
 
 fn sort_keys(query: &Query) -> Vec<(String, bool)> {
@@ -1048,6 +1145,112 @@ pub(crate) mod tests {
             false,
         )
         .unwrap();
+    }
+
+    #[test]
+    fn a_scan_of_one_root_leaves_a_sibling_root_whose_name_it_prefixes() {
+        let root = tempfile::tempdir().unwrap();
+        let (music, music2) = (root.path().join("music"), root.path().join("music2"));
+        std::fs::create_dir_all(&music).unwrap();
+        std::fs::create_dir_all(&music2).unwrap();
+        tagged_wav(&music.join("x.wav"), "A", "X", "x", 1);
+        tagged_wav(&music2.join("y.wav"), "B", "Y", "y", 1);
+        let mut lib = Library::in_memory().unwrap();
+        lib.update(&music).unwrap();
+        lib.update(&music2).unwrap();
+        let r = lib.update(&music).unwrap();
+        assert_eq!(r.removed, 0);
+        assert_eq!(lib.items(&Query::default()).unwrap().len(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_folder_is_reported_and_its_rows_kept() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let locked = root.path().join("A");
+        std::fs::create_dir_all(&locked).unwrap();
+        tagged_wav(&locked.join("x.wav"), "A", "X", "x", 1);
+        tagged_wav(&root.path().join("y.wav"), "B", "Y", "y", 1);
+        let mut lib = Library::in_memory().unwrap();
+        lib.update(root.path()).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let readable = std::fs::read_dir(&locked).is_ok(); // root reads anything
+        let r = lib.update(root.path());
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if readable {
+            return;
+        }
+        let r = r.unwrap();
+        assert_eq!(r.removed, 0);
+        assert!(r.failed.iter().any(|(p, _)| p == &locked));
+        assert_eq!(lib.items(&Query::default()).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_stale_scratch_copy_is_swept_and_a_fresh_one_left() {
+        let root = tempfile::tempdir().unwrap();
+        let scratch = root.path().join(".sift-1-1.tmp");
+        std::fs::write(&scratch, b"x").unwrap();
+        // A copy carries its source's mtime: an old one says nothing.
+        std::fs::File::options()
+            .write(true)
+            .open(&scratch)
+            .unwrap()
+            .set_modified(SystemTime::now() - 2 * STALE_SCRATCH)
+            .unwrap();
+        audio_files(root.path(), STALE_SCRATCH).unwrap();
+        assert!(scratch.exists(), "made just now");
+        audio_files(root.path(), Duration::ZERO).unwrap();
+        assert!(!scratch.exists());
+    }
+
+    #[test]
+    fn a_moved_file_keeps_its_check_and_a_gone_one_loses_it() {
+        let root = tempfile::tempdir().unwrap();
+        let (a, b) = (root.path().join("a.wav"), root.path().join("b.wav"));
+        tagged_wav(&a, "A", "X", "a", 1);
+        tagged_wav(&b, "A", "X", "b", 2);
+        let mut lib = Library::in_memory().unwrap();
+        lib.update(root.path()).unwrap();
+        let items = lib.items(&Query::default()).unwrap();
+        lib.check(&items).unwrap();
+        let checked = |lib: &Library| -> Vec<String> {
+            let mut stmt = lib
+                .conn
+                .prepare("SELECT path FROM checks ORDER BY path")
+                .unwrap();
+            stmt.query_map([], |r| r.get(0))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        };
+        let c = root.path().join("c.wav");
+        std::fs::rename(&a, &c).unwrap();
+        lib.rename(&a, &c).unwrap();
+        std::fs::remove_file(&b).unwrap();
+        lib.update(root.path()).unwrap();
+        assert_eq!(checked(&lib), [c.to_string_lossy().into_owned()]);
+    }
+
+    #[test]
+    fn albums_in_reads_just_the_folders_named() {
+        let root = tempfile::tempdir().unwrap();
+        let (a, sibling, below) = (
+            root.path().join("A"),
+            root.path().join("A B"),
+            root.path().join("A").join("CD2"),
+        );
+        for dir in [&a, &sibling, &below] {
+            std::fs::create_dir_all(dir).unwrap();
+            tagged_wav(&dir.join("t.wav"), "A", "X", "t", 1);
+        }
+        let mut lib = Library::in_memory().unwrap();
+        lib.update(root.path()).unwrap();
+        let albums = lib.albums_in([a.as_path()]).unwrap();
+        assert_eq!(albums.len(), 1);
+        assert_eq!(albums[0].dir, a);
+        assert_eq!(albums[0].items.len(), 1);
     }
 
     #[test]
