@@ -120,6 +120,17 @@ impl Discogs {
         path: &str,
         query: &[(&str, &str)],
     ) -> Result<bytes::Bytes, DiscogsError> {
+        // The gate is let go once the headers are in: the body need not hold
+        // up the next request.
+        let resp = self.send(path, query).await?;
+        Ok(resp.error_for_status()?.bytes().await?)
+    }
+
+    async fn send(
+        &self,
+        path: &str,
+        query: &[(&str, &str)],
+    ) -> Result<reqwest::Response, DiscogsError> {
         let mut gate = self.gate.lock().await;
         let mut attempt = 0;
         loop {
@@ -148,7 +159,7 @@ impl Discogs {
                 }
                 Ok(resp) => {
                     gate.succeeded();
-                    return Ok(resp.error_for_status()?.bytes().await?);
+                    return Ok(resp);
                 }
                 Err(e) if e.is_timeout() || e.is_connect() => (backoff, DiscogsError::Http(e)),
                 Err(e) => return Err(e.into()),
@@ -205,7 +216,9 @@ impl Discogs {
             )
             .send()
             .await?;
-        Ok(resp.error_for_status()?.bytes().await?.to_vec())
+        crate::art::read_capped(resp.error_for_status()?, crate::art::MAX_FETCH_BYTES)
+            .await
+            .ok_or_else(|| DiscogsError::Decode(format!("{url}: image too large or cut short")))
     }
 }
 

@@ -179,6 +179,7 @@ pub struct Importer {
     mb: MusicBrainz,
     discogs: Option<Discogs>,
     http: reqwest::Client,
+    lyrics: crate::lyrics::Client,
 }
 
 /// What [`Importer::enrich`] added.
@@ -336,10 +337,13 @@ impl Importer {
     }
 
     pub fn with_musicbrainz(cfg: Config, mb: MusicBrainz) -> Self {
-        let discogs = cfg
-            .discogs
-            .as_ref()
-            .map(|d| Discogs::new(&d.token, &cfg.musicbrainz_contact));
+        let discogs = cfg.discogs.as_ref().map(|d| {
+            let discogs = Discogs::new(&d.token, &cfg.musicbrainz_contact);
+            match &cfg.cache_dir {
+                Some(dir) => discogs.with_cache(dir.clone()),
+                None => discogs,
+            }
+        });
         Self::with_clients(cfg, mb, discogs)
     }
 
@@ -358,6 +362,7 @@ impl Importer {
             mb,
             discogs,
             http,
+            lyrics: crate::lyrics::Client::new(),
         }
     }
 
@@ -399,14 +404,26 @@ impl Importer {
             problems: plan.problems,
             ..Credited::default()
         };
-        for c in &plan.files {
-            let credits = meta::Credits {
-                artists: &c.artists,
-                artist_ids: &c.artist_ids,
-                album_artists: &c.album_artists,
-                album_artist_ids: &c.album_artist_ids,
-            };
-            match meta::write_credits(&c.path, &credits) {
+        let files = plan.files;
+        let written = tokio::task::spawn_blocking(move || {
+            files
+                .into_iter()
+                .map(|c| {
+                    let credits = meta::Credits {
+                        artists: &c.artists,
+                        artist_ids: &c.artist_ids,
+                        album_artists: &c.album_artists,
+                        album_artist_ids: &c.album_artist_ids,
+                    };
+                    let result = meta::write_credits(&c.path, &credits);
+                    (c, result)
+                })
+                .collect::<Vec<_>>()
+        })
+        .await
+        .expect("tag writer panicked");
+        for (c, result) in written {
+            match result {
                 Ok(()) => {
                     out.files += 1;
                     for a in c.artists.iter().chain(&c.album_artists) {
@@ -647,16 +664,25 @@ impl Importer {
                 Err(e) => out.problems.push(format!("genres: {e}")),
             }
         }
-        let lyrics = crate::lyrics::Client::new();
-        for t in tracks {
+        let paths: Vec<PathBuf> = tracks.iter().map(|t| t.path.clone()).collect();
+        let has: Vec<bool> = tokio::task::spawn_blocking(move || {
+            paths.iter().map(|p| meta::has_lyrics(p)).collect()
+        })
+        .await
+        .expect("tag reader panicked");
+        for (t, has) in tracks.iter().zip(has) {
             let (Some(artist), Some(title)) = (&t.artist, &t.title) else {
                 continue;
             };
-            if meta::has_lyrics(&t.path) {
+            if has {
                 continue;
             }
             let album = t.album.as_deref().unwrap_or("");
-            match lyrics.get(artist, title, album, t.duration.as_secs()).await {
+            match self
+                .lyrics
+                .get(artist, title, album, t.duration.as_secs())
+                .await
+            {
                 Ok(crate::lyrics::Lyrics::Synced(text)) => out.lyrics.push(PlannedLyrics {
                     path: t.path.clone(),
                     synced: true,
@@ -976,14 +1002,16 @@ impl Importer {
         // lookups run out before the list does.
         hits.retain(|h| h.score >= 50);
         hits.sort_by_key(|h| h.track_count.abs_diff(tracks.len()));
+        let mut looked_up = 0;
         for hit in hits {
-            if releases.len() > LOOKUPS {
+            if looked_up == LOOKUPS {
                 break;
             }
             if releases.iter().any(|r| r.id == hit.id) {
                 continue;
             }
             releases.push(self.mb.release(&hit.id).await?);
+            looked_up += 1;
         }
         let mut matches: Vec<Match> = releases
             .iter()
@@ -1437,7 +1465,7 @@ impl Importer {
             if let (Some(url), Some(discogs)) = (&release.cover_url, &self.discogs)
                 && let Ok(bytes) = discogs.image(url).await
                 && !bytes.is_empty()
-                && let Some(prepared) = prepare(bytes.to_vec(), rules).await
+                && let Some(prepared) = prepare(bytes, rules).await
             {
                 return Some(CoverArt {
                     bytes: prepared.bytes,
@@ -1486,9 +1514,9 @@ impl Importer {
         for (url, source) in candidates {
             if let Ok(resp) = self.http.get(&url).send().await
                 && resp.status().is_success()
-                && let Ok(bytes) = resp.bytes().await
+                && let Some(bytes) = art::read_capped(resp, art::MAX_FETCH_BYTES).await
                 && !bytes.is_empty()
-                && let Some(prepared) = prepare(bytes.to_vec(), rules).await
+                && let Some(prepared) = prepare(bytes, rules).await
             {
                 return Some(CoverArt {
                     bytes: prepared.bytes,

@@ -1,7 +1,7 @@
 //! Cover art post-processing: size and ratio rules, and resizing to fit.
 //!
-//! Kept as a pure function over bytes so the rules can be tested without a
-//! network fetch.
+//! The rules are a pure function over bytes, so they can be tested without
+//! a network fetch.
 
 use image::imageops::FilterType;
 
@@ -23,15 +23,20 @@ pub struct Prepared {
     pub resized: bool,
 }
 
-/// Checks `bytes` against `rules`. Returns `None` when the image cannot be
-/// decoded, is narrower than `min_width`, or fails `ratio` — the caller
-/// should try its next candidate. An image wider than `max_width` is resized
-/// down and re-encoded as JPEG at `quality`; one already within bounds is
-/// returned unchanged.
+/// Checks `bytes` against `rules`. Returns `None` when the image's size
+/// cannot be read, it is narrower than `min_width`, or it fails `ratio` —
+/// the caller should try its next candidate. An image wider than
+/// `max_width` is resized down and re-encoded as JPEG at `quality`; one
+/// already within bounds is returned unchanged. Only the header is read
+/// unless the image is resized: decoding a large cover just to learn its
+/// width costs tens of megabytes.
 pub fn prepare(bytes: &[u8], rules: &ArtRules) -> Option<Prepared> {
-    let format = image::guess_format(bytes).ok()?;
-    let img = image::load_from_memory_with_format(bytes, format).ok()?;
-    let (width, height) = (img.width(), img.height());
+    let reader = || {
+        image::ImageReader::new(std::io::Cursor::new(bytes))
+            .with_guessed_format()
+            .ok()
+    };
+    let (width, height) = reader()?.into_dimensions().ok()?;
     if width < rules.min_width {
         return None;
     }
@@ -46,6 +51,11 @@ pub fn prepare(bytes: &[u8], rules: &ArtRules) -> Option<Prepared> {
             resized: false,
         });
     }
+    let mut decoder = reader()?;
+    let mut limits = image::Limits::default();
+    limits.max_alloc = Some(MAX_DECODE_BYTES);
+    decoder.limits(limits);
+    let img = decoder.decode().ok()?;
     let new_height =
         ((f64::from(height) * f64::from(rules.max_width) / f64::from(width)).round() as u32).max(1);
     // JPEG has no alpha channel: a transparent PNG is flattened to RGB, or
@@ -62,6 +72,31 @@ pub fn prepare(bytes: &[u8], rules: &ArtRules) -> Option<Prepared> {
         bytes: out,
         resized: true,
     })
+}
+
+/// The most a cover may take decoded: an 8000×8000 RGBA image, well past any
+/// real cover, and a fraction of what one hostile file could ask for.
+const MAX_DECODE_BYTES: u64 = 256 * 1024 * 1024;
+
+/// The most a fetched cover may weigh: far past a real one, short of what a
+/// misbehaving server could send.
+pub(crate) const MAX_FETCH_BYTES: usize = 64 * 1024 * 1024;
+
+/// `resp`'s body, or `None` if it is larger than `max` bytes or fails to
+/// arrive. Read a chunk at a time, so a body too large is dropped before it
+/// is all in memory.
+pub(crate) async fn read_capped(mut resp: reqwest::Response, max: usize) -> Option<Vec<u8>> {
+    if resp.content_length().is_some_and(|n| n > max as u64) {
+        return None;
+    }
+    let mut out = Vec::new();
+    while let Some(chunk) = resp.chunk().await.ok()? {
+        if out.len() + chunk.len() > max {
+            return None;
+        }
+        out.extend_from_slice(&chunk);
+    }
+    Some(out)
 }
 
 #[cfg(test)]

@@ -37,7 +37,9 @@ pub fn check(path: &Path) -> Verdict {
         &hint,
         mss,
         FormatOptions::default(),
-        MetadataOptions::default(),
+        // Decoding only: embedded pictures would be read into memory for
+        // nothing.
+        MetadataOptions::default().limit_visual_bytes(symphonia::core::common::Limit::Maximum(0)),
     ) {
         Ok(f) => f,
         Err(Error::Unsupported(what)) => return Verdict::Unchecked(what.to_string()),
