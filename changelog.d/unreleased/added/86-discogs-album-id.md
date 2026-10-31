@@ -1,1 +1,1 @@
-- **Albums matched on Discogs keep their release id.** It is written as `DISCOGS_ALBUMID`, beets' field, so `mbsync` and a re-import go back to that Discogs release instead of searching again.
+- **Albums matched on Discogs keep their release id.** It is written as `DISCOGS_ALBUMID`, so `mbsync` and a re-import go back to that Discogs release instead of searching again.
