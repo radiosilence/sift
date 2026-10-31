@@ -85,23 +85,17 @@ fn measure(path: &Path) -> Result<(EbuR128, f64), String> {
 }
 
 /// Track gains for `paths`, in order, and the album gain across them all.
-/// Tracks are measured in parallel, `workers` at a time.
+/// Tracks are measured in parallel, `workers` at a time; any track that
+/// cannot be measured fails the whole album, since its album gain would
+/// be wrong.
 pub fn album(paths: &[PathBuf], workers: usize) -> Result<(Vec<Gain>, Gain), String> {
-    let chunk = paths.len().div_ceil(workers.max(1)).max(1);
-    let measured: Vec<Result<(EbuR128, f64), String>> = std::thread::scope(|s| {
-        let handles: Vec<_> = paths
-            .chunks(chunk)
-            .map(|part| s.spawn(move || part.iter().map(|p| measure(p)).collect::<Vec<_>>()))
-            .collect();
-        handles
-            .into_iter()
-            .flat_map(|h| h.join().unwrap_or_default())
-            .collect()
-    });
+    let measured = crate::par::map(paths, workers, |p| measure(p));
     let mut meters = Vec::new();
     let mut tracks = Vec::new();
     for (path, m) in paths.iter().zip(measured) {
-        let (meter, peak) = m.map_err(|e| format!("{}: {e}", path.display()))?;
+        let (meter, peak) = m
+            .unwrap_or_else(|panic| Err(format!("the decoder panicked: {panic}")))
+            .map_err(|e| format!("{}: {e}", path.display()))?;
         let loudness = meter.loudness_global().map_err(|e| e.to_string())?;
         tracks.push(Gain {
             db: REFERENCE_LUFS - loudness,
