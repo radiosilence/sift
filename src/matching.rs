@@ -134,13 +134,16 @@ pub fn string_distance(a: &str, b: &str) -> f64 {
     let mut base = basic_distance(&a, &b);
     let mut penalty = 0.0;
     for (pattern, weight) in PATTERNS.iter() {
-        let (ca, cb) = (
-            pattern.replace_all(&a, "").into_owned(),
-            pattern.replace_all(&b, "").into_owned(),
-        );
-        if ca == a && cb == b {
+        // Most titles match none of the patterns, and a replacement that
+        // finds nothing borrows rather than copies.
+        let (ca, cb) = (pattern.replace_all(&a, ""), pattern.replace_all(&b, ""));
+        if matches!(
+            (&ca, &cb),
+            (std::borrow::Cow::Borrowed(_), std::borrow::Cow::Borrowed(_))
+        ) {
             continue;
         }
+        let (ca, cb) = (ca.into_owned(), cb.into_owned());
         let case = basic_distance(&ca, &cb);
         let delta = (base - case).max(0.0);
         if delta == 0.0 {

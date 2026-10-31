@@ -94,8 +94,15 @@ impl MusicBrainz {
     }
 
     async fn fetch(&self, path: &str, query: &[(&str, &str)]) -> Result<bytes::Bytes, MbError> {
-        // The gate is held for the whole exchange, waits included, so a
-        // refusal slows every request from here and not just this one.
+        // The gate is held from the first wait to the response's headers,
+        // retries included, so a refusal slows every request from here and
+        // not just this one. The body is read after it is let go: the
+        // service counts requests, and a slow body need not hold up the next.
+        let resp = self.send(path, query).await?;
+        Ok(resp.error_for_status()?.bytes().await?)
+    }
+
+    async fn send(&self, path: &str, query: &[(&str, &str)]) -> Result<reqwest::Response, MbError> {
         let mut gate = self.gate.lock().await;
         let mut attempt = 0;
         loop {
@@ -121,7 +128,7 @@ impl MusicBrainz {
                 }
                 Ok(resp) => {
                     gate.succeeded(resp.headers());
-                    return Ok(resp.error_for_status()?.bytes().await?);
+                    return Ok(resp);
                 }
                 Err(e) if e.is_timeout() || e.is_connect() => (backoff, MbError::Http(e)),
                 Err(e) => return Err(e.into()),
