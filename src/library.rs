@@ -301,7 +301,8 @@ pub struct ScanReport {
     pub changed: usize,
     pub removed: usize,
     pub unchanged: usize,
-    /// Files that are audio by extension but could not be read, with why.
+    /// Files that are audio by extension but could not be read, and folders
+    /// under the root that could not be listed, with why.
     pub failed: Vec<(PathBuf, String)>,
 }
 
@@ -374,18 +375,43 @@ fn mtime_nanos(meta: &std::fs::Metadata) -> i64 {
         .unwrap_or_default()
 }
 
+/// How long a scratch copy may sit before it counts as left by an edit
+/// that never finished rather than one still running.
+const STALE_SCRATCH: Duration = Duration::from_secs(3600);
+
 /// Every audio file under `root`, skipping hidden entries (`.part` downloads,
-/// macOS `._` resource forks, `.Trash`).
-fn audio_files(root: &Path) -> Result<Vec<PathBuf>, LibraryError> {
+/// macOS `._` resource forks, `.Trash`), and the directories below `root`
+/// that could not be read, with why. A scratch copy left by an interrupted
+/// tag write or transfer is removed on the way.
+fn audio_files(root: &Path, stale: Duration) -> Result<Walk, LibraryError> {
     let mut out = Vec::new();
+    let mut unread = Vec::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
-        let entries = std::fs::read_dir(&dir).map_err(|e| LibraryError::Io(dir.clone(), e))?;
-        for entry in entries.flatten() {
-            if entry.file_name().to_string_lossy().starts_with('.') {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) if dir == root => return Err(LibraryError::Io(dir, e)),
+            // Gone since it was listed (an album moved mid-scan), or not ours
+            // to read: the rest of the library is still scanned.
+            Err(e) => {
+                unread.push((dir.clone(), format!("{}: {e}", dir.display())));
                 continue;
             }
+        };
+        for entry in entries.flatten() {
             let path = entry.path();
+            if entry.file_name().to_string_lossy().starts_with('.') {
+                if crate::paths::is_scratch(&path)
+                    && entry
+                        .metadata()
+                        .ok()
+                        .and_then(|m| crate::paths::scratch_age(&m))
+                        .is_some_and(|age| age > stale)
+                {
+                    let _ = std::fs::remove_file(&path);
+                }
+                continue;
+            }
             match entry.file_type() {
                 Ok(t) if t.is_dir() => stack.push(path),
                 Ok(t) if t.is_file() && meta::is_audio(&path) => out.push(path),
@@ -393,7 +419,38 @@ fn audio_files(root: &Path) -> Result<Vec<PathBuf>, LibraryError> {
             }
         }
     }
-    Ok(out)
+    Ok(Walk { files: out, unread })
+}
+
+struct Walk {
+    files: Vec<PathBuf>,
+    unread: Vec<(PathBuf, String)>,
+}
+
+/// Rows keyed by a file's path, each of which follows the file when it moves
+/// and goes when it leaves.
+const PATH_TABLES: [&str; 4] = ["items", "checks", "lyrics_misses", "unreadable"];
+
+/// Move every row for `from` to `to`. Where `from` has a row, it replaces
+/// any stale row already at `to`; where it has none, a stale one there is
+/// left for the next scan's sweep.
+fn rename_rows(conn: &Connection, from: &Path, to: &Path) -> rusqlite::Result<()> {
+    for table in PATH_TABLES {
+        conn.prepare_cached(&format!(
+            "UPDATE OR REPLACE {table} SET path = ?2 WHERE path = ?1"
+        ))?
+        .execute(params![from.to_string_lossy(), to.to_string_lossy()])?;
+    }
+    Ok(())
+}
+
+/// Drop every row for `path`.
+fn forget_rows(conn: &Connection, path: &str) -> rusqlite::Result<()> {
+    for table in PATH_TABLES {
+        conn.prepare_cached(&format!("DELETE FROM {table} WHERE path = ?1"))?
+            .execute([path])?;
+    }
+    Ok(())
 }
 
 impl Library {
@@ -438,7 +495,8 @@ impl Library {
 
     /// Bring the index in line with the files under `root`: read files that
     /// are new or whose size or modification time changed, and drop rows for
-    /// files that are gone. Reads run on every core; a first scan of a large
+    /// files that are gone. Scratch copies left under `root` by interrupted
+    /// writes are removed. Reads run on every core; a first scan of a large
     /// library is bound by the disk.
     pub fn update(&mut self, root: &Path) -> Result<ScanReport, LibraryError> {
         let known: HashMap<String, (u64, i64)> = {
@@ -465,13 +523,18 @@ impl Library {
         let mut report = ScanReport::default();
         let mut seen = std::collections::HashSet::new();
         let mut to_read = Vec::new();
-        for path in audio_files(root)? {
+        let Walk { files, unread } = audio_files(root, STALE_SCRATCH)?;
+        report.failed.extend(unread.iter().cloned());
+        for path in files {
             let Some(key) = path.to_str().map(str::to_string) else {
                 let why = format!("{}: path is not valid UTF-8", path.display());
                 report.failed.push((path, why));
                 continue;
             };
+            // Listed but not stat'd this time (a NAS hiccup): still there,
+            // so nothing recorded for it is dropped.
             let Ok(m) = std::fs::metadata(&path) else {
+                seen.insert(key);
                 continue;
             };
             let stat = (m.len(), mtime_nanos(&m));
@@ -565,22 +628,36 @@ impl Library {
             tx.commit()?;
         }
 
+        // A file under `root` that the walk did not see has left, unless it
+        // is under a directory that could not be read this time.
+        let gone = |path: &str| {
+            let p = Path::new(path);
+            p.starts_with(root)
+                && !seen.contains(path)
+                && !unread.iter().any(|(dir, _)| p.starts_with(dir))
+        };
         let tx = self.conn.transaction()?;
-        {
-            let root = root.to_string_lossy();
-            let mut forget = tx.prepare("DELETE FROM unreadable WHERE path = ?1")?;
-            for path in failed.keys() {
-                if path.starts_with(root.as_ref()) && !seen.contains(path) {
-                    forget.execute([path])?;
-                }
+        for path in failed.keys() {
+            if gone(path) {
+                forget_rows(&tx, path)?;
             }
-            let mut delete = tx.prepare("DELETE FROM items WHERE path = ?1")?;
-            for path in known.keys() {
-                if path.starts_with(root.as_ref()) && !seen.contains(path) {
-                    delete.execute([path])?;
-                    report.removed += 1;
-                }
+        }
+        for path in known.keys() {
+            if gone(path) {
+                forget_rows(&tx, path)?;
+                report.removed += 1;
             }
+        }
+        // A verdict or a miss is only ever recorded for an indexed file; one
+        // whose file has left the index, however, goes with it.
+        for table in ["checks", "lyrics_misses"] {
+            tx.execute(
+                &format!(
+                    "DELETE FROM {table} WHERE NOT EXISTS
+                     (SELECT 1 FROM items i WHERE i.path = {table}.path)"
+                ),
+                [],
+            )?;
         }
         tx.commit()?;
         Ok(report)
@@ -682,49 +759,42 @@ impl Library {
 
     /// Drop a file that left the library.
     pub fn forget(&self, path: &Path) -> Result<(), LibraryError> {
-        self.conn.execute(
-            "DELETE FROM items WHERE path = ?1",
-            [path.to_string_lossy()],
-        )?;
+        let tx = self.conn.unchecked_transaction()?;
+        forget_rows(&tx, &path.to_string_lossy())?;
+        tx.commit()?;
         Ok(())
     }
 
-    /// Record that a file moved.
+    /// Record that a file moved. Its check verdict and lyrics miss move
+    /// with it: they are keyed by size and mtime, which a move keeps.
     pub fn rename(&self, from: &Path, to: &Path) -> Result<(), LibraryError> {
-        self.conn.execute(
-            "UPDATE items SET path = ?2 WHERE path = ?1",
-            params![from.to_string_lossy(), to.to_string_lossy()],
-        )?;
+        let tx = self.conn.unchecked_transaction()?;
+        rename_rows(&tx, from, to)?;
+        tx.commit()?;
         Ok(())
     }
 
-    /// Record that files moved, all at once.
+    /// [`Library::rename`] for many files, in one transaction.
     pub fn rename_all<'a>(
         &mut self,
         moves: impl IntoIterator<Item = (&'a Path, &'a Path)>,
     ) -> Result<(), LibraryError> {
         let tx = self.conn.transaction()?;
-        {
-            let mut rename = tx.prepare("UPDATE items SET path = ?2 WHERE path = ?1")?;
-            for (from, to) in moves {
-                rename.execute(params![from.to_string_lossy(), to.to_string_lossy()])?;
-            }
+        for (from, to) in moves {
+            rename_rows(&tx, from, to)?;
         }
         tx.commit()?;
         Ok(())
     }
 
-    /// Drop files that left the library, all at once.
+    /// [`Library::forget`] for many files, in one transaction.
     pub fn forget_all<'a>(
         &mut self,
         paths: impl IntoIterator<Item = &'a Path>,
     ) -> Result<(), LibraryError> {
         let tx = self.conn.transaction()?;
-        {
-            let mut forget = tx.prepare("DELETE FROM items WHERE path = ?1")?;
-            for path in paths {
-                forget.execute([path.to_string_lossy()])?;
-            }
+        for path in paths {
+            forget_rows(&tx, &path.to_string_lossy())?;
         }
         tx.commit()?;
         Ok(())
@@ -981,6 +1051,92 @@ pub(crate) mod tests {
             false,
         )
         .unwrap();
+    }
+
+    #[test]
+    fn a_scan_of_one_root_leaves_a_sibling_root_whose_name_it_prefixes() {
+        let root = tempfile::tempdir().unwrap();
+        let (music, music2) = (root.path().join("music"), root.path().join("music2"));
+        std::fs::create_dir_all(&music).unwrap();
+        std::fs::create_dir_all(&music2).unwrap();
+        tagged_wav(&music.join("x.wav"), "A", "X", "x", 1);
+        tagged_wav(&music2.join("y.wav"), "B", "Y", "y", 1);
+        let mut lib = Library::in_memory().unwrap();
+        lib.update(&music).unwrap();
+        lib.update(&music2).unwrap();
+        let r = lib.update(&music).unwrap();
+        assert_eq!(r.removed, 0);
+        assert_eq!(lib.items(&Query::default()).unwrap().len(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_folder_is_reported_and_its_rows_kept() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let locked = root.path().join("A");
+        std::fs::create_dir_all(&locked).unwrap();
+        tagged_wav(&locked.join("x.wav"), "A", "X", "x", 1);
+        tagged_wav(&root.path().join("y.wav"), "B", "Y", "y", 1);
+        let mut lib = Library::in_memory().unwrap();
+        lib.update(root.path()).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let readable = std::fs::read_dir(&locked).is_ok(); // root reads anything
+        let r = lib.update(root.path());
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if readable {
+            return;
+        }
+        let r = r.unwrap();
+        assert_eq!(r.removed, 0);
+        assert!(r.failed.iter().any(|(p, _)| p == &locked));
+        assert_eq!(lib.items(&Query::default()).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_stale_scratch_copy_is_swept_and_a_fresh_one_left() {
+        let root = tempfile::tempdir().unwrap();
+        let scratch = root.path().join(".sift-1-1.tmp");
+        std::fs::write(&scratch, b"x").unwrap();
+        // A copy carries its source's mtime: an old one says nothing.
+        std::fs::File::options()
+            .write(true)
+            .open(&scratch)
+            .unwrap()
+            .set_modified(SystemTime::now() - 2 * STALE_SCRATCH)
+            .unwrap();
+        audio_files(root.path(), STALE_SCRATCH).unwrap();
+        assert!(scratch.exists(), "made just now");
+        audio_files(root.path(), Duration::ZERO).unwrap();
+        assert!(!scratch.exists());
+    }
+
+    #[test]
+    fn a_moved_file_keeps_its_check_and_a_gone_one_loses_it() {
+        let root = tempfile::tempdir().unwrap();
+        let (a, b) = (root.path().join("a.wav"), root.path().join("b.wav"));
+        tagged_wav(&a, "A", "X", "a", 1);
+        tagged_wav(&b, "A", "X", "b", 2);
+        let mut lib = Library::in_memory().unwrap();
+        lib.update(root.path()).unwrap();
+        let items = lib.items(&Query::default()).unwrap();
+        lib.check(&items).unwrap();
+        let checked = |lib: &Library| -> Vec<String> {
+            let mut stmt = lib
+                .conn
+                .prepare("SELECT path FROM checks ORDER BY path")
+                .unwrap();
+            stmt.query_map([], |r| r.get(0))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        };
+        let c = root.path().join("c.wav");
+        std::fs::rename(&a, &c).unwrap();
+        lib.rename(&a, &c).unwrap();
+        std::fs::remove_file(&b).unwrap();
+        lib.update(root.path()).unwrap();
+        assert_eq!(checked(&lib), [c.to_string_lossy().into_owned()]);
     }
 
     #[test]
