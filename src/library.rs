@@ -502,24 +502,12 @@ impl Library {
         let workers = self.workers;
         let added = now_secs();
         for batch in to_read.chunks(BATCH) {
-            let chunk = batch.len().div_ceil(workers).max(1);
-            let results: Vec<_> = std::thread::scope(|s| {
-                let handles: Vec<_> = batch
-                    .chunks(chunk)
-                    .map(|part| {
-                        s.spawn(move || {
-                            part.iter()
-                                .map(|(p, stat, is_new)| {
-                                    (p, *stat, *is_new, meta::read(p).map_err(|e| e.to_string()))
-                                })
-                                .collect::<Vec<_>>()
-                        })
-                    })
-                    .collect();
-                handles
-                    .into_iter()
-                    .flat_map(|h| h.join().unwrap_or_default())
-                    .collect()
+            let read = crate::par::map(batch, workers, |(p, _, _)| {
+                meta::read(p).map_err(|e| e.to_string())
+            });
+            let results = batch.iter().zip(read).map(|((p, stat, is_new), r)| {
+                let r = r.unwrap_or_else(|| Err("reading this file panicked".into()));
+                (p, *stat, *is_new, r)
             });
             let tx = self.conn.transaction()?;
             {
@@ -640,22 +628,12 @@ impl Library {
         }
         let workers = self.workers;
         for batch in todo.chunks(BATCH / 10) {
-            let chunk = batch.len().div_ceil(workers).max(1);
-            let results: Vec<_> = std::thread::scope(|s| {
-                let handles: Vec<_> = batch
-                    .chunks(chunk)
-                    .map(|part| {
-                        s.spawn(move || {
-                            part.iter()
-                                .map(|i| (*i, crate::check::check(&i.track.path)))
-                                .collect::<Vec<_>>()
-                        })
-                    })
-                    .collect();
-                handles
-                    .into_iter()
-                    .flat_map(|h| h.join().unwrap_or_default())
-                    .collect()
+            let checked = crate::par::map(batch, workers, |i| crate::check::check(&i.track.path));
+            let results = batch.iter().zip(checked).map(|(i, v)| {
+                let v = v.unwrap_or_else(|| {
+                    crate::check::Verdict::Bad("the decoder panicked on this file".into())
+                });
+                (*i, v)
             });
             let tx = self.conn.transaction()?;
             for (i, v) in results {
