@@ -36,10 +36,7 @@ fn measure(path: &Path) -> Result<(EbuR128, f64), String> {
             &hint,
             mss,
             FormatOptions::default(),
-            // Decoding only: embedded pictures would be read into memory for
-            // nothing.
-            MetadataOptions::default()
-                .limit_visual_bytes(symphonia::core::common::Limit::Maximum(0)),
+            MetadataOptions::default(),
         )
         .map_err(|e| e.to_string())?;
     let track = format

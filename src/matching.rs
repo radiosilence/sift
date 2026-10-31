@@ -134,6 +134,11 @@ pub fn string_distance(a: &str, b: &str) -> f64 {
     let mut base = basic_distance(&a, &b);
     let mut penalty = 0.0;
     for (pattern, weight) in PATTERNS.iter() {
+        // Most titles match none of the patterns; finding that out costs
+        // no copies.
+        if !pattern.is_match(&a) && !pattern.is_match(&b) {
+            continue;
+        }
         let (ca, cb) = (
             pattern.replace_all(&a, "").into_owned(),
             pattern.replace_all(&b, "").into_owned(),
