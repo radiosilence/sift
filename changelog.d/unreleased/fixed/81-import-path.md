@@ -1,0 +1,1 @@
+- **Imports decode, copy and wait less.** A cover is decoded only when it must be resized, under a memory limit, and fetched images are capped at 64 MiB. A slow response no longer holds up other MusicBrainz or Discogs requests, an importer reuses one lyrics client, and tag reads and writes during enrichment run off the async runtime.
