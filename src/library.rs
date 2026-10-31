@@ -719,6 +719,12 @@ impl Library {
         let mut report = ScanReport::default();
         let mut to_read = Vec::new();
         for path in paths {
+            // The index keys files by UTF-8 path, as a scan does.
+            if path.to_str().is_none() {
+                let why = format!("{}: path is not valid UTF-8", path.display());
+                report.failed.push((path.clone(), why));
+                continue;
+            }
             let Ok(m) = std::fs::metadata(path) else {
                 self.forget(path)?;
                 report.removed += 1;
