@@ -329,7 +329,6 @@ pub(crate) fn transfer_blocking(from: &Path, to: &Path, move_file: bool) -> std:
     let from_meta = std::fs::metadata(from)?;
     let copied = std::fs::copy(from, &*tmp)?;
     let file = std::fs::File::open(&*tmp)?;
-    file.sync_all()?;
     let expected = from_meta.len();
     if copied != expected || file.metadata()?.len() != expected {
         return Err(std::io::Error::other(format!(
@@ -338,13 +337,13 @@ pub(crate) fn transfer_blocking(from: &Path, to: &Path, move_file: bool) -> std:
         )));
     }
     // A copy gets a fresh mtime; a move of the same file should never look
-    // newer than the original just because it crossed filesystems.
+    // newer than the original just because it crossed filesystems. Set
+    // through the read handle: the copy has the source's mode, which may
+    // not allow writing, and setting times needs only ownership.
     if let Ok(modified) = from_meta.modified() {
-        std::fs::File::options()
-            .write(true)
-            .open(&*tmp)?
-            .set_modified(modified)?;
+        file.set_modified(modified)?;
     }
+    file.sync_all()?;
     std::fs::rename(&*tmp, to)?;
     claim.kept = true;
     if move_file {

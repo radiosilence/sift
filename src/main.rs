@@ -205,6 +205,7 @@ async fn run() -> anyhow::Result<ExitCode> {
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::WARN)
         .with_writer(std::io::stderr)
+        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
         .without_time()
         .init();
     // Before the config: completions are generated where there may be none.

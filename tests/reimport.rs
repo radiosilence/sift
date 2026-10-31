@@ -347,7 +347,10 @@ async fn an_import_that_fails_part_way_takes_back_the_copies_it_made() {
         return; // running as root, which writes anything
     }
     let result = importer(&lib).await.import(&src, Some("rel")).await;
-    assert!(result.is_err(), "{result:?}");
+    assert!(
+        matches!(result, Err(sift::ImportError::Meta(_))),
+        "the second track's tag write fails: {result:?}"
+    );
     assert_eq!(
         walk(&lib),
         Vec::<std::path::PathBuf>::new(),
