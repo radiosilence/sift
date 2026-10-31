@@ -9,8 +9,9 @@ use std::time::Duration;
 
 use lofty::config::{ParseOptions, WriteOptions};
 use lofty::file::{AudioFile, TaggedFileExt};
+use lofty::ogg::VorbisComments;
 use lofty::picture::{MimeType, Picture, PictureType};
-use lofty::tag::{Accessor, ItemKey, ItemValue, Tag, TagExt, TagItem};
+use lofty::tag::{Accessor, ItemKey, ItemValue, Tag, TagExt, TagItem, TagType};
 
 #[derive(Debug, thiserror::Error)]
 pub enum MetaError {
@@ -327,14 +328,21 @@ fn edit_at(
     repair_id3v2_languages(target, path)?;
     let mut file = probe(target, path)?.read().map_err(lofty(path))?;
     f(&mut file)?;
-    match scope {
-        Scope::Primary => file
-            .tag(file.primary_tag_type())
-            .ok_or_else(|| MetaError::NoTag(path.to_path_buf()))?
-            .save_to_path(target, WriteOptions::default()),
-        Scope::All => file.save_to_path(target, WriteOptions::default()),
+    let types: Vec<TagType> = match scope {
+        Scope::Primary => vec![file.primary_tag_type()],
+        Scope::All => file
+            .tags()
+            .iter()
+            .map(|t| t.tag_type())
+            .filter(|t| file.tag_support(*t).is_writable())
+            .collect(),
+    };
+    for tag_type in types {
+        let tag = file
+            .remove(tag_type)
+            .ok_or_else(|| MetaError::NoTag(path.to_path_buf()))?;
+        save(tag, target).map_err(lofty(path))?;
     }
-    .map_err(lofty(path))?;
     if let Some(modified) = mtime {
         std::fs::File::options()
             .write(true)
@@ -343,6 +351,18 @@ fn edit_at(
             .map_err(lofty(path))?;
     }
     Ok(())
+}
+
+/// Save `tag` to `target`. A Vorbis comment block goes through lofty's own
+/// type, which keeps the comments lofty has no generic key for (beets'
+/// `DISCOGS_ALBUMID`, `ACOUSTID_ID`, anyone's custom fields); saved as a
+/// generic tag, it would write only the keys it knows.
+fn save(tag: Tag, target: &Path) -> Result<(), lofty::error::LoftyError> {
+    if tag.tag_type() == TagType::VorbisComments {
+        VorbisComments::from(tag).save_to_path(target, WriteOptions::default())
+    } else {
+        tag.save_to_path(target, WriteOptions::default())
+    }
 }
 
 /// `target` opened as lofty would open `path`: a scratch copy's name says
