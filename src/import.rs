@@ -1317,8 +1317,15 @@ impl Importer {
                             journal.transfer(from, to, true)?;
                         }
                     } else {
-                        journal.transfer(from, to, false)?;
-                        write(to, tags)?;
+                        // Tagged before it takes its name: one copy, and
+                        // never seen in the library untagged.
+                        journal.copy_tagged(from, to, |tmp| -> Result<bool, ImportError> {
+                            if meta::unchanged_at(tmp, to, tags, cover.as_deref()) {
+                                return Ok(true);
+                            }
+                            meta::write_at(tmp, to, tags, cover.as_deref())?;
+                            Ok(preserve_mtime)
+                        })?;
                     }
                 }
                 // A re-imported album that changed directory takes its
