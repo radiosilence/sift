@@ -346,7 +346,7 @@ impl Scratch {
     }
 
     /// Sync the copy and rename it over `path`.
-    fn replace(self, path: &Path, original: &std::fs::Metadata) -> Result<(), MetaError> {
+    fn replace(mut self, path: &Path, original: &std::fs::Metadata) -> Result<(), MetaError> {
         let file = std::fs::File::open(&self.0).map_err(lofty(path))?;
         // Copies belong to whoever made them; best effort, as only root may
         // give a file away.
@@ -359,7 +359,7 @@ impl Scratch {
         let _ = original;
         file.sync_all().map_err(lofty(path))?;
         std::fs::rename(&self.0, path).map_err(lofty(path))?;
-        std::mem::forget(self);
+        self.0 = PathBuf::new();
         if let Some(dir) = path.parent()
             && let Ok(dir) = std::fs::File::open(dir)
         {
@@ -371,6 +371,9 @@ impl Scratch {
 
 impl Drop for Scratch {
     fn drop(&mut self) {
+        if self.0.as_os_str().is_empty() {
+            return;
+        }
         let _ = std::fs::remove_file(&self.0);
     }
 }
