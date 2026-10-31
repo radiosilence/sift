@@ -259,9 +259,10 @@ enum Scope {
 /// split it into two files with different tags. Such a file keeps the risk
 /// of an interrupted write.
 ///
-/// An edit that finds the file replaced or moved before its rename (by
-/// another edit, or by the album being moved) fails rather than write: the
-/// other change is not lost, and no copy reappears at the old path.
+/// Just before the rename, the file is checked to be the one copied: one
+/// replaced by another edit, or moved away with its album, fails the edit
+/// rather than being overwritten or reappearing at the old path. A change
+/// in the moment between that check and the rename is not caught.
 ///
 /// Where the folder cannot be written but the file can, there is nowhere
 /// to make the copy, and the file is edited in place, as a linked one is.
