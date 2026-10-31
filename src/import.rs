@@ -126,7 +126,7 @@ async fn set_aside(dir: &Path, root: &Path, bin: &Path) -> Result<PathBuf, Impor
         dest = bin.join(rel).with_file_name(name);
     }
     for entry in std::fs::read_dir(dir)?.flatten() {
-        if entry.file_type().is_ok_and(|t| t.is_file()) {
+        if entry.file_type().is_ok_and(|t| t.is_file()) && !meta::is_scratch(&entry.path()) {
             paths::transfer(&entry.path(), &dest.join(entry.file_name()), true).await?;
         }
     }
@@ -420,6 +420,15 @@ impl Importer {
     /// not listed.
     pub async fn credit_plan(&self, dir: &Path, known: &Known) -> Result<CreditPlan, ImportError> {
         let tracks = read_dir(dir).await?;
+        self.credit_plan_for(dir, &tracks, known).await
+    }
+
+    async fn credit_plan_for(
+        &self,
+        dir: &Path,
+        tracks: &[Track],
+        known: &Known,
+    ) -> Result<CreditPlan, ImportError> {
         let mut out = CreditPlan::default();
         let pending = |t: &Track| t.artists.is_empty() || t.album_artists.is_empty();
         if !tracks.iter().any(pending) {
@@ -502,13 +511,12 @@ impl Importer {
     /// an import: album and track gain, genres from MusicBrainz when the
     /// album has none, and lyrics for tracks without them; and each artist
     /// on a collaboration credited one by one ([`Importer::credit`]). Each
-    /// is written only to its own tags, and each failure is reported rather
-    /// than stopping the rest. Each file is written once, with everything
-    /// found for it; a file that cannot be written is reported with what it
-    /// was not given.
+    /// is written only to its own tags. Each file is written once, with
+    /// everything found for it; a file that cannot be written is reported
+    /// with what it was not given, and the rest are still written.
     pub async fn enrich(&self, dir: &Path, known: &Known) -> Result<Enriched, ImportError> {
-        let credits = self.credit_plan(dir, known).await?;
         let tracks = read_dir(dir).await?;
+        let credits = self.credit_plan_for(dir, &tracks, known).await?;
         let mut out = Enriched {
             problems: credits.problems,
             ..Enriched::default()
@@ -1619,7 +1627,12 @@ fn companions(from: &Path, to: &Path) -> Vec<Companion> {
     };
     let mut out: Vec<Companion> = entries
         .flatten()
-        .filter(|e| e.file_type().is_ok_and(|t| t.is_file()) && !meta::is_audio(&e.path()))
+        .filter(|e| {
+            let path = e.path();
+            e.file_type().is_ok_and(|t| t.is_file())
+                && !meta::is_audio(&path)
+                && !meta::is_scratch(&path)
+        })
         .map(|e| {
             let dest = to.join(e.file_name());
             Companion {

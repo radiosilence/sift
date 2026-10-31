@@ -254,9 +254,10 @@ enum Scope {
 /// is the edit's own unless `keep_mtime`, since the index notices a change
 /// by size and modification time.
 ///
-/// A file with more than one hard link is edited in place instead: it is
-/// shared (a seeding copy, say), and a rename would split it into two files
-/// with different tags. Such a file keeps the risk of an interrupted write.
+/// A symlink, or a file with more than one hard link, is edited in place
+/// instead: the file is shared (a seeding copy, say), and a rename would
+/// split it into two files with different tags. Such a file keeps the risk
+/// of an interrupted write.
 ///
 /// Two edits of one file at once no longer damage it, but the later rename
 /// wins and the earlier edit is lost.
@@ -267,15 +268,16 @@ fn edit(
     f: impl FnOnce(&mut lofty::file::TaggedFile) -> Result<(), MetaError>,
 ) -> Result<(), MetaError> {
     raise_allocation_limit();
+    let link = std::fs::symlink_metadata(path).map_err(lofty(path))?;
     let original = std::fs::metadata(path).map_err(lofty(path))?;
     let mtime = keep_mtime.then(|| original.modified().ok()).flatten();
     #[cfg(unix)]
-    let shared = std::os::unix::fs::MetadataExt::nlink(&original) > 1;
+    let linked = std::os::unix::fs::MetadataExt::nlink(&original) > 1;
     #[cfg(not(unix))]
-    let shared = false;
-    if shared {
+    let linked = false;
+    if linked || link.file_type().is_symlink() {
         tracing::warn!(
-            "{} has other hard links; its tags are written in place",
+            "{} is linked from elsewhere; its tags are written in place",
             path.display()
         );
         return contained(path, || edit_at(path, path, scope, mtime, f));
@@ -332,6 +334,14 @@ fn edit_at(
 /// A copy of a file beside it, removed when dropped unless it has replaced
 /// the original.
 struct Scratch(PathBuf);
+
+/// Whether `path` is the copy an edit in progress writes to. It belongs to
+/// that edit, so it never moves with the album's other files.
+pub(crate) fn is_scratch(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.starts_with(".sift-") && n.ends_with(".tmp"))
+}
 
 impl Scratch {
     fn beside(path: &Path) -> Result<Self, MetaError> {
@@ -517,9 +527,6 @@ pub struct Edit<'a> {
 pub fn apply(path: &Path, e: &Edit) -> Result<(), MetaError> {
     edit(path, Scope::Primary, false, |file| {
         let tag = primary(file, path)?;
-        if let Some(credits) = e.credits {
-            set_credits(tag, credits, true);
-        }
         if let Some((track, album)) = e.replaygain {
             for (key, value) in [
                 (ItemKey::ReplayGainTrackGain, format!("{:.2} dB", track.db)),
@@ -532,6 +539,11 @@ pub fn apply(path: &Path, e: &Edit) -> Result<(), MetaError> {
             }
         }
         set_tag(tag, e.changes);
+        // After the changes: an artist change settles a repeated `ARTIST`
+        // into `ARTISTS`, which would otherwise undo the credits.
+        if let Some(credits) = e.credits {
+            set_credits(tag, credits, true);
+        }
         if let Some(lyrics) = e.lyrics {
             tag.remove_key(ItemKey::Lyrics);
             tag.insert_text(ItemKey::Lyrics, lyrics.to_string());
@@ -1243,7 +1255,6 @@ mod tests {
         assert_eq!(read(&path).unwrap().artists, ["A", "B"]);
     }
 
-    #[test]
     #[cfg(unix)]
     #[test]
     fn an_edit_replaces_the_file_whole_and_leaves_nothing_beside_it() {
@@ -1280,6 +1291,24 @@ mod tests {
             std::fs::metadata(&seed).unwrap().ino()
         );
         assert!(has_lyrics(&seed));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_is_written_through_not_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("seed.wav");
+        let link = dir.path().join("a.wav");
+        crate::library::tests::wav(&target, 44_100);
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        set_lyrics(&link, "la").unwrap();
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(has_lyrics(&target));
     }
 
     #[test]

@@ -119,7 +119,10 @@ pub fn plan_move(cfg: &Config, album: &Album) -> Plan {
     {
         for entry in entries.flatten() {
             let path = entry.path();
-            if !entry.file_type().is_ok_and(|t| t.is_file()) || meta::is_audio(&path) {
+            if !entry.file_type().is_ok_and(|t| t.is_file())
+                || meta::is_audio(&path)
+                || meta::is_scratch(&path)
+            {
                 continue;
             }
             let to = new_dir.join(entry.file_name());
@@ -178,10 +181,10 @@ pub async fn bin(
     let entries =
         std::fs::read_dir(&album.dir).map_err(|e| LibraryError::Io(album.dir.clone(), e))?;
     for entry in entries.flatten() {
-        if !entry.file_type().is_ok_and(|t| t.is_file()) {
+        let from = entry.path();
+        if !entry.file_type().is_ok_and(|t| t.is_file()) || meta::is_scratch(&from) {
             continue;
         }
-        let from = entry.path();
         paths::transfer(&from, &dest.join(entry.file_name()), true)
             .await
             .map_err(|e| LibraryError::Io(from.clone(), e))?;
