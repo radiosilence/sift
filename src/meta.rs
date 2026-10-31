@@ -276,10 +276,14 @@ fn edit(
     #[cfg(not(unix))]
     let linked = false;
     if linked || link.file_type().is_symlink() {
-        tracing::warn!(
-            "{} is linked from elsewhere; its tags are written in place",
-            path.display()
-        );
+        // Seeding setups link every file, so this is said once, not per file.
+        static SAID: std::sync::Once = std::sync::Once::new();
+        SAID.call_once(|| {
+            tracing::warn!(
+                "{} is linked from elsewhere; linked files have their tags written in place",
+                path.display()
+            );
+        });
         return contained(path, || edit_at(path, path, scope, mtime, f));
     }
     let tmp = Scratch::beside(path)?;
