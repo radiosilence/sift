@@ -74,8 +74,8 @@ pub fn prepare(bytes: &[u8], rules: &ArtRules) -> Option<Prepared> {
     })
 }
 
-/// The most a cover may take decoded: an 8000×8000 RGBA image, past any
-/// cover the Cover Art Archive holds, and half of `image`'s own default.
+/// The most a cover may take decoded: an 8000×8000 RGBA image, past nearly
+/// any real cover, and half of `image`'s own default.
 /// Resizing it takes roughly half as much again.
 const MAX_DECODE_BYTES: u64 = 256 * 1024 * 1024;
 
