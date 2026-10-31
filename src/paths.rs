@@ -343,6 +343,16 @@ pub(crate) fn transfer_blocking(from: &Path, to: &Path, move_file: bool) -> std:
     if let Ok(modified) = from_meta.modified() {
         file.set_modified(modified)?;
     }
+    // A copy filed into the library is the library's to tag: a source
+    // made read-only (a share, a finished download) is given back its
+    // owner's write permission. A move keeps the file as it was.
+    #[cfg(unix)]
+    if !move_file {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = from_meta.permissions();
+        perms.set_mode(perms.mode() | 0o200);
+        file.set_permissions(perms)?;
+    }
     file.sync_all()?;
     std::fs::rename(&*tmp, to)?;
     claim.kept = true;
@@ -357,7 +367,13 @@ pub(crate) fn transfer_blocking(from: &Path, to: &Path, move_file: bool) -> std:
         // A source that cannot be removed is still whole: the move did not
         // happen, so the copy goes rather than leave the file in two places.
         if let Err(e) = std::fs::remove_file(from) {
-            let _ = std::fs::remove_file(to);
+            if std::fs::remove_file(to).is_err() {
+                tracing::error!(
+                    "{} could not be moved and is now also at {}",
+                    from.display(),
+                    to.display()
+                );
+            }
             return Err(e);
         }
     }
@@ -413,6 +429,15 @@ impl Journal {
             };
             if undone.is_err() {
                 stuck.push(to);
+                continue;
+            }
+            // The album's folder, and its artist's, made for this change and
+            // empty again; a folder holding anything stays.
+            if let Some(dir) = to.parent()
+                && std::fs::remove_dir(dir).is_ok()
+                && let Some(parent) = dir.parent()
+            {
+                let _ = std::fs::remove_dir(parent);
             }
         }
         stuck

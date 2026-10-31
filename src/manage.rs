@@ -140,25 +140,33 @@ pub fn plan_move(cfg: &Config, album: &Album) -> Plan {
 /// directory is only ever removed empty. A move that fails puts back the
 /// ones made before it, so the album stays whole where it was.
 pub async fn execute(lib: &mut Library, album: &Album, moves: &[Move]) -> Result<(), LibraryError> {
-    let (moves, dir) = (moves.to_vec(), album.dir.clone());
-    let moved = tokio::task::spawn_blocking(move || {
+    let owned = moves.to_vec();
+    let journal = tokio::task::spawn_blocking(move || {
         let mut journal = paths::Journal::default();
-        for m in &moves {
+        for m in &owned {
             journal
                 .transfer(&m.from, &m.to, true)
                 .map_err(|e| LibraryError::Io(m.from.clone(), e))?;
         }
-        journal.commit();
-        if std::fs::remove_dir(&dir).is_ok()
-            && let Some(parent) = dir.parent()
-        {
-            let _ = std::fs::remove_dir(parent);
-        }
-        Ok::<_, LibraryError>(moves)
+        Ok::<_, LibraryError>(journal)
     })
     .await
     .expect("move panicked")?;
-    lib.rename_all(moved.iter().map(|m| (m.from.as_path(), m.to.as_path())))
+    // The index follows before the moves are kept: if it cannot, the
+    // journal puts the files back and both still agree.
+    lib.rename_all(moves.iter().map(|m| (m.from.as_path(), m.to.as_path())))?;
+    journal.commit();
+    remove_emptied(&album.dir);
+    Ok(())
+}
+
+/// Remove `dir`, and then its parent, each only if empty.
+fn remove_emptied(dir: &Path) {
+    if std::fs::remove_dir(dir).is_ok()
+        && let Some(parent) = dir.parent()
+    {
+        let _ = std::fs::remove_dir(parent);
+    }
 }
 
 /// Move an album into `bin`, at its path relative to the library root, and
@@ -188,7 +196,7 @@ pub async fn bin(
         ));
     }
     let (dir, to) = (album.dir.clone(), dest.clone());
-    let moved = tokio::task::spawn_blocking(move || {
+    let journal = tokio::task::spawn_blocking(move || {
         let entries = std::fs::read_dir(&dir).map_err(|e| LibraryError::Io(dir.clone(), e))?;
         let mut journal = paths::Journal::default();
         for entry in entries.flatten() {
@@ -200,21 +208,13 @@ pub async fn bin(
                 .transfer(&from, &to.join(entry.file_name()), true)
                 .map_err(|e| LibraryError::Io(from.clone(), e))?;
         }
-        let moved: Vec<PathBuf> = journal
-            .moves()
-            .map(|(from, _)| from.to_path_buf())
-            .collect();
-        journal.commit();
-        if std::fs::remove_dir(&dir).is_ok()
-            && let Some(parent) = dir.parent()
-        {
-            let _ = std::fs::remove_dir(parent);
-        }
-        Ok::<_, LibraryError>(moved)
+        Ok::<_, LibraryError>(journal)
     })
     .await
     .expect("move panicked")?;
-    lib.forget_all(moved.iter().map(PathBuf::as_path))?;
+    lib.forget_all(journal.moves().map(|(from, _)| from))?;
+    journal.commit();
+    remove_emptied(&album.dir);
     Ok(dest)
 }
 
