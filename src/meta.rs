@@ -308,10 +308,7 @@ fn edit_at(
     f: impl FnOnce(&mut lofty::file::TaggedFile) -> Result<(), MetaError>,
 ) -> Result<(), MetaError> {
     repair_id3v2_languages(target, path)?;
-    let mut file = lofty::probe::Probe::open(target)
-        .map_err(lofty(path))?
-        .read()
-        .map_err(lofty(path))?;
+    let mut file = probe(target, path)?.read().map_err(lofty(path))?;
     f(&mut file)?;
     match scope {
         Scope::Primary => file
@@ -329,6 +326,19 @@ fn edit_at(
             .map_err(lofty(path))?;
     }
     Ok(())
+}
+
+/// `target` opened as lofty would open `path`: a scratch copy's name says
+/// nothing of its type, and lofty takes the type from the extension.
+fn probe(
+    target: &Path,
+    path: &Path,
+) -> Result<lofty::probe::Probe<std::io::BufReader<std::fs::File>>, MetaError> {
+    let probe = lofty::probe::Probe::open(target).map_err(lofty(path))?;
+    Ok(match lofty::file::FileType::from_path(path) {
+        Some(ft) => probe.set_file_type(ft),
+        None => probe,
+    })
 }
 
 /// A copy of a file beside it, removed when dropped unless it has replaced
@@ -998,8 +1008,7 @@ fn repair_id3v2_languages(target: &Path, path: &Path) -> Result<(), MetaError> {
     use lofty::id3::v2::Frame;
     use lofty::mpeg::MpegFile;
     use lofty::tag::items::UNKNOWN_LANGUAGE;
-    let is_mpeg = lofty::probe::Probe::open(target)
-        .map_err(lofty(path))?
+    let is_mpeg = probe(target, path)?
         .guess_file_type()
         .map_err(lofty(path))?
         .file_type()
