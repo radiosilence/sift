@@ -1,0 +1,1 @@
+- **Copying an album into the library writes each track once.** The tags go into the copy before it takes its name, which halves the disk work on filesystems without cloning and keeps a library scan from catching a track untagged.
