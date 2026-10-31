@@ -280,15 +280,63 @@ impl Pattern {
     }
 }
 
-fn compare(a: Option<Value>, b: Option<Value>) -> std::cmp::Ordering {
-    use std::cmp::Ordering;
-    match (a, b) {
-        (Some(Value::Number(a)), Some(Value::Number(b))) => {
-            a.partial_cmp(&b).unwrap_or(Ordering::Equal)
+/// A field's value as sorting compares it, worked out once per row rather
+/// than on every comparison: two numbers by value, anything else by its
+/// text without case, and a missing value first.
+struct SortKey {
+    number: Option<f64>,
+    text: Option<String>,
+}
+
+impl SortKey {
+    fn of(v: Option<Value>) -> Self {
+        Self {
+            number: match &v {
+                Some(Value::Number(n)) => Some(*n),
+                _ => None,
+            },
+            text: v.map(|v| v.text().to_lowercase()),
         }
-        (Some(a), Some(b)) => a.text().to_lowercase().cmp(&b.text().to_lowercase()),
-        (a, b) => a.is_some().cmp(&b.is_some()),
     }
+
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        match (self.number, other.number, &self.text, &other.text) {
+            (Some(a), Some(b), _, _) => a.partial_cmp(&b).unwrap_or(std::cmp::Ordering::Equal),
+            (_, _, Some(a), Some(b)) => a.cmp(b),
+            _ => self.text.is_some().cmp(&other.text.is_some()),
+        }
+    }
+}
+
+/// Sort `rows` by `keys`, each a field and whether it ascends.
+fn sort_by_fields<T>(
+    rows: Vec<T>,
+    keys: &[(String, bool)],
+    field: impl Fn(&T, &str) -> Option<Value>,
+) -> Vec<T> {
+    let mut keyed: Vec<(Vec<SortKey>, T)> = rows
+        .into_iter()
+        .map(|r| {
+            (
+                keys.iter()
+                    .map(|(f, _)| SortKey::of(field(&r, f)))
+                    .collect(),
+                r,
+            )
+        })
+        .collect();
+    keyed.sort_by(|(a, _), (b, _)| {
+        a.iter()
+            .zip(b)
+            .zip(keys)
+            .map(|((a, b), (_, asc))| {
+                let o = a.cmp(b);
+                if *asc { o } else { o.reverse() }
+            })
+            .find(|o| o.is_ne())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    keyed.into_iter().map(|(_, r)| r).collect()
 }
 
 /// Beets' default order: by album artist, album, disc and track.
@@ -559,9 +607,52 @@ impl Library {
             seen.insert(key);
         }
 
-        // Read and commit a batch at a time, so memory stays flat however
-        // large the library, and an interrupted first scan keeps what it
-        // had read.
+        self.read_into(&to_read, &mut report)?;
+
+        // A file under `root` that the walk did not see has left, unless it
+        // is under a directory that could not be read this time.
+        let gone = |path: &str| {
+            let p = Path::new(path);
+            p.starts_with(root)
+                && !seen.contains(path)
+                && !unread.iter().any(|(dir, _)| p.starts_with(dir))
+        };
+        let tx = self.conn.transaction()?;
+        for path in failed.keys() {
+            if gone(path) {
+                forget_rows(&tx, path)?;
+            }
+        }
+        for path in known.keys() {
+            if gone(path) {
+                forget_rows(&tx, path)?;
+                report.removed += 1;
+            }
+        }
+        // A verdict or a miss is only ever recorded for an indexed file; one
+        // whose file has left the index, however, goes with it.
+        for table in ["checks", "lyrics_misses"] {
+            tx.execute(
+                &format!(
+                    "DELETE FROM {table} WHERE NOT EXISTS
+                     (SELECT 1 FROM items i WHERE i.path = {table}.path)"
+                ),
+                [],
+            )?;
+        }
+        tx.commit()?;
+        Ok(report)
+    }
+
+    /// Read each `(file, (size, mtime), is new)` and record what it holds,
+    /// or why it could not be read. A batch at a time is read and
+    /// committed, so memory stays flat however large the library, and an
+    /// interrupted first scan keeps what it had read.
+    fn read_into(
+        &mut self,
+        to_read: &[(PathBuf, (u64, i64), bool)],
+        report: &mut ScanReport,
+    ) -> Result<(), LibraryError> {
         let workers = self.workers;
         let added = now_secs();
         for batch in to_read.chunks(BATCH) {
@@ -628,38 +719,48 @@ impl Library {
             tx.commit()?;
         }
 
-        // A file under `root` that the walk did not see has left, unless it
-        // is under a directory that could not be read this time.
-        let gone = |path: &str| {
-            let p = Path::new(path);
-            p.starts_with(root)
-                && !seen.contains(path)
-                && !unread.iter().any(|(dir, _)| p.starts_with(dir))
-        };
-        let tx = self.conn.transaction()?;
-        for path in failed.keys() {
-            if gone(path) {
-                forget_rows(&tx, path)?;
+        Ok(())
+    }
+
+    /// Read each of `paths` again after sift changed them, without walking
+    /// the library. A path no longer there is dropped.
+    pub fn refresh(&mut self, paths: &[PathBuf]) -> Result<ScanReport, LibraryError> {
+        let mut report = ScanReport::default();
+        let mut to_read = Vec::new();
+        for path in paths {
+            // The index keys files by UTF-8 path, as a scan does.
+            if path.to_str().is_none() {
+                let why = format!("{}: path is not valid UTF-8", path.display());
+                report.failed.push((path.clone(), why));
+                continue;
             }
-        }
-        for path in known.keys() {
-            if gone(path) {
-                forget_rows(&tx, path)?;
-                report.removed += 1;
+            let m = match std::fs::metadata(path) {
+                Ok(m) => m,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    self.forget(path)?;
+                    report.removed += 1;
+                    continue;
+                }
+                // Not stat'd this time, but not gone: its rows stay.
+                Err(e) => {
+                    report
+                        .failed
+                        .push((path.clone(), format!("{}: {e}", path.display())));
+                    continue;
+                }
+            };
+            let known: bool = self
+                .conn
+                .prepare_cached("SELECT EXISTS(SELECT 1 FROM items WHERE path = ?1)")?
+                .query_row([path.to_string_lossy()], |r| r.get(0))?;
+            if known {
+                report.changed += 1;
+            } else {
+                report.added += 1;
             }
+            to_read.push((path.clone(), (m.len(), mtime_nanos(&m)), !known));
         }
-        // A verdict or a miss is only ever recorded for an indexed file; one
-        // whose file has left the index, however, goes with it.
-        for table in ["checks", "lyrics_misses"] {
-            tx.execute(
-                &format!(
-                    "DELETE FROM {table} WHERE NOT EXISTS
-                     (SELECT 1 FROM items i WHERE i.path = {table}.path)"
-                ),
-                [],
-            )?;
-        }
-        tx.commit()?;
+        self.read_into(&to_read, &mut report)?;
         Ok(report)
     }
 
@@ -805,21 +906,26 @@ impl Library {
     /// re-import), whose files a scan finds as new: it keeps the date it
     /// first arrived.
     pub fn set_added(&self, dir: &Path, added: i64) -> Result<(), LibraryError> {
-        let prefix = format!("{}/", dir.to_string_lossy().trim_end_matches('/'));
+        let (from, to) = under_bounds(dir);
         self.conn.execute(
-            "UPDATE items SET added = ?2 WHERE substr(path, 1, length(?1)) = ?1",
-            params![prefix, added],
+            "UPDATE items SET added = ?3 WHERE path >= ?1 AND path < ?2",
+            params![from, to, added],
         )?;
         Ok(())
     }
 
     fn all(&self) -> Result<Vec<Item>, LibraryError> {
-        let mut stmt = self.conn.prepare(
+        self.select("", [])
+    }
+
+    /// Items whose rows match `filter`, a `WHERE` clause or nothing.
+    fn select(&self, filter: &str, args: impl rusqlite::Params) -> Result<Vec<Item>, LibraryError> {
+        let mut stmt = self.conn.prepare(&format!(
             "SELECT path, size, mtime, added, title, artist, album, albumartist, track,
                 tracktotal, disc, disctotal, date, genre, mb_trackid, mb_albumid, format,
-                bitrate, samplerate, bitdepth, length, original_date, compilation FROM items",
-        )?;
-        let rows = stmt.query_map([], |r| {
+                bitrate, samplerate, bitdepth, length, original_date, compilation FROM items {filter}"
+        ))?;
+        let rows = stmt.query_map(args, |r| {
             Ok(Item {
                 size: r.get::<_, i64>(1)? as u64,
                 mtime: r.get(2)?,
@@ -854,57 +960,71 @@ impl Library {
 
     /// Items matching `query`, in its sort order or beets' default.
     pub fn items(&self, query: &Query) -> Result<Vec<Item>, LibraryError> {
-        let mut items: Vec<Item> = self
+        let items: Vec<Item> = self
             .all()?
             .into_iter()
             .filter(|i| query.matches_item(i))
             .collect();
-        let keys = sort_keys(query);
-        items.sort_by(|a, b| {
-            keys.iter()
-                .map(|(f, asc)| {
-                    let o = compare(a.field(f), b.field(f));
-                    if *asc { o } else { o.reverse() }
-                })
-                .find(|o| o.is_ne())
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        Ok(items)
+        Ok(sort_by_fields(items, &sort_keys(query), Item::field))
     }
 
     /// Albums matching `query`: directories of items, each item in disc and
     /// track order.
     pub fn albums(&self, query: &Query) -> Result<Vec<Album>, LibraryError> {
-        let mut dirs: BTreeMap<PathBuf, Vec<Item>> = BTreeMap::new();
-        for item in self.all()? {
-            let dir = item
-                .track
-                .path
-                .parent()
-                .map(Path::to_path_buf)
-                .unwrap_or_default();
-            dirs.entry(dir).or_default().push(item);
-        }
-        let mut albums: Vec<Album> = dirs
+        let albums: Vec<Album> = group(self.all()?)
             .into_iter()
-            .map(|(dir, mut items)| {
-                items.sort_by_key(|i| (i.track.disc, i.track.track));
-                Album { dir, items }
-            })
             .filter(|a| query.matches_album(a))
             .collect();
-        let keys = sort_keys(query);
-        albums.sort_by(|a, b| {
-            keys.iter()
-                .map(|(f, asc)| {
-                    let o = compare(a.field(f), b.field(f));
-                    if *asc { o } else { o.reverse() }
-                })
-                .find(|o| o.is_ne())
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        Ok(albums)
+        Ok(sort_by_fields(albums, &sort_keys(query), Album::field))
     }
+
+    /// The albums in `dirs`, each in disc and track order, read without the
+    /// rest of the index.
+    pub fn albums_in<'a>(
+        &self,
+        dirs: impl IntoIterator<Item = &'a Path>,
+    ) -> Result<Vec<Album>, LibraryError> {
+        let mut items = Vec::new();
+        for dir in dirs {
+            let (from, to) = under_bounds(dir);
+            let found = self.select("WHERE path >= ?1 AND path < ?2", [from, to])?;
+            items.extend(
+                found
+                    .into_iter()
+                    .filter(|i| i.track.path.parent() == Some(dir)),
+            );
+        }
+        Ok(group(items))
+    }
+}
+
+/// The range of indexed paths under `dir`, at any depth: from `dir/` to just
+/// before `dir0`, as '0' follows '/'. A range the primary key answers.
+fn under_bounds(dir: &Path) -> (String, String) {
+    let dir = dir.to_string_lossy();
+    let dir = dir.trim_end_matches('/');
+    (format!("{dir}/"), format!("{dir}0"))
+}
+
+/// Items gathered into the directories that hold them, each in disc and
+/// track order.
+fn group(items: Vec<Item>) -> Vec<Album> {
+    let mut dirs: BTreeMap<PathBuf, Vec<Item>> = BTreeMap::new();
+    for item in items {
+        let dir = item
+            .track
+            .path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_default();
+        dirs.entry(dir).or_default().push(item);
+    }
+    dirs.into_iter()
+        .map(|(dir, mut items)| {
+            items.sort_by_key(|i| (i.track.disc, i.track.track));
+            Album { dir, items }
+        })
+        .collect()
 }
 
 fn sort_keys(query: &Query) -> Vec<(String, bool)> {
@@ -1137,6 +1257,26 @@ pub(crate) mod tests {
         std::fs::remove_file(&b).unwrap();
         lib.update(root.path()).unwrap();
         assert_eq!(checked(&lib), [c.to_string_lossy().into_owned()]);
+    }
+
+    #[test]
+    fn albums_in_reads_just_the_folders_named() {
+        let root = tempfile::tempdir().unwrap();
+        let (a, sibling, below) = (
+            root.path().join("A"),
+            root.path().join("A B"),
+            root.path().join("A").join("CD2"),
+        );
+        for dir in [&a, &sibling, &below] {
+            std::fs::create_dir_all(dir).unwrap();
+            tagged_wav(&dir.join("t.wav"), "A", "X", "t", 1);
+        }
+        let mut lib = Library::in_memory().unwrap();
+        lib.update(root.path()).unwrap();
+        let albums = lib.albums_in([a.as_path()]).unwrap();
+        assert_eq!(albums.len(), 1);
+        assert_eq!(albums[0].dir, a);
+        assert_eq!(albums[0].items.len(), 1);
     }
 
     #[test]

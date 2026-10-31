@@ -9,7 +9,7 @@
 //! word with a separator stays whole unless each part is an artist in its
 //! own right.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 
@@ -49,10 +49,18 @@ const MAX_PARTS: usize = 10;
 /// credit's parts are checked against.
 #[derive(Debug, Default, Clone)]
 pub struct Known {
-    artists: HashMap<String, HashSet<PathBuf>>,
+    artists: HashMap<String, Seen>,
     /// A separator a person has said joins artists in the credits being
     /// split, which then needs no artist to be known.
     separator: Option<String>,
+}
+
+/// Where an artist is credited: the first album's folder, and whether on
+/// any other. That is all [`Known::is_artist`] asks.
+#[derive(Debug, Clone)]
+struct Seen {
+    first: PathBuf,
+    elsewhere: bool,
 }
 
 impl Known {
@@ -71,11 +79,20 @@ impl Known {
     /// Record `name` as an artist on the album in `dir`.
     pub fn add(&mut self, name: &str, dir: &Path) {
         let key = normalise(name);
-        if !key.is_empty() {
-            self.artists
-                .entry(key)
-                .or_default()
-                .insert(dir.to_path_buf());
+        if key.is_empty() {
+            return;
+        }
+        match self.artists.get_mut(&key) {
+            Some(seen) => seen.elsewhere |= seen.first != dir,
+            None => {
+                self.artists.insert(
+                    key,
+                    Seen {
+                        first: dir.to_path_buf(),
+                        elsewhere: false,
+                    },
+                );
+            }
         }
     }
 
@@ -85,7 +102,7 @@ impl Known {
     pub fn is_artist(&self, name: &str, dir: &Path) -> bool {
         self.artists
             .get(&normalise(name))
-            .is_some_and(|dirs| dirs.iter().any(|d| d != dir))
+            .is_some_and(|seen| seen.elsewhere || seen.first != dir)
     }
 
     /// Every track and album artist in `albums`, as the files name them.

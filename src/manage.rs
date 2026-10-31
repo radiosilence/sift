@@ -59,23 +59,24 @@ fn tags_of(t: &Track) -> Tags {
     }
 }
 
-fn destination(cfg: &Config, t: &Track) -> Result<PathBuf, String> {
+fn destination(cfg: &Config, t: &Track, listings: &mut paths::Listings) -> Result<PathBuf, String> {
     let rel = paths::render(cfg, &tags_of(t), t, None).map_err(|e| e.to_string())?;
     let ext = t
         .path
         .extension()
         .map(|e| e.to_string_lossy().to_lowercase())
         .unwrap_or_default();
-    paths::under(&cfg.directory, &format!("{rel}.{ext}")).map_err(|e| e.to_string())
+    paths::under_with(&cfg.directory, &format!("{rel}.{ext}"), listings).map_err(|e| e.to_string())
 }
 
 /// Where the current rules put `album`.
 pub fn plan_move(cfg: &Config, album: &Album) -> Plan {
     let mut moves = Vec::new();
     let mut claimed: HashMap<String, &Path> = HashMap::new();
+    let mut listings = paths::Listings::default();
     for item in &album.items {
         let from = &item.track.path;
-        let to = match destination(cfg, &item.track) {
+        let to = match destination(cfg, &item.track, &mut listings) {
             Ok(to) => to,
             Err(e) => return Plan::Refused(format!("{}: {e}", from.display())),
         };
@@ -289,18 +290,21 @@ pub async fn modify(
     if pretend || changes.is_empty() {
         return Ok(report);
     }
-    for f in &files {
-        meta::set(f, changes).map_err(|e| LibraryError::Io(f.clone(), std::io::Error::other(e)))?;
+    for (i, f) in files.iter().enumerate() {
+        if let Err(e) = meta::set(f, changes) {
+            // The index follows the files already changed before stopping;
+            // if it cannot, the next scan catches up, and the write error is
+            // the one to report.
+            let _ = lib.refresh(&files[..i]);
+            return Err(LibraryError::Io(f.clone(), std::io::Error::other(e)));
+        }
     }
-    lib.update(&cfg.directory)?;
+    lib.refresh(&files)?;
     let dirs: std::collections::HashSet<PathBuf> = files
         .iter()
         .filter_map(|f| f.parent().map(Path::to_path_buf))
         .collect();
-    for album in lib.albums(&crate::library::Query::default())? {
-        if !dirs.contains(&album.dir) {
-            continue;
-        }
+    for album in lib.albums_in(dirs.iter().map(PathBuf::as_path))? {
         match plan_move(cfg, &album) {
             Plan::InPlace => {}
             Plan::Refused(why) => report.left.push((album.dir.clone(), why)),
@@ -543,25 +547,27 @@ pub fn duplicates<'a>(cfg: &Config, albums: &'a [Album]) -> Vec<Duplicate<'a>> {
     let mut out: Vec<Duplicate> = groups
         .into_values()
         .filter(|g| g.len() > 1)
-        .filter_map(|mut g| {
-            g.sort_by_key(|a| std::cmp::Reverse(rank(cfg, a)));
-            let keep = g[0];
-            let k = rank(cfg, keep);
+        .filter_map(|g| {
+            // Ranked once each: a rank plans the album's move, which reads
+            // the disk.
+            let mut g: Vec<_> = g.into_iter().map(|a| (rank(cfg, a), a)).collect();
+            g.sort_by_key(|(r, _)| std::cmp::Reverse(*r));
+            let (k, keep) = g[0];
             // A copy is spare only if the kept one has every track it has.
             // One release in several directories (a folder per disc) is an
             // album in pieces, which `move` puts back together; binning a
             // piece would lose music.
             let others: Vec<_> = g[1..]
                 .iter()
-                .filter(|a| a.items.iter().all(|i| contains(keep, i)))
-                .map(|a| {
-                    let reason = match why(k, rank(cfg, a)) {
+                .filter(|(_, a)| a.items.iter().all(|i| contains(keep, i)))
+                .map(|&(r, a)| {
+                    let reason = match why(k, r) {
                         "identical copy" if key(a) != key(keep) => {
                             "the same album, tagged differently"
                         }
                         reason => reason,
                     };
-                    (*a, reason)
+                    (a, reason)
                 })
                 .collect();
             (!others.is_empty()).then_some(Duplicate { keep, others })
