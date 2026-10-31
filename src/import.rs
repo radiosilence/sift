@@ -126,7 +126,7 @@ async fn set_aside(dir: &Path, root: &Path, bin: &Path) -> Result<PathBuf, Impor
         dest = bin.join(rel).with_file_name(name);
     }
     for entry in std::fs::read_dir(dir)?.flatten() {
-        if entry.file_type().is_ok_and(|t| t.is_file()) {
+        if entry.file_type().is_ok_and(|t| t.is_file()) && !meta::is_scratch(&entry.path()) {
             paths::transfer(&entry.path(), &dest.join(entry.file_name()), true).await?;
         }
     }
@@ -420,6 +420,15 @@ impl Importer {
     /// not listed.
     pub async fn credit_plan(&self, dir: &Path, known: &Known) -> Result<CreditPlan, ImportError> {
         let tracks = read_dir(dir).await?;
+        self.credit_plan_for(dir, &tracks, known).await
+    }
+
+    async fn credit_plan_for(
+        &self,
+        dir: &Path,
+        tracks: &[Track],
+        known: &Known,
+    ) -> Result<CreditPlan, ImportError> {
         let mut out = CreditPlan::default();
         let pending = |t: &Track| t.artists.is_empty() || t.album_artists.is_empty();
         if !tracks.iter().any(pending) {
@@ -502,14 +511,14 @@ impl Importer {
     /// an import: album and track gain, genres from MusicBrainz when the
     /// album has none, and lyrics for tracks without them; and each artist
     /// on a collaboration credited one by one ([`Importer::credit`]). Each
-    /// is written only to its own tags, and each failure is reported rather
-    /// than stopping the rest.
+    /// is written only to its own tags. Each file is written once, with
+    /// everything found for it; a file that cannot be written is reported
+    /// with what it was not given, and the rest are still written.
     pub async fn enrich(&self, dir: &Path, known: &Known) -> Result<Enriched, ImportError> {
-        let credited = self.credit(dir, known).await?;
         let tracks = read_dir(dir).await?;
+        let credits = self.credit_plan_for(dir, &tracks, known).await?;
         let mut out = Enriched {
-            artists: credited.artists,
-            problems: credited.problems,
+            problems: credits.problems,
             ..Enriched::default()
         };
         let paths: Vec<PathBuf> = tracks.iter().map(|t| t.path.clone()).collect();
@@ -520,33 +529,81 @@ impl Importer {
                 .await
                 .expect("replaygain panicked")
         };
-        match measured {
+        let gains: Vec<Option<_>> = match measured {
             Ok((gains, album)) => {
-                for (p, g) in paths.iter().zip(gains) {
-                    if let Err(e) = meta::set_replaygain(p, g, album) {
-                        out.problems.push(e.to_string());
-                    }
-                }
                 out.gain_db = Some(album.db);
+                gains.into_iter().map(|g| Some((g, album))).collect()
             }
-            Err(e) => out.problems.push(format!("replaygain: {e}")),
-        }
+            Err(e) => {
+                out.problems.push(format!("replaygain: {e}"));
+                vec![None; paths.len()]
+            }
+        };
 
         let found = self.lookups(&tracks).await;
         out.problems.extend(found.problems);
-        if !found.genres.is_empty() {
-            let genre = found.genres.join("; ");
-            for p in &paths {
-                if let Err(e) = meta::set(p, &[("genre".into(), Some(genre.clone()))]) {
-                    out.problems.push(e.to_string());
+        let genre: Vec<meta::Change> = if found.genres.is_empty() {
+            Vec::new()
+        } else {
+            vec![("genre".into(), Some(found.genres.join("; ")))]
+        };
+        out.genres = found.genres;
+        let lyrics = found.lyrics;
+        let files = credits.files;
+
+        let written = tokio::task::spawn_blocking(move || {
+            paths
+                .iter()
+                .zip(gains)
+                .filter_map(|(p, gain)| {
+                    let credit = files.iter().find(|c| &c.path == p);
+                    let lyric = lyrics.iter().find(|l| &l.path == p);
+                    let credits = credit.map(|c| meta::Credits {
+                        artists: &c.artists,
+                        artist_ids: &c.artist_ids,
+                        album_artists: &c.album_artists,
+                        album_artist_ids: &c.album_artist_ids,
+                    });
+                    let edit = meta::Edit {
+                        credits: credits.as_ref(),
+                        replaygain: gain,
+                        changes: &genre,
+                        lyrics: lyric.map(|l| l.text.as_str()),
+                    };
+                    let fields: Vec<&str> = [
+                        (edit.credits.is_some(), "artist credits"),
+                        (edit.replaygain.is_some(), "gain"),
+                        (!edit.changes.is_empty(), "genre"),
+                        (edit.lyrics.is_some(), "lyrics"),
+                    ]
+                    .into_iter()
+                    .filter_map(|(on, name)| on.then_some(name))
+                    .collect();
+                    if fields.is_empty() {
+                        return None;
+                    }
+                    let result = meta::apply(p, &edit)
+                        .map_err(|e| format!("{e} (not written: {})", fields.join(", ")));
+                    let artists: Vec<String> = credit
+                        .map(|c| c.artists.iter().chain(&c.album_artists).cloned().collect())
+                        .unwrap_or_default();
+                    Some((result, artists, lyric.is_some()))
+                })
+                .collect::<Vec<_>>()
+        })
+        .await
+        .expect("tag writer panicked");
+        for (result, artists, lyric) in written {
+            match result {
+                Ok(()) => {
+                    out.lyrics += usize::from(lyric);
+                    for a in artists {
+                        if !out.artists.contains(&a) {
+                            out.artists.push(a);
+                        }
+                    }
                 }
-            }
-            out.genres = found.genres;
-        }
-        for l in &found.lyrics {
-            match meta::set_lyrics(&l.path, &l.text) {
-                Ok(()) => out.lyrics += 1,
-                Err(e) => out.problems.push(e.to_string()),
+                Err(e) => out.problems.push(e),
             }
         }
         Ok(out)
@@ -1570,7 +1627,12 @@ fn companions(from: &Path, to: &Path) -> Vec<Companion> {
     };
     let mut out: Vec<Companion> = entries
         .flatten()
-        .filter(|e| e.file_type().is_ok_and(|t| t.is_file()) && !meta::is_audio(&e.path()))
+        .filter(|e| {
+            let path = e.path();
+            e.file_type().is_ok_and(|t| t.is_file())
+                && !meta::is_audio(&path)
+                && !meta::is_scratch(&path)
+        })
         .map(|e| {
             let dest = to.join(e.file_name());
             Companion {

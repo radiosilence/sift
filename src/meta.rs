@@ -233,6 +233,225 @@ pub struct Tags {
     pub mb_release_group_id: Option<String>,
 }
 
+/// Which tags an [`edit`] saves.
+#[derive(Clone, Copy)]
+enum Scope {
+    /// The primary tag only; any other tag the file carries is left as it is.
+    Primary,
+    /// Every tag the file carries.
+    All,
+}
+
+/// Change `path`'s tags through `f` without ever leaving the file half
+/// written.
+///
+/// lofty writes in place, and a tag that grows shifts all the audio after
+/// it; interrupted, that leaves the audio damaged. So the file is copied
+/// beside itself (a clone on APFS, and on Linux filesystems with reflinks),
+/// the copy is edited and synced, and it is renamed over the original: a
+/// crash leaves one whole file or the other. The copy keeps the original's
+/// mode, and its owner where the process may set it. Its modification time
+/// is the edit's own unless `keep_mtime`, since the index notices a change
+/// by size and modification time.
+///
+/// A symlink, or a file with more than one hard link, is edited in place
+/// instead: the file is shared (a seeding copy, say), and a rename would
+/// split it into two files with different tags. Such a file keeps the risk
+/// of an interrupted write.
+///
+/// Just before the rename, the file is checked to be the one copied: one
+/// replaced by another edit, or moved away with its album, fails the edit
+/// rather than being overwritten or reappearing at the old path. A change
+/// in the moment between that check and the rename is not caught.
+///
+/// Where the folder cannot be written but the file can, there is nowhere
+/// to make the copy, and the file is edited in place, as a linked one is.
+fn edit(
+    path: &Path,
+    scope: Scope,
+    keep_mtime: bool,
+    f: impl FnOnce(&mut lofty::file::TaggedFile) -> Result<(), MetaError>,
+) -> Result<(), MetaError> {
+    raise_allocation_limit();
+    let link = std::fs::symlink_metadata(path).map_err(lofty(path))?;
+    let original = std::fs::metadata(path).map_err(lofty(path))?;
+    let mtime = keep_mtime.then(|| original.modified().ok()).flatten();
+    #[cfg(unix)]
+    let linked = std::os::unix::fs::MetadataExt::nlink(&original) > 1;
+    #[cfg(not(unix))]
+    let linked = false;
+    if linked || link.file_type().is_symlink() {
+        // Seeding setups link every file, so this is said once, not per file.
+        static SAID: std::sync::Once = std::sync::Once::new();
+        SAID.call_once(|| {
+            tracing::warn!(
+                "{} is linked from elsewhere; linked files have their tags written in place",
+                path.display()
+            );
+        });
+        return contained(path, || edit_at(path, path, scope, mtime, f));
+    }
+    let tmp = match Scratch::beside(path) {
+        Ok(tmp) => tmp,
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            static SAID: std::sync::Once = std::sync::Once::new();
+            SAID.call_once(|| {
+                tracing::warn!(
+                    "cannot write in {}; files in read-only folders have their tags written in place",
+                    path.parent().unwrap_or(path).display()
+                );
+            });
+            return contained(path, || edit_at(path, path, scope, mtime, f));
+        }
+        Err(e) => return Err(lofty(path)(e)),
+    };
+    contained(path, || edit_at(&tmp.0, path, scope, mtime, f))?;
+    tmp.replace(path, &original)
+}
+
+/// `f`, with a panic inside the tag parser or writer reported as this
+/// file's error.
+fn contained(path: &Path, f: impl FnOnce() -> Result<(), MetaError>) -> Result<(), MetaError> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or_else(|_| {
+        Err(MetaError::Lofty {
+            path: path.to_path_buf(),
+            source: "the tag library panicked on this file".into(),
+        })
+    })
+}
+
+/// Read `target`, change it through `f` and save it there. Errors name
+/// `path`, the file the person knows.
+fn edit_at(
+    target: &Path,
+    path: &Path,
+    scope: Scope,
+    mtime: Option<std::time::SystemTime>,
+    f: impl FnOnce(&mut lofty::file::TaggedFile) -> Result<(), MetaError>,
+) -> Result<(), MetaError> {
+    repair_id3v2_languages(target, path)?;
+    let mut file = probe(target, path)?.read().map_err(lofty(path))?;
+    f(&mut file)?;
+    match scope {
+        Scope::Primary => file
+            .tag(file.primary_tag_type())
+            .ok_or_else(|| MetaError::NoTag(path.to_path_buf()))?
+            .save_to_path(target, WriteOptions::default()),
+        Scope::All => file.save_to_path(target, WriteOptions::default()),
+    }
+    .map_err(lofty(path))?;
+    if let Some(modified) = mtime {
+        std::fs::File::options()
+            .write(true)
+            .open(target)
+            .and_then(|f| f.set_modified(modified))
+            .map_err(lofty(path))?;
+    }
+    Ok(())
+}
+
+/// `target` opened as lofty would open `path`: a scratch copy's name says
+/// nothing of its type, and lofty takes the type from the extension.
+fn probe(
+    target: &Path,
+    path: &Path,
+) -> Result<lofty::probe::Probe<std::io::BufReader<std::fs::File>>, MetaError> {
+    let probe = lofty::probe::Probe::open(target).map_err(lofty(path))?;
+    Ok(match lofty::file::FileType::from_path(path) {
+        Some(ft) => probe.set_file_type(ft),
+        None => probe,
+    })
+}
+
+/// A copy of a file beside it, removed when dropped unless it has replaced
+/// the original.
+struct Scratch(PathBuf);
+
+/// Whether `path` is the copy an edit in progress writes to. It belongs to
+/// that edit, so it never moves with the album's other files.
+pub(crate) fn is_scratch(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.starts_with(".sift-") && n.ends_with(".tmp"))
+}
+
+impl Scratch {
+    fn beside(path: &Path) -> std::io::Result<Self> {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // Short and hidden: a name already at the length limit has no room
+        // for a suffix, and a library scan skips dotfiles.
+        let tmp = path.with_file_name(format!(".sift-{}-{n}.tmp", std::process::id()));
+        // Not claimed with `create_new` first: copying onto an existing
+        // file stops macOS cloning it.
+        let scratch = Self(tmp);
+        std::fs::copy(path, &scratch.0)?;
+        Ok(scratch)
+    }
+
+    /// Sync the copy and rename it over `path`.
+    fn replace(mut self, path: &Path, original: &std::fs::Metadata) -> Result<(), MetaError> {
+        let file = std::fs::File::open(&self.0).map_err(lofty(path))?;
+        // Copies belong to whoever made them; best effort, as only root may
+        // give a file away, though the group alone may still be set.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{MetadataExt, fchown};
+            if fchown(&file, Some(original.uid()), Some(original.gid())).is_err() {
+                let _ = fchown(&file, None, Some(original.gid()));
+            }
+        }
+        file.sync_all().map_err(lofty(path))?;
+        // The file must still be the one that was copied: one replaced by
+        // another edit, or moved away with its album, is not overwritten.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let same = std::fs::metadata(path)
+                .is_ok_and(|now| (now.dev(), now.ino()) == (original.dev(), original.ino()));
+            if !same {
+                return Err(MetaError::Lofty {
+                    path: path.to_path_buf(),
+                    source: "the file was replaced or moved while its tags were being written"
+                        .into(),
+                });
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = original;
+        std::fs::rename(&self.0, path).map_err(lofty(path))?;
+        self.0 = PathBuf::new();
+        if let Some(dir) = path.parent()
+            && let Ok(dir) = std::fs::File::open(dir)
+        {
+            let _ = dir.sync_all();
+        }
+        Ok(())
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        if self.0.as_os_str().is_empty() {
+            return;
+        }
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// The file's primary tag, created if it has none.
+fn primary<'a>(
+    file: &'a mut lofty::file::TaggedFile,
+    path: &Path,
+) -> Result<&'a mut Tag, MetaError> {
+    let tag_type = file.primary_tag_type();
+    if file.tag(tag_type).is_none() {
+        file.insert_tag(Tag::new(tag_type));
+    }
+    file.tag_mut(tag_type)
+        .ok_or_else(|| MetaError::NoTag(path.to_path_buf()))
+}
+
 /// Write `tags` (and a front cover, if given) into `path`, replacing
 /// whatever was there. With `preserve_mtime`, the file's modification time
 /// is restored afterwards, as beets' `importadded` plugin: retagging on
@@ -243,25 +462,13 @@ pub fn write(
     cover: Option<&[u8]>,
     preserve_mtime: bool,
 ) -> Result<(), MetaError> {
-    raise_allocation_limit();
-    let original_mtime = if preserve_mtime {
-        path.metadata().ok().and_then(|m| m.modified().ok())
-    } else {
-        None
-    };
-    repair_id3v2_languages(path)?;
-    let mut file = lofty::probe::Probe::open(path)
-        .map_err(lofty(path))?
-        .read()
-        .map_err(lofty(path))?;
-    let tag_type = file.primary_tag_type();
-    if file.tag(tag_type).is_none() {
-        file.insert_tag(Tag::new(tag_type));
-    }
-    let tag = file
-        .tag_mut(tag_type)
-        .ok_or_else(|| MetaError::NoTag(path.to_path_buf()))?;
+    edit(path, Scope::Primary, preserve_mtime, |file| {
+        write_tags(primary(file, path)?, tags, cover);
+        Ok(())
+    })
+}
 
+fn write_tags(tag: &mut Tag, tags: &Tags, cover: Option<&[u8]>) {
     tag.set_title(tags.title.clone());
     tag.set_artist(tags.artist.clone());
     tag.set_album(tags.album.clone());
@@ -310,16 +517,6 @@ pub fn write(
         tag.remove_picture_type(PictureType::CoverFront);
         tag.push_picture(front_cover(data));
     }
-    tag.save_to_path(path, WriteOptions::default())
-        .map_err(lofty(path))?;
-    if let Some(modified) = original_mtime {
-        std::fs::File::options()
-            .write(true)
-            .open(path)
-            .and_then(|f| f.set_modified(modified))
-            .map_err(lofty(path))?;
-    }
-    Ok(())
 }
 
 /// The multi-valued artist fields, each written one value per item: repeated
@@ -356,23 +553,55 @@ fn set_credits(tag: &mut Tag, credits: &Credits, keep_unset: bool) {
 /// Write only the multi-valued artist fields given values, leaving every
 /// other tag as it is: for crediting each artist on files already filed.
 pub fn write_credits(path: &Path, credits: &Credits) -> Result<(), MetaError> {
-    raise_allocation_limit();
-    repair_id3v2_languages(path)?;
-    let mut file = lofty::probe::Probe::open(path)
-        .map_err(lofty(path))?
-        .read()
-        .map_err(lofty(path))?;
-    let tag_type = file.primary_tag_type();
-    if file.tag(tag_type).is_none() {
-        file.insert_tag(Tag::new(tag_type));
-    }
-    let tag = file
-        .tag_mut(tag_type)
-        .ok_or_else(|| MetaError::NoTag(path.to_path_buf()))?;
-    set_credits(tag, credits, true);
-    tag.save_to_path(path, WriteOptions::default())
-        .map_err(lofty(path))?;
-    Ok(())
+    apply(
+        path,
+        &Edit {
+            credits: Some(credits),
+            ..Edit::default()
+        },
+    )
+}
+
+/// Changes to a file's primary tag, made by [`apply`] in one write. Each is
+/// left out when unset, and every other tag stays as it is.
+#[derive(Default)]
+pub struct Edit<'a> {
+    /// Only the lists given values are written, as [`write_credits`].
+    pub credits: Option<&'a Credits<'a>>,
+    /// Track gain, then album gain.
+    pub replaygain: Option<(crate::replaygain::Gain, crate::replaygain::Gain)>,
+    /// As [`set`].
+    pub changes: &'a [Change],
+    pub lyrics: Option<&'a str>,
+}
+
+/// Make every change in `e` to `path` in one write.
+pub fn apply(path: &Path, e: &Edit) -> Result<(), MetaError> {
+    edit(path, Scope::Primary, false, |file| {
+        let tag = primary(file, path)?;
+        if let Some((track, album)) = e.replaygain {
+            for (key, value) in [
+                (ItemKey::ReplayGainTrackGain, format!("{:.2} dB", track.db)),
+                (ItemKey::ReplayGainTrackPeak, format!("{:.6}", track.peak)),
+                (ItemKey::ReplayGainAlbumGain, format!("{:.2} dB", album.db)),
+                (ItemKey::ReplayGainAlbumPeak, format!("{:.6}", album.peak)),
+            ] {
+                tag.remove_key(key);
+                tag.insert_text(key, value);
+            }
+        }
+        set_tag(tag, e.changes);
+        // After the changes: an artist change settles a repeated `ARTIST`
+        // into `ARTISTS`, which would otherwise undo the credits.
+        if let Some(credits) = e.credits {
+            set_credits(tag, credits, true);
+        }
+        if let Some(lyrics) = e.lyrics {
+            tag.remove_key(ItemKey::Lyrics);
+            tag.insert_text(ItemKey::Lyrics, lyrics.to_string());
+        }
+        Ok(())
+    })
 }
 
 /// A field to set, by its beets name, or to clear with `None`.
@@ -605,23 +834,13 @@ pub fn diff(old: &Track, new: &Track) -> Vec<TagChange> {
 /// it is. [`write`] replaces everything sift knows about, which is right for
 /// an import and wrong for correcting one field of a filed album.
 pub fn set(path: &Path, changes: &[Change]) -> Result<(), MetaError> {
-    raise_allocation_limit();
-    repair_id3v2_languages(path)?;
-    let mut file = lofty::probe::Probe::open(path)
-        .map_err(lofty(path))?
-        .read()
-        .map_err(lofty(path))?;
-    let tag_type = file.primary_tag_type();
-    if file.tag(tag_type).is_none() {
-        file.insert_tag(Tag::new(tag_type));
-    }
-    let tag = file
-        .tag_mut(tag_type)
-        .ok_or_else(|| MetaError::NoTag(path.to_path_buf()))?;
-    set_tag(tag, changes);
-    tag.save_to_path(path, WriteOptions::default())
-        .map_err(lofty(path))?;
-    Ok(())
+    apply(
+        path,
+        &Edit {
+            changes,
+            ..Edit::default()
+        },
+    )
 }
 
 fn set_tag(tag: &mut Tag, changes: &[Change]) {
@@ -731,53 +950,24 @@ pub fn set_replaygain(
     track: crate::replaygain::Gain,
     album: crate::replaygain::Gain,
 ) -> Result<(), MetaError> {
-    raise_allocation_limit();
-    repair_id3v2_languages(path)?;
-    let mut file = lofty::probe::Probe::open(path)
-        .map_err(lofty(path))?
-        .read()
-        .map_err(lofty(path))?;
-    let tag_type = file.primary_tag_type();
-    if file.tag(tag_type).is_none() {
-        file.insert_tag(Tag::new(tag_type));
-    }
-    let tag = file
-        .tag_mut(tag_type)
-        .ok_or_else(|| MetaError::NoTag(path.to_path_buf()))?;
-    for (key, value) in [
-        (ItemKey::ReplayGainTrackGain, format!("{:.2} dB", track.db)),
-        (ItemKey::ReplayGainTrackPeak, format!("{:.6}", track.peak)),
-        (ItemKey::ReplayGainAlbumGain, format!("{:.2} dB", album.db)),
-        (ItemKey::ReplayGainAlbumPeak, format!("{:.6}", album.peak)),
-    ] {
-        tag.remove_key(key);
-        tag.insert_text(key, value);
-    }
-    tag.save_to_path(path, WriteOptions::default())
-        .map_err(lofty(path))?;
-    Ok(())
+    apply(
+        path,
+        &Edit {
+            replaygain: Some((track, album)),
+            ..Edit::default()
+        },
+    )
 }
 
 /// Write lyrics, leaving every other tag alone.
 pub fn set_lyrics(path: &Path, lyrics: &str) -> Result<(), MetaError> {
-    raise_allocation_limit();
-    repair_id3v2_languages(path)?;
-    let mut file = lofty::probe::Probe::open(path)
-        .map_err(lofty(path))?
-        .read()
-        .map_err(lofty(path))?;
-    let tag_type = file.primary_tag_type();
-    if file.tag(tag_type).is_none() {
-        file.insert_tag(Tag::new(tag_type));
-    }
-    let tag = file
-        .tag_mut(tag_type)
-        .ok_or_else(|| MetaError::NoTag(path.to_path_buf()))?;
-    tag.remove_key(ItemKey::Lyrics);
-    tag.insert_text(ItemKey::Lyrics, lyrics.to_string());
-    tag.save_to_path(path, WriteOptions::default())
-        .map_err(lofty(path))?;
-    Ok(())
+    apply(
+        path,
+        &Edit {
+            lyrics: Some(lyrics),
+            ..Edit::default()
+        },
+    )
 }
 
 /// Whether `path` already carries lyrics.
@@ -858,18 +1048,18 @@ pub fn pictures(path: &Path) -> Result<Vec<Embedded>, MetaError> {
         .collect())
 }
 
-/// Give every ID3v2 lyrics and comment frame in `path` whose language is
+/// Give every ID3v2 lyrics and comment frame in `target` whose language is
 /// not three ASCII letters the unknown language, `XXX`. Some taggers write
 /// a language of zero bytes; lofty reads such frames but refuses to write
 /// them back, and keeps them out of reach of the generic tag, so every
 /// change to the file would otherwise fail. Only MPEG files are checked,
-/// and the file is written only when a frame needs repair.
-fn repair_id3v2_languages(path: &Path) -> Result<(), MetaError> {
+/// and the file is written only when a frame needs repair. Errors name
+/// `path`.
+fn repair_id3v2_languages(target: &Path, path: &Path) -> Result<(), MetaError> {
     use lofty::id3::v2::Frame;
     use lofty::mpeg::MpegFile;
     use lofty::tag::items::UNKNOWN_LANGUAGE;
-    let is_mpeg = lofty::probe::Probe::open(path)
-        .map_err(lofty(path))?
+    let is_mpeg = probe(target, path)?
         .guess_file_type()
         .map_err(lofty(path))?
         .file_type()
@@ -877,7 +1067,7 @@ fn repair_id3v2_languages(path: &Path) -> Result<(), MetaError> {
     if !is_mpeg {
         return Ok(());
     }
-    let mut file = std::fs::File::open(path).map_err(lofty(path))?;
+    let mut file = std::fs::File::open(target).map_err(lofty(path))?;
     let mut mpeg = MpegFile::read_from(&mut file, ParseOptions::new()).map_err(lofty(path))?;
     let Some(tag) = mpeg.id3v2_mut() else {
         return Ok(());
@@ -896,7 +1086,7 @@ fn repair_id3v2_languages(path: &Path) -> Result<(), MetaError> {
         true
     });
     if repaired {
-        tag.save_to_path(path, WriteOptions::default())
+        tag.save_to_path(target, WriteOptions::default())
             .map_err(lofty(path))?;
     }
     Ok(())
@@ -914,32 +1104,20 @@ pub fn set_cover(path: &Path, cover: &[u8]) -> Result<(), MetaError> {
 }
 
 fn replace_pictures(path: &Path, cover: Option<&[u8]>) -> Result<(), MetaError> {
-    raise_allocation_limit();
-    repair_id3v2_languages(path)?;
-    let mut file = lofty::probe::Probe::open(path)
-        .map_err(lofty(path))?
-        .read()
-        .map_err(lofty(path))?;
-    let types: Vec<_> = file.tags().iter().map(|t| t.tag_type()).collect();
-    for t in types {
-        if let Some(tag) = file.tag_mut(t) {
-            while !tag.pictures().is_empty() {
-                tag.remove_picture(0);
+    edit(path, Scope::All, false, |file| {
+        let types: Vec<_> = file.tags().iter().map(|t| t.tag_type()).collect();
+        for t in types {
+            if let Some(tag) = file.tag_mut(t) {
+                while !tag.pictures().is_empty() {
+                    tag.remove_picture(0);
+                }
             }
         }
-    }
-    if let Some(data) = cover {
-        let tag_type = file.primary_tag_type();
-        if file.tag(tag_type).is_none() {
-            file.insert_tag(Tag::new(tag_type));
+        if let Some(data) = cover {
+            primary(file, path)?.push_picture(front_cover(data));
         }
-        file.tag_mut(tag_type)
-            .ok_or_else(|| MetaError::NoTag(path.to_path_buf()))?
-            .push_picture(front_cover(data));
-    }
-    file.save_to_path(path, WriteOptions::default())
-        .map_err(lofty(path))?;
-    Ok(())
+        Ok(())
+    })
 }
 
 #[cfg(test)]
@@ -1126,6 +1304,102 @@ mod tests {
         assert_eq!(t.date, None);
         set(&path, &[("artists".into(), Some("A; B ;".into()))]).unwrap();
         assert_eq!(read(&path).unwrap().artists, ["A", "B"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_edit_replaces_the_file_whole_and_leaves_nothing_beside_it() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.wav");
+        crate::library::tests::wav(&path, 44_100);
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        let before = std::fs::metadata(&path).unwrap();
+        set(&path, &[("title".into(), Some("T".into()))]).unwrap();
+        let after = std::fs::metadata(&path).unwrap();
+        assert_ne!(before.ino(), after.ino(), "written to a copy and renamed");
+        assert_eq!(after.mode() & 0o777, 0o640);
+        assert_eq!(read(&path).unwrap().title.as_deref(), Some("T"));
+        let names: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["a.wav"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_hard_linked_file_is_edited_in_place_and_stays_linked() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.wav");
+        let seed = dir.path().join("seed.wav");
+        crate::library::tests::wav(&path, 44_100);
+        std::fs::hard_link(&path, &seed).unwrap();
+        set(&path, &[("genre".into(), Some("Dub".into()))]).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().ino(),
+            std::fs::metadata(&seed).unwrap().ino()
+        );
+        assert_eq!(read(&seed).unwrap().genre.as_deref(), Some("Dub"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_is_written_through_not_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("seed.wav");
+        let link = dir.path().join("a.wav");
+        crate::library::tests::wav(&target, 44_100);
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        set(&link, &[("genre".into(), Some("Dub".into()))]).unwrap();
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(read(&target).unwrap().genre.as_deref(), Some("Dub"));
+    }
+
+    #[test]
+    fn a_failed_edit_leaves_the_file_and_no_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.flac");
+        std::fs::write(&path, b"not audio").unwrap();
+        assert!(set(&path, &[("title".into(), Some("T".into()))]).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"not audio");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn one_apply_writes_every_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.wav");
+        crate::library::tests::wav(&path, 44_100);
+        let gain = crate::replaygain::Gain {
+            db: -3.0,
+            peak: 0.9,
+        };
+        apply(
+            &path,
+            &Edit {
+                credits: Some(&Credits {
+                    artists: &["A".into(), "B".into()],
+                    artist_ids: &[],
+                    album_artists: &[],
+                    album_artist_ids: &[],
+                }),
+                replaygain: Some((gain, gain)),
+                changes: &[("genre".into(), Some("Dub".into()))],
+                lyrics: None,
+            },
+        )
+        .unwrap();
+        let t = read(&path).unwrap();
+        assert_eq!(t.artists, ["A", "B"]);
+        assert_eq!(t.genre.as_deref(), Some("Dub"));
+        assert!(has_album_gain(&path));
     }
 
     #[test]
