@@ -1,0 +1,1 @@
+- **Tag writes can no longer damage audio when interrupted.** Each write edits a copy of the file and renames it over the original, so a crash or a full disk leaves one whole file. Files with other hard links are still written in place, so a seeding copy stays linked. Enriching an album writes each file once instead of up to five times.
