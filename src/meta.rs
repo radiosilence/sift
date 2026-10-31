@@ -602,6 +602,27 @@ pub fn write(
     })
 }
 
+/// [`write`] into `target`, a copy on its way to `path`, read as `path`'s
+/// type. The copy is written in place: it is not yet anyone's file, so an
+/// interrupted write leaves only a copy to discard.
+pub(crate) fn write_at(
+    target: &Path,
+    path: &Path,
+    tags: &Tags,
+    cover: Option<&[u8]>,
+) -> Result<(), MetaError> {
+    raise_allocation_limit();
+    let scope = Scope::Written {
+        discogs_album_id: tags.discogs_album_id.as_deref(),
+    };
+    contained(path, || {
+        edit_at(target, path, scope, None, |file| {
+            write_tags(primary(file, path)?, tags, cover);
+            Ok(())
+        })
+    })
+}
+
 fn write_tags(tag: &mut Tag, tags: &Tags, cover: Option<&[u8]>) {
     tag.set_title(tags.title.clone());
     tag.set_artist(tags.artist.clone());
@@ -896,9 +917,15 @@ pub struct TagChange {
 /// exactly that front cover (in MP4, which has no picture types, exactly
 /// that picture). A file that cannot be read is not.
 pub fn unchanged(path: &Path, tags: &Tags, cover: Option<&[u8]>) -> bool {
+    unchanged_at(path, path, tags, cover)
+}
+
+/// [`unchanged`] for `target`, read as `path`'s type: a copy on its way to
+/// `path`, whose own name says nothing of its type.
+pub(crate) fn unchanged_at(target: &Path, path: &Path, tags: &Tags, cover: Option<&[u8]>) -> bool {
     raise_allocation_limit();
     let read = contained(path, || {
-        probe(path, path)?
+        probe(target, path)?
             .options(ParseOptions::new().read_cover_art(cover.is_some()))
             .read()
             .map_err(lofty(path))

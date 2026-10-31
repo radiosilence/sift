@@ -1003,21 +1003,10 @@ impl Importer {
                 break;
             }
         }
-        // A credit spelled differently from MusicBrainz's ("x" for "×")
-        // fails the artist phrase; the plain title by any of the artist's
-        // words still finds it, and distance decides. Only the top-scoring
-        // hits are kept: one sharing a single word of the credit scores
-        // about half, and the sort below would otherwise put it first.
-        let mut floor = 50;
-        if !hits.iter().any(|h| h.score >= floor) {
-            let _ = writeln!(log, "searching for {base:?} by any of {artist:?}");
-            hits = self.mb.search_releases_loosely(&artist, &base, 10).await?;
-            floor = 90;
-        }
         // An album usually has many pressings scoring alike; the ones with
         // as many tracks as the folder are looked up first, since the
         // lookups run out before the list does.
-        hits.retain(|h| h.score >= floor);
+        hits.retain(|h| h.score >= 50);
         hits.sort_by_key(|h| h.track_count.abs_diff(tracks.len()));
         let mut looked_up = 0;
         for hit in hits {
@@ -1335,8 +1324,15 @@ impl Importer {
                             journal.transfer(from, to, true)?;
                         }
                     } else {
-                        journal.transfer(from, to, false)?;
-                        write(to, tags, *same)?;
+                        // Tagged before it takes its name: one copy, and it
+                        // never appears under its name before it is tagged.
+                        journal.copy_tagged(from, to, |tmp| -> Result<bool, ImportError> {
+                            if *same && meta::unchanged_at(tmp, to, tags, cover.as_deref()) {
+                                return Ok(true);
+                            }
+                            meta::write_at(tmp, to, tags, cover.as_deref())?;
+                            Ok(preserve_mtime)
+                        })?;
                     }
                 }
                 // A re-imported album that changed directory takes its
