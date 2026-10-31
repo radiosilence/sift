@@ -19,12 +19,13 @@ impl Cache {
     /// background: nothing reads a response past its time to live, so
     /// without pruning the directory only grows.
     pub(crate) fn new(dir: PathBuf, prefix: &'static str, legacy: bool, keep: Duration) -> Self {
-        static PRUNED: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+        static PRUNED: std::sync::Mutex<Vec<(PathBuf, &str)>> = std::sync::Mutex::new(Vec::new());
         let first = {
             let mut pruned = PRUNED.lock().unwrap_or_else(|e| e.into_inner());
-            let first = !pruned.contains(&dir);
+            let key = (dir.clone(), prefix);
+            let first = !pruned.contains(&key);
             if first {
-                pruned.push(dir.clone());
+                pruned.push(key);
             }
             first
         };

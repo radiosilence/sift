@@ -301,7 +301,8 @@ pub struct ScanReport {
     pub changed: usize,
     pub removed: usize,
     pub unchanged: usize,
-    /// Files that are audio by extension but could not be read, with why.
+    /// Files that are audio by extension but could not be read, and folders
+    /// under the root that could not be listed, with why.
     pub failed: Vec<(PathBuf, String)>,
 }
 
@@ -430,7 +431,9 @@ struct Walk {
 /// and goes when it leaves.
 const PATH_TABLES: [&str; 4] = ["items", "checks", "lyrics_misses", "unreadable"];
 
-/// Move every row for `from` to `to`, replacing any stale row already there.
+/// Move every row for `from` to `to`. Where `from` has a row, it replaces
+/// any stale row already at `to`; where it has none, a stale one there is
+/// left for the next scan's sweep.
 fn rename_rows(conn: &Connection, from: &Path, to: &Path) -> rusqlite::Result<()> {
     for table in PATH_TABLES {
         conn.prepare_cached(&format!(
@@ -528,7 +531,10 @@ impl Library {
                 report.failed.push((path, why));
                 continue;
             };
+            // Listed but not stat'd this time (a NAS hiccup): still there,
+            // so nothing recorded for it is dropped.
             let Ok(m) = std::fs::metadata(&path) else {
+                seen.insert(key);
                 continue;
             };
             let stat = (m.len(), mtime_nanos(&m));
@@ -630,16 +636,8 @@ impl Library {
                 && !seen.contains(path)
                 && !unread.iter().any(|(dir, _)| p.starts_with(dir))
         };
-        let mut recorded: Vec<String> = Vec::new();
-        for table in ["checks", "lyrics_misses"] {
-            let mut stmt = self.conn.prepare(&format!("SELECT path FROM {table}"))?;
-            let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
-            for path in rows {
-                recorded.push(path?);
-            }
-        }
         let tx = self.conn.transaction()?;
-        for path in failed.keys().chain(&recorded) {
+        for path in failed.keys() {
             if gone(path) {
                 forget_rows(&tx, path)?;
             }
@@ -649,6 +647,14 @@ impl Library {
                 forget_rows(&tx, path)?;
                 report.removed += 1;
             }
+        }
+        // A verdict or a miss is only ever recorded for an indexed file; one
+        // whose file has left the index, however, goes with it.
+        for table in ["checks", "lyrics_misses"] {
+            tx.execute(
+                &format!("DELETE FROM {table} WHERE path NOT IN (SELECT path FROM items)"),
+                [],
+            )?;
         }
         tx.commit()?;
         Ok(report)
