@@ -787,6 +787,8 @@ impl Track {
     pub fn written(&self, tags: &Tags) -> Track {
         let text = |s: &str| (!s.is_empty()).then(|| s.to_string());
         let num = |n: u32| (n > 0).then_some(n);
+        // An empty value is written, but reads as none.
+        let opt = |o: &Option<String>| o.clone().filter(|v| !v.trim().is_empty());
         Track {
             title: text(&tags.title),
             artist: text(&tags.artist),
@@ -796,22 +798,22 @@ impl Track {
             track_total: num(tags.track_total),
             disc: num(tags.disc),
             disc_total: num(tags.disc_total),
-            date: tags.date.clone(),
-            original_date: tags.original_date.clone(),
-            label: tags.label.clone(),
-            catalog_number: tags.catalog_number.clone(),
-            country: tags.country.clone(),
-            media: tags.media.clone(),
+            date: opt(&tags.date),
+            original_date: opt(&tags.original_date),
+            label: opt(&tags.label),
+            catalog_number: opt(&tags.catalog_number),
+            country: opt(&tags.country),
+            media: opt(&tags.media),
             compilation: tags.compilation,
-            mb_recording_id: tags.mb_recording_id.clone(),
-            mb_track_id: tags.mb_track_id.clone(),
-            mb_album_id: tags.mb_album_id.clone(),
+            mb_recording_id: opt(&tags.mb_recording_id),
+            mb_track_id: opt(&tags.mb_track_id),
+            mb_album_id: opt(&tags.mb_album_id),
             artists: tags.artists.clone(),
             album_artists: tags.album_artists.clone(),
             mb_artist_ids: tags.mb_artist_ids.clone(),
             mb_album_artist_ids: tags.mb_album_artist_ids.clone(),
-            mb_release_group_id: tags.mb_release_group_id.clone(),
-            discogs_album_id: tags.discogs_album_id.clone(),
+            mb_release_group_id: opt(&tags.mb_release_group_id),
+            discogs_album_id: opt(&tags.discogs_album_id),
             ..self.clone()
         }
     }
@@ -860,6 +862,40 @@ pub struct TagChange {
     pub field: &'static str,
     pub old: Option<String>,
     pub new: Option<String>,
+}
+
+/// Whether [`write`] with `tags` and `cover` would leave `path` reading as
+/// it does now, judged from a fresh read of its primary tag: a file whose
+/// tags live in another tag type (an MP3 with only APEv2) is not, since the
+/// write would create the primary one. With a cover, the file must carry
+/// exactly that front cover. A file that cannot be read is not.
+pub fn unchanged(path: &Path, tags: &Tags, cover: Option<&[u8]>) -> bool {
+    raise_allocation_limit();
+    let read = contained(path, || {
+        probe(path, path)?
+            .options(ParseOptions::new().read_cover_art(cover.is_some()))
+            .read()
+            .map_err(lofty(path))
+    });
+    let Ok(file) = read else {
+        return false;
+    };
+    let Some(tag) = file.tag(file.primary_tag_type()) else {
+        return false;
+    };
+    let mut now = Track::default();
+    read_tag(&mut now, tag);
+    if !changes(&now, tags).is_empty() {
+        return false;
+    }
+    let Some(cover) = cover else {
+        return true;
+    };
+    let mut fronts = tag
+        .pictures()
+        .iter()
+        .filter(|p| p.pic_type() == PictureType::CoverFront);
+    fronts.next().is_some_and(|p| p.data() == cover) && fronts.next().is_none()
 }
 
 /// Every field [`write`] with `new` would change in a file that reads as
@@ -1577,5 +1613,44 @@ mod tests {
         remove_pictures(&path).unwrap();
         assert!(pictures(&path).unwrap().is_empty());
         assert_eq!(read(&path).unwrap().title.as_deref(), Some("T"));
+    }
+
+    #[test]
+    fn unchanged_wants_the_same_tags_and_exactly_that_front_cover() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.flac");
+        std::fs::copy(
+            concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/silence.flac"),
+            &path,
+        )
+        .unwrap();
+        let tags = Tags {
+            title: "T".into(),
+            artist: "A".into(),
+            album: "B".into(),
+            album_artist: "A".into(),
+            track: 1,
+            label: Some(String::new()),
+            ..Default::default()
+        };
+        let cover: &[u8] = include_bytes!("../tests/fixtures/cover.png");
+        assert!(!unchanged(&path, &tags, None), "an untagged file changes");
+        write(&path, &tags, Some(cover), false).unwrap();
+        assert!(
+            unchanged(&path, &tags, Some(cover)),
+            "an empty label reads as none"
+        );
+        assert!(unchanged(&path, &tags, None));
+        assert!(!unchanged(&path, &tags, Some(b"other")));
+        let retitled = Tags {
+            title: "U".into(),
+            ..tags.clone()
+        };
+        assert!(!unchanged(&path, &retitled, Some(cover)));
+        replace_pictures(&path, None).unwrap();
+        assert!(
+            !unchanged(&path, &tags, Some(cover)),
+            "a missing cover is a change"
+        );
     }
 }

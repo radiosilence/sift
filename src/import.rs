@@ -1299,18 +1299,26 @@ impl Importer {
                         ));
                     }
                 }
+                // A file that already reads as it would be written is left
+                // alone: a re-import of a filed album costs reads only.
+                let write = |path: &Path, tags: &Tags| -> Result<(), ImportError> {
+                    if !meta::unchanged(path, tags, cover.as_deref()) {
+                        meta::write(path, tags, cover.as_deref(), preserve_mtime)?;
+                    }
+                    Ok(())
+                };
                 for (from, to, stays, tags) in &work {
                     // Moving: the source is ours to change, so tag it and
                     // move it. Copying: the source must come out untouched,
                     // so copy first and tag the copy.
                     if moving {
-                        meta::write(from, tags, cover.as_deref(), preserve_mtime)?;
+                        write(from, tags)?;
                         if !stays {
                             journal.transfer(from, to, true)?;
                         }
                     } else {
                         journal.transfer(from, to, false)?;
-                        meta::write(to, tags, cover.as_deref(), preserve_mtime)?;
+                        write(to, tags)?;
                     }
                 }
                 // A re-imported album that changed directory takes its
