@@ -923,9 +923,24 @@ pub fn set_lyrics(path: &Path, lyrics: &str) -> Result<(), MetaError> {
     )
 }
 
+/// `path`'s tags without its pictures, for a question about the tags alone:
+/// cover art is most of a tag's bytes. A parser panic reads as no tags.
+fn tags_only(path: &Path) -> Option<lofty::file::TaggedFile> {
+    raise_allocation_limit();
+    std::panic::catch_unwind(|| {
+        lofty::probe::Probe::open(path)
+            .ok()?
+            .options(ParseOptions::new().read_cover_art(false))
+            .read()
+            .ok()
+    })
+    .ok()
+    .flatten()
+}
+
 /// Whether `path` already carries lyrics.
 pub fn has_lyrics(path: &Path) -> bool {
-    lofty::read_from_path(path).is_ok_and(|f| {
+    tags_only(path).is_some_and(|f| {
         f.primary_tag().or_else(|| f.first_tag()).is_some_and(|t| {
             t.get_string(ItemKey::Lyrics)
                 .is_some_and(|l| !l.trim().is_empty())
@@ -935,7 +950,7 @@ pub fn has_lyrics(path: &Path) -> bool {
 
 /// Whether `path` already carries an album gain.
 pub fn has_album_gain(path: &Path) -> bool {
-    lofty::read_from_path(path).is_ok_and(|f| {
+    tags_only(path).is_some_and(|f| {
         f.primary_tag()
             .or_else(|| f.first_tag())
             .is_some_and(|t| t.get_string(ItemKey::ReplayGainAlbumGain).is_some())
@@ -943,7 +958,10 @@ pub fn has_album_gain(path: &Path) -> bool {
 }
 
 pub fn embedded_cover(path: &Path) -> Option<Vec<u8>> {
-    let file = lofty::read_from_path(path).ok()?;
+    raise_allocation_limit();
+    let file = std::panic::catch_unwind(|| lofty::read_from_path(path).ok())
+        .ok()
+        .flatten()?;
     let tag = file.primary_tag().or_else(|| file.first_tag())?;
     let pic = tag
         .pictures()
@@ -980,7 +998,13 @@ pub struct Embedded {
 /// Every picture embedded in `path`, from every tag it carries.
 pub fn pictures(path: &Path) -> Result<Vec<Embedded>, MetaError> {
     raise_allocation_limit();
-    let file = lofty::read_from_path(path).map_err(lofty(path))?;
+    let file = std::panic::catch_unwind(|| lofty::read_from_path(path).map_err(lofty(path)))
+        .unwrap_or_else(|_| {
+            Err(MetaError::Lofty {
+                path: path.to_path_buf(),
+                source: "the tag library panicked on this file".into(),
+            })
+        })?;
     Ok(file
         .tags()
         .iter()

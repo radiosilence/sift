@@ -280,15 +280,63 @@ impl Pattern {
     }
 }
 
-fn compare(a: Option<Value>, b: Option<Value>) -> std::cmp::Ordering {
-    use std::cmp::Ordering;
-    match (a, b) {
-        (Some(Value::Number(a)), Some(Value::Number(b))) => {
-            a.partial_cmp(&b).unwrap_or(Ordering::Equal)
+/// A field's value as sorting compares it, worked out once per row rather
+/// than on every comparison: two numbers by value, anything else by its
+/// text without case, and a missing value first.
+struct SortKey {
+    number: Option<f64>,
+    text: Option<String>,
+}
+
+impl SortKey {
+    fn of(v: Option<Value>) -> Self {
+        Self {
+            number: match &v {
+                Some(Value::Number(n)) => Some(*n),
+                _ => None,
+            },
+            text: v.map(|v| v.text().to_lowercase()),
         }
-        (Some(a), Some(b)) => a.text().to_lowercase().cmp(&b.text().to_lowercase()),
-        (a, b) => a.is_some().cmp(&b.is_some()),
     }
+
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        match (self.number, other.number, &self.text, &other.text) {
+            (Some(a), Some(b), _, _) => a.partial_cmp(&b).unwrap_or(std::cmp::Ordering::Equal),
+            (_, _, Some(a), Some(b)) => a.cmp(b),
+            _ => self.text.is_some().cmp(&other.text.is_some()),
+        }
+    }
+}
+
+/// Sort `rows` by `keys`, each a field and whether it ascends.
+fn sort_by_fields<T>(
+    rows: Vec<T>,
+    keys: &[(String, bool)],
+    field: impl Fn(&T, &str) -> Option<Value>,
+) -> Vec<T> {
+    let mut keyed: Vec<(Vec<SortKey>, T)> = rows
+        .into_iter()
+        .map(|r| {
+            (
+                keys.iter()
+                    .map(|(f, _)| SortKey::of(field(&r, f)))
+                    .collect(),
+                r,
+            )
+        })
+        .collect();
+    keyed.sort_by(|(a, _), (b, _)| {
+        a.iter()
+            .zip(b)
+            .zip(keys)
+            .map(|((a, b), (_, asc))| {
+                let o = a.cmp(b);
+                if *asc { o } else { o.reverse() }
+            })
+            .find(|o| o.is_ne())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    keyed.into_iter().map(|(_, r)| r).collect()
 }
 
 /// Beets' default order: by album artist, album, disc and track.
@@ -798,22 +846,12 @@ impl Library {
 
     /// Items matching `query`, in its sort order or beets' default.
     pub fn items(&self, query: &Query) -> Result<Vec<Item>, LibraryError> {
-        let mut items: Vec<Item> = self
+        let items: Vec<Item> = self
             .all()?
             .into_iter()
             .filter(|i| query.matches_item(i))
             .collect();
-        let keys = sort_keys(query);
-        items.sort_by(|a, b| {
-            keys.iter()
-                .map(|(f, asc)| {
-                    let o = compare(a.field(f), b.field(f));
-                    if *asc { o } else { o.reverse() }
-                })
-                .find(|o| o.is_ne())
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        Ok(items)
+        Ok(sort_by_fields(items, &sort_keys(query), Item::field))
     }
 
     /// Albums matching `query`: directories of items, each item in disc and
@@ -829,7 +867,7 @@ impl Library {
                 .unwrap_or_default();
             dirs.entry(dir).or_default().push(item);
         }
-        let mut albums: Vec<Album> = dirs
+        let albums: Vec<Album> = dirs
             .into_iter()
             .map(|(dir, mut items)| {
                 items.sort_by_key(|i| (i.track.disc, i.track.track));
@@ -837,17 +875,7 @@ impl Library {
             })
             .filter(|a| query.matches_album(a))
             .collect();
-        let keys = sort_keys(query);
-        albums.sort_by(|a, b| {
-            keys.iter()
-                .map(|(f, asc)| {
-                    let o = compare(a.field(f), b.field(f));
-                    if *asc { o } else { o.reverse() }
-                })
-                .find(|o| o.is_ne())
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        Ok(albums)
+        Ok(sort_by_fields(albums, &sort_keys(query), Album::field))
     }
 }
 

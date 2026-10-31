@@ -543,25 +543,27 @@ pub fn duplicates<'a>(cfg: &Config, albums: &'a [Album]) -> Vec<Duplicate<'a>> {
     let mut out: Vec<Duplicate> = groups
         .into_values()
         .filter(|g| g.len() > 1)
-        .filter_map(|mut g| {
-            g.sort_by_key(|a| std::cmp::Reverse(rank(cfg, a)));
-            let keep = g[0];
-            let k = rank(cfg, keep);
+        .filter_map(|g| {
+            // Ranked once each: a rank plans the album's move, which reads
+            // the disk.
+            let mut g: Vec<_> = g.into_iter().map(|a| (rank(cfg, a), a)).collect();
+            g.sort_by_key(|(r, _)| std::cmp::Reverse(*r));
+            let (k, keep) = g[0];
             // A copy is spare only if the kept one has every track it has.
             // One release in several directories (a folder per disc) is an
             // album in pieces, which `move` puts back together; binning a
             // piece would lose music.
             let others: Vec<_> = g[1..]
                 .iter()
-                .filter(|a| a.items.iter().all(|i| contains(keep, i)))
-                .map(|a| {
-                    let reason = match why(k, rank(cfg, a)) {
+                .filter(|(_, a)| a.items.iter().all(|i| contains(keep, i)))
+                .map(|&(r, a)| {
+                    let reason = match why(k, r) {
                         "identical copy" if key(a) != key(keep) => {
                             "the same album, tagged differently"
                         }
                         reason => reason,
                     };
-                    (*a, reason)
+                    (a, reason)
                 })
                 .collect();
             (!others.is_empty()).then_some(Duplicate { keep, others })
