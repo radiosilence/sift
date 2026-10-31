@@ -250,9 +250,9 @@ pub fn score(local: &[Track], release: &Release) -> Match {
 /// heard as a release track's recording costs nothing for its title, since
 /// the audio says more than any tag; one heard as another recording costs
 /// [`W_FINGERPRINT`]. A track without a recording id (a Discogs release's)
-/// is neither. When every paired file is heard as its track, an album title
-/// or artist the files do not carry is no evidence against the release, and
-/// is left out.
+/// is neither. When every file is paired and heard as its track, an album
+/// title or artist the files do not carry is no evidence against the
+/// release, and is left out.
 pub fn score_with(
     local: &[Track],
     release: &Release,
@@ -310,21 +310,25 @@ pub fn score_with(
         None => None,
     };
 
-    // The audio outranks the numbers: a misnumbered file heard as its track
-    // would otherwise be paired with another and charged for it.
-    let numbered = if heard.iter().any(|h| !h.is_empty()) {
-        None
-    } else {
-        pair_by_number(local, release)
-    };
+    // The numbers stand unless the audio contradicts one of their pairs:
+    // a misnumbered file heard as another track is paired by cost instead.
+    let numbered = pair_by_number(local, release)
+        .filter(|pairs| !pairs.iter().any(|&(l, r)| heard_as(l, r) == Some(false)));
+    // A file heard as another recording is not kept out of a pair: a
+    // remaster's recordings are often not the ones AcoustID links, and the
+    // penalty is charged below.
     let pairs = numbered.unwrap_or_else(|| {
         pair_by_cost(local.len(), remote.len(), |l, r| {
             let (t, len) = cost(l, r);
-            W_TITLE * t + W_LENGTH * len + fingerprint(l, r).map_or(0.0, |f| W_FINGERPRINT * f)
+            W_TITLE * t + W_LENGTH * len
         })
     });
 
-    let all_heard = !pairs.is_empty() && pairs.iter().all(|&(l, r)| heard_as(l, r) == Some(true));
+    // Every file, not only every pair: an EP holding a few of an untagged
+    // album's recordings is not vouched for by the audio.
+    let all_heard = pairs.len() == local.len()
+        && !pairs.is_empty()
+        && pairs.iter().all(|&(l, r)| heard_as(l, r) == Some(true));
     let (mut num, mut den) = (0.0, 0.0);
     for (untagged, weight, d) in [
         (album.is_empty(), W_ALBUM, d_album),
@@ -538,6 +542,46 @@ mod tests {
         pairs.sort();
         assert_eq!(pairs, [(0, 2), (1, 0), (2, 1)]);
         assert!(m.distance < 0.04, "{}", m.distance);
+    }
+
+    #[test]
+    fn one_heard_file_leaves_the_numbers_pairing_the_rest() {
+        let local = vec![
+            track("Ready Lets Go", Some(1), 59),
+            track("Music Is Math", Some(2), 321),
+            track("Beware the Friendly Stranger", Some(3), 37),
+        ];
+        let plain = score(&local, &release());
+        let m = score_with(&local, &release(), &heard(&[&["r1"]]));
+        assert_eq!(m.pairs, plain.pairs);
+    }
+
+    #[test]
+    fn a_file_heard_as_a_sibling_recording_still_pairs() {
+        let local = vec![
+            track("Ready Lets Go", None, 59),
+            track("Music Is Math", None, 321),
+            track("Beware the Friendly Stranger", None, 37),
+        ];
+        let m = score_with(&local, &release(), &heard(&[&["remaster"], &[], &[]]));
+        assert_eq!(m.pairs.len(), 3, "{:?}", m.pairs);
+        assert_eq!(m.missing, 0);
+    }
+
+    #[test]
+    fn an_ep_of_some_of_the_files_is_not_vouched_for() {
+        let mut local = untagged();
+        local.push(Track {
+            duration: Duration::from_secs(200),
+            ..Default::default()
+        });
+        let m = score_with(
+            &local,
+            &release(),
+            &heard(&[&["r3"], &["r1"], &["r2"], &[]]),
+        );
+        assert_eq!(m.extra, 1);
+        assert!(m.distance > 0.04, "{}", m.distance);
     }
 
     #[test]

@@ -37,6 +37,8 @@ pub enum AcoustIdError {
     Http(#[from] reqwest::Error),
     #[error("AcoustID refused the lookup: {message}")]
     Refused { code: Option<u32>, message: String },
+    #[error("AcoustID is unavailable (HTTP {0})")]
+    Unavailable(u16),
 }
 
 impl AcoustIdError {
@@ -45,7 +47,9 @@ impl AcoustIdError {
     /// nothing about the next.
     pub fn stops_all(&self) -> bool {
         match self {
-            Self::Http(_) => true,
+            // A timeout is one slow answer; a refused connection is all of them.
+            Self::Http(e) => e.is_connect(),
+            Self::Unavailable(_) => true,
             // AcoustID's code for an invalid application key.
             Self::Refused { code, .. } => *code == Some(4),
         }
@@ -256,15 +260,19 @@ impl AcoustId {
                     tokio::time::sleep_until(*next).await;
                     *next = Instant::now() + SPACING;
                 }
-                let body = self
+                let resp = self
                     .http
                     .post(format!("{}/lookup", self.base))
                     .form(&[&[("client", self.client.as_str())][..], &form[..]].concat())
                     .send()
-                    .await?
-                    .bytes()
                     .await?;
-                body.to_vec()
+                let status = resp.status();
+                // A refusal of the lookup comes as JSON with its reason; an
+                // overloaded service answers with a page of its own.
+                if status.is_server_error() || status.as_u16() == 429 {
+                    return Err(AcoustIdError::Unavailable(status.as_u16()));
+                }
+                resp.bytes().await?.to_vec()
             }
         };
         let resp: Response = serde_json::from_slice(&body).map_err(|e| AcoustIdError::Refused {

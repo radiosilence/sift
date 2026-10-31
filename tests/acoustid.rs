@@ -20,6 +20,9 @@ async fn serve(body: &'static str) -> (String, tokio::task::JoinHandle<String>) 
         let mut buf = [0u8; 65536];
         loop {
             let n = sock.read(&mut buf).await.unwrap();
+            if n == 0 {
+                break;
+            }
             req.extend_from_slice(&buf[..n]);
             let text = String::from_utf8_lossy(&req);
             if let Some((head, rest)) = text.split_once("\r\n\r\n") {
@@ -31,7 +34,7 @@ async fn serve(body: &'static str) -> (String, tokio::task::JoinHandle<String>) 
                             .map(|v| v.trim().parse::<usize>().unwrap())
                     })
                     .unwrap_or(0);
-                if rest.len() >= len || n == 0 {
+                if rest.len() >= len {
                     break;
                 }
             }

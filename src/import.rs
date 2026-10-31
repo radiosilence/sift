@@ -397,7 +397,10 @@ impl Importer {
             })
         })
         .await
-        .unwrap_or_default();
+        .unwrap_or_else(|e| {
+            let _ = writeln!(log, "fingerprinting failed: {e}");
+            Vec::new()
+        });
         let mut heard = vec![crate::acoustid::Identified::default(); tracks.len()];
         for (i, print) in prints.into_iter().enumerate() {
             let print = match print {
