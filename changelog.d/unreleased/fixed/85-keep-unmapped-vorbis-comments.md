@@ -1,0 +1,1 @@
+- **Tag writes keep the Vorbis comments sift does not know.** Writing to a FLAC, Ogg or Opus file no longer deletes fields such as `DISCOGS_ALBUMID`, `ACOUSTID_ID` or custom fields added by other taggers.
