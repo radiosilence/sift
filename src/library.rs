@@ -712,6 +712,38 @@ impl Library {
         Ok(())
     }
 
+    /// Record that files moved, all at once.
+    pub fn rename_all<'a>(
+        &mut self,
+        moves: impl IntoIterator<Item = (&'a Path, &'a Path)>,
+    ) -> Result<(), LibraryError> {
+        let tx = self.conn.transaction()?;
+        {
+            let mut rename = tx.prepare("UPDATE items SET path = ?2 WHERE path = ?1")?;
+            for (from, to) in moves {
+                rename.execute(params![from.to_string_lossy(), to.to_string_lossy()])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Drop files that left the library, all at once.
+    pub fn forget_all<'a>(
+        &mut self,
+        paths: impl IntoIterator<Item = &'a Path>,
+    ) -> Result<(), LibraryError> {
+        let tx = self.conn.transaction()?;
+        {
+            let mut forget = tx.prepare("DELETE FROM items WHERE path = ?1")?;
+            for path in paths {
+                forget.execute([path.to_string_lossy()])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Stamp every file indexed under `dir` as added at `added`, in seconds
     /// since the epoch. For an album moved outside [`Library::rename`] (a
     /// re-import), whose files a scan finds as new: it keeps the date it

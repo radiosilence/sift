@@ -121,7 +121,7 @@ pub fn plan_move(cfg: &Config, album: &Album) -> Plan {
             let path = entry.path();
             if !entry.file_type().is_ok_and(|t| t.is_file())
                 || meta::is_audio(&path)
-                || meta::is_scratch(&path)
+                || paths::is_scratch(&path)
             {
                 continue;
             }
@@ -137,24 +137,33 @@ pub fn plan_move(cfg: &Config, album: &Album) -> Plan {
 
 /// Carry out a plan from [`plan_move`], keeping the index in step, then
 /// remove the directories it emptied (the album's, then its artist's). A
-/// directory is only ever removed empty.
+/// directory is only ever removed empty. A move that fails puts back the
+/// ones made before it, so the album stays whole where it was.
 pub async fn execute(lib: &mut Library, album: &Album, moves: &[Move]) -> Result<(), LibraryError> {
-    for m in moves {
-        paths::transfer(&m.from, &m.to, true)
-            .await
-            .map_err(|e| LibraryError::Io(m.from.clone(), e))?;
-        lib.rename(&m.from, &m.to)?;
-    }
-    if std::fs::remove_dir(&album.dir).is_ok()
-        && let Some(parent) = album.dir.parent()
-    {
-        let _ = std::fs::remove_dir(parent);
-    }
-    Ok(())
+    let (moves, dir) = (moves.to_vec(), album.dir.clone());
+    let moved = tokio::task::spawn_blocking(move || {
+        let mut journal = paths::Journal::default();
+        for m in &moves {
+            journal
+                .transfer(&m.from, &m.to, true)
+                .map_err(|e| LibraryError::Io(m.from.clone(), e))?;
+        }
+        journal.commit();
+        if std::fs::remove_dir(&dir).is_ok()
+            && let Some(parent) = dir.parent()
+        {
+            let _ = std::fs::remove_dir(parent);
+        }
+        Ok::<_, LibraryError>(moves)
+    })
+    .await
+    .expect("move panicked")?;
+    lib.rename_all(moved.iter().map(|m| (m.from.as_path(), m.to.as_path())))
 }
 
 /// Move an album into `bin`, at its path relative to the library root, and
 /// drop it from the index. Nothing is deleted: putting it back is a move.
+/// A move that fails puts back the ones made before it.
 pub async fn bin(
     lib: &mut Library,
     library_root: &Path,
@@ -178,23 +187,34 @@ pub async fn bin(
             std::io::Error::from(std::io::ErrorKind::AlreadyExists),
         ));
     }
-    let entries =
-        std::fs::read_dir(&album.dir).map_err(|e| LibraryError::Io(album.dir.clone(), e))?;
-    for entry in entries.flatten() {
-        let from = entry.path();
-        if !entry.file_type().is_ok_and(|t| t.is_file()) || meta::is_scratch(&from) {
-            continue;
+    let (dir, to) = (album.dir.clone(), dest.clone());
+    let moved = tokio::task::spawn_blocking(move || {
+        let entries = std::fs::read_dir(&dir).map_err(|e| LibraryError::Io(dir.clone(), e))?;
+        let mut journal = paths::Journal::default();
+        for entry in entries.flatten() {
+            let from = entry.path();
+            if !entry.file_type().is_ok_and(|t| t.is_file()) || paths::is_scratch(&from) {
+                continue;
+            }
+            journal
+                .transfer(&from, &to.join(entry.file_name()), true)
+                .map_err(|e| LibraryError::Io(from.clone(), e))?;
         }
-        paths::transfer(&from, &dest.join(entry.file_name()), true)
-            .await
-            .map_err(|e| LibraryError::Io(from.clone(), e))?;
-        lib.forget(&from)?;
-    }
-    if std::fs::remove_dir(&album.dir).is_ok()
-        && let Some(parent) = album.dir.parent()
-    {
-        let _ = std::fs::remove_dir(parent);
-    }
+        let moved: Vec<PathBuf> = journal
+            .moves()
+            .map(|(from, _)| from.to_path_buf())
+            .collect();
+        journal.commit();
+        if std::fs::remove_dir(&dir).is_ok()
+            && let Some(parent) = dir.parent()
+        {
+            let _ = std::fs::remove_dir(parent);
+        }
+        Ok::<_, LibraryError>(moved)
+    })
+    .await
+    .expect("move panicked")?;
+    lib.forget_all(moved.iter().map(PathBuf::as_path))?;
     Ok(dest)
 }
 

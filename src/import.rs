@@ -103,8 +103,14 @@ enum Filing<'a> {
 
 /// Move an album folder out of the library into `bin`, at its path relative
 /// to the library root, under a new name if the bin already holds one by
-/// that name. Nothing is deleted: putting it back is a move.
-async fn set_aside(dir: &Path, root: &Path, bin: &Path) -> Result<PathBuf, ImportError> {
+/// that name. Nothing is deleted: putting it back is a move, which
+/// `journal` does if the import does not finish.
+fn set_aside(
+    dir: &Path,
+    root: &Path,
+    bin: &Path,
+    journal: &mut paths::Journal,
+) -> Result<PathBuf, ImportError> {
     let rel = dir
         .strip_prefix(root)
         .ok()
@@ -126,8 +132,9 @@ async fn set_aside(dir: &Path, root: &Path, bin: &Path) -> Result<PathBuf, Impor
         dest = bin.join(rel).with_file_name(name);
     }
     for entry in std::fs::read_dir(dir)?.flatten() {
-        if entry.file_type().is_ok_and(|t| t.is_file()) && !meta::is_scratch(&entry.path()) {
-            paths::transfer(&entry.path(), &dest.join(entry.file_name()), true).await?;
+        let from = entry.path();
+        if entry.file_type().is_ok_and(|t| t.is_file()) && !paths::is_scratch(&from) {
+            journal.transfer(&from, &dest.join(entry.file_name()), true)?;
         }
     }
     let _ = std::fs::remove_dir(dir);
@@ -1138,6 +1145,9 @@ impl Importer {
     ) -> Result<PathBuf, ImportError> {
         let in_place = matches!(filing, Filing::InPlace);
         let plan = self.destinations(tracks, entries, release, in_place)?;
+        // Every transfer from here is undone if the album is not filed whole,
+        // including a copy set aside for it.
+        let mut journal = paths::Journal::default();
 
         // Every destination already there, each the same recording as its
         // source, is this album filed once before: a repeated import (a
@@ -1154,8 +1164,21 @@ impl Importer {
                 .collect();
             taken.sort();
             taken.dedup();
-            for dir in taken {
-                let to = set_aside(&dir, &self.cfg.directory, bin).await?;
+            let (root, bin) = (self.cfg.directory.clone(), bin.to_path_buf());
+            let (j, set) = tokio::task::spawn_blocking(move || {
+                let set: Result<Vec<_>, ImportError> = taken
+                    .into_iter()
+                    .map(|dir| {
+                        let to = set_aside(&dir, &root, &bin, &mut journal)?;
+                        Ok((dir, to))
+                    })
+                    .collect();
+                (journal, set)
+            })
+            .await
+            .expect("set aside panicked");
+            journal = j;
+            for (dir, to) in set? {
                 let _ = writeln!(log, "replaced: {} moved to {}", dir.display(), to.display());
             }
             present = plan.iter().map(|d| d.to.exists()).collect();
@@ -1174,6 +1197,7 @@ impl Importer {
                 .map(Path::to_path_buf)
                 .unwrap_or_default();
             if same {
+                journal.commit();
                 let _ = writeln!(
                     log,
                     "already in the library as {}; nothing moved",
@@ -1206,71 +1230,81 @@ impl Importer {
                 None => "none".to_string(),
             }
         );
-        let cover = cover_art.map(|c| c.bytes);
-        for d in &plan {
-            let (local, dest) = (&tracks[d.local], &d.to);
-            let (cover, tags) = (cover.clone(), d.tags.clone());
-            // Moving: the source is ours to change, so tag it and move it.
-            // Copying: the source must come out untouched, so copy first and
-            // tag the copy, taking it back out if tagging fails.
-            let preserve_mtime = self.cfg.import_added;
-            if self.cfg.move_files || in_place {
-                let path = local.path.clone();
-                tokio::task::spawn_blocking(move || {
-                    meta::write(&path, &tags, cover.as_deref(), preserve_mtime)
-                })
-                .await
-                .expect("tag writer panicked")?;
-                if !d.stays {
-                    paths::transfer(&local.path, dest, true).await?;
+        let cover: Option<std::sync::Arc<[u8]>> = cover_art.map(|c| c.bytes.into());
+        let work: Vec<(PathBuf, PathBuf, bool, Tags)> = plan
+            .iter()
+            .map(|d| {
+                (
+                    tracks[d.local].path.clone(),
+                    d.to.clone(),
+                    d.stays,
+                    d.tags.clone(),
+                )
+            })
+            .collect();
+        let moving = self.cfg.move_files || in_place;
+        let preserve_mtime = self.cfg.import_added;
+        let source = source_dir.to_path_buf();
+        let new_dir = plan
+            .first()
+            .and_then(|d| d.to.parent())
+            .map(Path::to_path_buf);
+        // One blocking task files the whole album, so a dropped import
+        // future cannot stop it half way: it finishes, or its journal puts
+        // every file back.
+        {
+            let work = work.clone();
+            let new_dir = new_dir.clone();
+            tokio::task::spawn_blocking(move || -> Result<(), ImportError> {
+                for (from, to, stays, tags) in &work {
+                    // Moving: the source is ours to change, so tag it and
+                    // move it. Copying: the source must come out untouched,
+                    // so copy first and tag the copy.
+                    if moving {
+                        meta::write(from, tags, cover.as_deref(), preserve_mtime)?;
+                        if !stays {
+                            journal.transfer(from, to, true)?;
+                        }
+                    } else {
+                        journal.transfer(from, to, false)?;
+                        meta::write(to, tags, cover.as_deref(), preserve_mtime)?;
+                    }
                 }
-            } else {
-                paths::transfer(&local.path, dest, false).await?;
-                let path = dest.clone();
-                let written = tokio::task::spawn_blocking(move || {
-                    meta::write(&path, &tags, cover.as_deref(), preserve_mtime)
-                })
-                .await
-                .expect("tag writer panicked");
-                if let Err(e) = written {
-                    let _ = tokio::fs::remove_file(dest).await;
-                    return Err(e.into());
+                // A re-imported album that changed directory takes its
+                // other files along, and leaves no empty directory behind.
+                if in_place && let Some(new_dir) = &new_dir {
+                    for c in companions(&source, new_dir) {
+                        if !c.stays {
+                            journal.transfer(&c.from, &c.to, true)?;
+                        }
+                    }
                 }
-            }
+                journal.commit();
+                if in_place
+                    && let Some(new_dir) = &new_dir
+                    && !same_file(&source, new_dir)
+                    && std::fs::remove_dir(&source).is_ok()
+                    && let Some(parent) = source.parent()
+                {
+                    let _ = std::fs::remove_dir(parent);
+                }
+                Ok(())
+            })
+            .await
+            .expect("filing panicked")?;
+        }
+        for (from, to, _, _) in &work {
             let _ = writeln!(
                 log,
                 "{} → {}",
-                local
-                    .path
-                    .strip_prefix(source_dir)
-                    .unwrap_or(&local.path)
-                    .display(),
-                dest.display()
+                from.strip_prefix(source_dir).unwrap_or(from).display(),
+                to.display()
             );
         }
         for t in unmatched(tracks, entries) {
             let _ = writeln!(log, "left behind (no matching track): {}", t.path.display());
         }
-        // A re-imported album that changed directory takes its other files
-        // along, and leaves no empty directory behind.
-        if in_place && let Some(new_dir) = plan.first().and_then(|d| d.to.parent()) {
-            for c in companions(source_dir, new_dir) {
-                if !c.stays {
-                    paths::transfer(&c.from, &c.to, true).await?;
-                }
-            }
-            if !same_file(source_dir, new_dir)
-                && std::fs::remove_dir(source_dir).is_ok()
-                && let Some(parent) = source_dir.parent()
-            {
-                let _ = std::fs::remove_dir(parent);
-            }
-        }
-        Ok(plan
-            .first()
-            .and_then(|d| d.to.parent())
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| self.cfg.directory.clone()))
+        Ok(new_dir.unwrap_or_else(|| self.cfg.directory.clone()))
     }
 
     fn tags(
@@ -1631,7 +1665,7 @@ fn companions(from: &Path, to: &Path) -> Vec<Companion> {
             let path = e.path();
             e.file_type().is_ok_and(|t| t.is_file())
                 && !meta::is_audio(&path)
-                && !meta::is_scratch(&path)
+                && !paths::is_scratch(&path)
         })
         .map(|e| {
             let dest = to.join(e.file_name());
