@@ -37,7 +37,7 @@ pub struct MusicBrainz {
     /// Responses kept on disk. Releases barely change and a retried import
     /// asks for the same ones again, so a cache is most of what stands
     /// between an import and the rate limit.
-    cache: Option<std::path::PathBuf>,
+    cache: Option<crate::cache::Cache>,
 }
 
 const RELEASE_TTL: Duration = Duration::from_secs(7 * 24 * 3600);
@@ -64,16 +64,8 @@ impl MusicBrainz {
 
     /// Keep responses under `dir`.
     pub fn with_cache(mut self, dir: std::path::PathBuf) -> Self {
-        self.cache = Some(dir);
+        self.cache = Some(crate::cache::Cache::new(dir, "mb-", RELEASE_TTL));
         self
-    }
-
-    fn cache_path(&self, path: &str, query: &[(&str, &str)]) -> Option<std::path::PathBuf> {
-        use std::hash::{Hash, Hasher};
-        let dir = self.cache.as_ref()?;
-        let mut h = std::collections::hash_map::DefaultHasher::new();
-        (path, query).hash(&mut h);
-        Some(dir.join(format!("{:016x}.json", h.finish())))
     }
 
     async fn get<T: for<'de> Deserialize<'de>>(
@@ -86,28 +78,17 @@ impl MusicBrainz {
         } else {
             SEARCH_TTL
         };
-        let cached = self.cache_path(path, query);
-        if let Some(file) = &cached {
-            let fresh = tokio::fs::metadata(file)
-                .await
-                .ok()
-                .and_then(|m| m.modified().ok())
-                .and_then(|t| t.elapsed().ok())
-                .is_some_and(|age| age < ttl);
-            if fresh
-                && let Ok(body) = tokio::fs::read(file).await
-                && let Ok(v) = serde_json::from_slice(&body)
-            {
-                return Ok(v);
-            }
+        let cached = self.cache.as_ref().map(|c| (c, c.path(path, query)));
+        if let Some((cache, file)) = &cached
+            && let Some(body) = cache.read(file, ttl).await
+            && let Ok(v) = serde_json::from_slice(&body)
+        {
+            return Ok(v);
         }
         let body: bytes::Bytes = self.fetch(path, query).await?;
         let value = serde_json::from_slice(&body).map_err(|e| MbError::Decode(e.to_string()))?;
-        if let Some(file) = cached {
-            if let Some(dir) = file.parent() {
-                let _ = tokio::fs::create_dir_all(dir).await;
-            }
-            let _ = tokio::fs::write(&file, &body).await;
+        if let Some((cache, file)) = cached {
+            cache.write(&file, &body).await;
         }
         Ok(value)
     }

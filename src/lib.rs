@@ -1,6 +1,8 @@
 #[cfg(feature = "tagger")]
 pub mod art;
 #[cfg(feature = "tagger")]
+mod cache;
+#[cfg(feature = "tagger")]
 pub mod check;
 #[cfg(feature = "tagger")]
 pub mod config;
