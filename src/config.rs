@@ -90,6 +90,10 @@ pub struct Config {
     /// Set only when the `discogs` plugin is listed and a token is
     /// available, from `discogs.user_token` or `DISCOGS_TOKEN`.
     pub discogs: Option<DiscogsConf>,
+    /// An AcoustID application key, from `acoustid.client` or
+    /// `ACOUSTID_CLIENT`, set only when the `chroma` plugin is listed:
+    /// what lets an import identify files by their audio.
+    pub acoustid_client: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -133,6 +137,7 @@ impl Default for Config {
             import_added: false,
             ft_in_title: None,
             discogs: None,
+            acoustid_client: None,
         }
     }
 }
@@ -219,6 +224,16 @@ struct Raw {
     discogs: RawDiscogs,
     #[serde(skip_serializing_if = "Option::is_none")]
     ftintitle: Option<RawFtInTitle>,
+    #[serde(default, skip_serializing_if = "is_default")]
+    acoustid: RawAcoustId,
+}
+
+/// beets' `acoustid.apikey` is a user key, for submitting fingerprints;
+/// a lookup needs an application's key, which beets ships and sift cannot.
+#[derive(Debug, Default, PartialEq, Deserialize, Serialize)]
+struct RawAcoustId {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    client: Option<String>,
 }
 
 fn is_default<T: Default + PartialEq>(t: &T) -> bool {
@@ -272,7 +287,7 @@ struct RawDiscogs {
 }
 
 /// The plugins whose presence sift acts on.
-const PLUGINS: &[&str] = &["discogs", "fetchart", "ftintitle", "importadded"];
+const PLUGINS: &[&str] = &["chroma", "discogs", "fetchart", "ftintitle", "importadded"];
 
 #[derive(Debug, Default, PartialEq, Deserialize, Serialize)]
 #[serde(untagged)]
@@ -332,6 +347,8 @@ impl Config {
         let mut discogs_enabled = false;
         let mut discogs_token = None;
         let mut discogs_index_tracks = false;
+        let mut chroma = false;
+        let mut acoustid_client = None;
         for raw in layers {
             if let Some(d) = raw.directory {
                 cfg.directory = expand(&d);
@@ -402,6 +419,8 @@ impl Config {
             discogs_enabled |= raw.plugins.contains("discogs");
             discogs_token = raw.discogs.user_token.or(discogs_token);
             discogs_index_tracks = raw.discogs.index_tracks.unwrap_or(discogs_index_tracks);
+            chroma |= raw.plugins.contains("chroma");
+            acoustid_client = raw.acoustid.client.or(acoustid_client);
         }
         cfg.fetch_art = fetchart;
         if let Some(w) = art_width {
@@ -433,6 +452,13 @@ impl Config {
                 token,
                 index_tracks: discogs_index_tracks,
             });
+        let client = std::env::var("ACOUSTID_CLIENT").ok().or(acoustid_client);
+        if chroma && client.is_none() {
+            tracing::warn!(
+                "the chroma plugin needs an AcoustID application key (acoustid.client or ACOUSTID_CLIENT); fingerprinting is off"
+            );
+        }
+        cfg.acoustid_client = chroma.then_some(client).flatten();
         // No `directory` is allowed: a shared base config often leaves it to
         // a per-machine file, and a caller may set it after loading. Whoever
         // imports checks it is set.

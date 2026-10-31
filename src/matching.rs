@@ -21,6 +21,9 @@ const W_TITLE: f64 = 3.0;
 const W_LENGTH: f64 = 2.0;
 const W_MISSING: f64 = 0.9;
 const W_EXTRA: f64 = 0.6;
+/// A file whose fingerprint AcoustID knows, against a release track with a
+/// recording id: none when it is that recording, the whole weight when not.
+const W_FINGERPRINT: f64 = 3.0;
 /// Length differences below this are rounding and encoder padding.
 const LENGTH_GRACE_SECS: f64 = 10.0;
 const LENGTH_MAX_SECS: f64 = 30.0;
@@ -239,6 +242,22 @@ pub fn consensus<'a>(values: impl Iterator<Item = Option<&'a str>>) -> Option<St
 }
 
 pub fn score(local: &[Track], release: &Release) -> Match {
+    score_with(local, release, &[])
+}
+
+/// [`score`], with `heard[i]` the MusicBrainz recordings AcoustID says
+/// file `i` is (empty, or past the end, where it said nothing). A file
+/// heard as a release track's recording costs nothing for its title, since
+/// the audio says more than any tag; one heard as another recording costs
+/// [`W_FINGERPRINT`]. A track without a recording id (a Discogs release's)
+/// is neither. When every paired file is heard as its track, an album title
+/// or artist the files do not carry is no evidence against the release, and
+/// is left out.
+pub fn score_with(
+    local: &[Track],
+    release: &Release,
+    heard: &[std::collections::HashSet<String>],
+) -> Match {
     let remote: Vec<_> = release.tracks().collect();
     let album = consensus(local.iter().map(|t| t.album.as_deref())).unwrap_or_default();
     let artist = consensus(
@@ -257,6 +276,13 @@ pub fn score(local: &[Track], release: &Release) -> Match {
         string_distance(&artist, &release.artist())
     };
 
+    // Whether file `l` was heard as track `r`'s recording; `None` when
+    // either side has nothing to say.
+    let heard_as = |l: usize, r: usize| -> Option<bool> {
+        let id = &remote[r].1.recording.id;
+        let heard = heard.get(l).filter(|h| !h.is_empty())?;
+        (!id.is_empty()).then(|| heard.contains(id))
+    };
     let cost = |l: usize, r: usize| -> (f64, f64) {
         let (_, track) = remote[r];
         let title = local[l].title.as_deref().unwrap_or_default();
@@ -268,21 +294,40 @@ pub fn score(local: &[Track], release: &Release) -> Match {
         } else {
             track.length.or(track.recording.length)
         };
+        let title = if heard_as(l, r) == Some(true) {
+            0.0
+        } else {
+            string_distance(title, &track.title)
+        };
         (
-            string_distance(title, &track.title),
+            title,
             length_distance(local[l].duration.as_secs_f64(), length),
         )
+    };
+    let fingerprint = |l: usize, r: usize| match heard_as(l, r) {
+        Some(true) => Some(0.0),
+        Some(false) => Some(1.0),
+        None => None,
     };
 
     let pairs = pair_by_number(local, release).unwrap_or_else(|| {
         pair_by_cost(local.len(), remote.len(), |l, r| {
             let (t, len) = cost(l, r);
-            W_TITLE * t + W_LENGTH * len
+            W_TITLE * t + W_LENGTH * len + fingerprint(l, r).map_or(0.0, |f| W_FINGERPRINT * f)
         })
     });
 
-    let mut num = W_ALBUM * d_album + W_ARTIST * d_artist;
-    let mut den = W_ALBUM + W_ARTIST;
+    let all_heard = !pairs.is_empty() && pairs.iter().all(|&(l, r)| heard_as(l, r) == Some(true));
+    let (mut num, mut den) = (0.0, 0.0);
+    for (untagged, weight, d) in [
+        (album.is_empty(), W_ALBUM, d_album),
+        (artist.is_empty(), W_ARTIST, d_artist),
+    ] {
+        if !(untagged && all_heard) {
+            num += weight * d;
+            den += weight;
+        }
+    }
     let (mut titles, mut lengths) = (0.0, 0.0);
     for &(l, r) in &pairs {
         let (t, len) = cost(l, r);
@@ -290,6 +335,10 @@ pub fn score(local: &[Track], release: &Release) -> Match {
         lengths += len;
         num += W_TITLE * t + W_LENGTH * len;
         den += W_TITLE + W_LENGTH;
+        if let Some(f) = fingerprint(l, r) {
+            num += W_FINGERPRINT * f;
+            den += W_FINGERPRINT;
+        }
     }
     let paired = pairs.len().max(1) as f64;
     let missing = remote.len() - pairs.len();
@@ -418,6 +467,68 @@ mod tests {
             duration: Duration::from_secs(secs),
             ..Default::default()
         }
+    }
+
+    fn heard(ids: &[&[&str]]) -> Vec<std::collections::HashSet<String>> {
+        ids.iter()
+            .map(|r| r.iter().map(|s| s.to_string()).collect())
+            .collect()
+    }
+
+    /// Files named "01.flac" and so on, with nothing in their tags.
+    fn untagged() -> Vec<Track> {
+        [37, 59, 321]
+            .iter()
+            .map(|&secs| Track {
+                duration: Duration::from_secs(secs),
+                ..Default::default()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn untagged_files_heard_as_the_release_match_it_strongly() {
+        let local = untagged();
+        let without = score(&local, &release());
+        assert!(without.distance > 0.5, "{}", without.distance);
+        let with = score_with(&local, &release(), &heard(&[&["r3"], &["r1"], &["r2"]]));
+        assert!(with.distance < 0.04, "{} {}", with.distance, with.parts);
+        let mut pairs = with.pairs.clone();
+        pairs.sort();
+        assert_eq!(
+            pairs,
+            [(0, 2), (1, 0), (2, 1)],
+            "paired by the audio, not the order"
+        );
+    }
+
+    #[test]
+    fn a_file_heard_as_another_recording_counts_against_the_release() {
+        let local = vec![
+            track("Ready Lets Go", Some(1), 59),
+            track("Music Is Math", Some(2), 321),
+            track("Beware the Friendly Stranger", Some(3), 37),
+        ];
+        let plain = score(&local, &release()).distance;
+        let wrong = score_with(&local, &release(), &heard(&[&["x"], &[], &[]])).distance;
+        assert!(wrong > plain, "{wrong} vs {plain}");
+        let right = score_with(&local, &release(), &heard(&[&["r1"], &["r2"], &["r3"]]));
+        assert!(right.distance <= plain);
+        // The files carry an album and an artist, so those still count.
+        assert!(right.parts.album == score(&local, &release()).parts.album);
+    }
+
+    #[test]
+    fn a_release_without_recording_ids_is_not_judged_by_the_audio() {
+        let mut discogs = release();
+        for t in &mut discogs.media[0].tracks {
+            t.recording.id.clear();
+        }
+        let local = untagged();
+        assert_eq!(
+            score(&local, &discogs).distance,
+            score_with(&local, &discogs, &heard(&[&["r3"], &["r1"], &["r2"]])).distance
+        );
     }
 
     #[test]

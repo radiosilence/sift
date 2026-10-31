@@ -178,6 +178,7 @@ pub struct Importer {
     pub cfg: Config,
     mb: MusicBrainz,
     discogs: Option<Discogs>,
+    acoustid: Option<crate::acoustid::AcoustId>,
     http: reqwest::Client,
     lyrics: crate::lyrics::Client,
 }
@@ -350,13 +351,70 @@ impl Importer {
             .timeout(std::time::Duration::from_secs(60))
             .build()
             .expect("static client config");
+        let acoustid = cfg.acoustid_client.as_ref().map(|key| {
+            let a = crate::acoustid::AcoustId::new(key, &cfg.musicbrainz_contact);
+            match &cfg.cache_dir {
+                Some(dir) => a.with_cache(dir.clone()),
+                None => a,
+            }
+        });
         Self {
             cfg,
             mb,
             discogs,
+            acoustid,
             http,
             lyrics: crate::lyrics::Client::new(),
         }
+    }
+
+    /// Identify weakly matched files by their audio through `acoustid`,
+    /// whatever the configuration says.
+    pub fn with_acoustid(mut self, acoustid: crate::acoustid::AcoustId) -> Self {
+        self.acoustid = Some(acoustid);
+        self
+    }
+
+    /// What AcoustID says each of `tracks` is, in order; empty for a file
+    /// it could not fingerprint or does not know. Lookups stop at the
+    /// first failure, which is logged: the import goes on without them.
+    async fn listen(
+        &self,
+        acoustid: &crate::acoustid::AcoustId,
+        tracks: &[Track],
+        log: &mut String,
+    ) -> Vec<crate::acoustid::Identified> {
+        let files: Vec<(PathBuf, std::time::Duration)> = tracks
+            .iter()
+            .map(|t| (t.path.clone(), t.duration))
+            .collect();
+        let workers = std::thread::available_parallelism().map_or(2, |n| n.get());
+        let prints = tokio::task::spawn_blocking(move || {
+            crate::par::map(&files, workers, |(path, duration)| {
+                crate::acoustid::fingerprint(path, *duration)
+            })
+        })
+        .await
+        .unwrap_or_default();
+        let mut heard = vec![crate::acoustid::Identified::default(); tracks.len()];
+        let _ = writeln!(log, "fingerprinting {} files for AcoustID", tracks.len());
+        for (i, print) in prints.into_iter().enumerate() {
+            let print = match print {
+                Ok(Ok(p)) => p,
+                Ok(Err(e)) | Err(e) => {
+                    let _ = writeln!(log, "no fingerprint for {}: {e}", tracks[i].path.display());
+                    continue;
+                }
+            };
+            match acoustid.lookup(&print).await {
+                Ok(found) => heard[i] = found,
+                Err(e) => {
+                    let _ = writeln!(log, "acoustid: {e}");
+                    break;
+                }
+            }
+        }
+        heard
     }
 
     /// Match and import `dir`. With `release_id`, that release is applied
@@ -1012,6 +1070,51 @@ impl Importer {
             .iter()
             .map(|r| matching::score(tracks, r))
             .collect();
+
+        // Nothing strong by name: ask AcoustID what the files are, look up
+        // the releases most of them appear on, and score every candidate
+        // with what the audio says.
+        let best = matches
+            .iter()
+            .map(|m| m.distance)
+            .fold(f64::INFINITY, f64::min);
+        if let Some(acoustid) = &self.acoustid
+            && best > self.cfg.strong_threshold
+        {
+            let heard = self.listen(acoustid, tracks, log).await;
+            let mut votes: HashMap<&str, usize> = HashMap::new();
+            for h in &heard {
+                for r in &h.releases {
+                    *votes.entry(r.as_str()).or_default() += 1;
+                }
+            }
+            let mut voted: Vec<(&str, usize)> = votes.into_iter().collect();
+            voted.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+            let mut looked_up = 0;
+            for (id, n) in voted {
+                if looked_up == LOOKUPS {
+                    break;
+                }
+                if releases.iter().any(|r| r.id == id) {
+                    continue;
+                }
+                let _ = writeln!(log, "acoustid: release {id} holds {n} of the files");
+                match self.mb.release(id).await {
+                    Ok(r) => releases.push(r),
+                    Err(e) => {
+                        let _ = writeln!(log, "release {id}: {e}");
+                    }
+                }
+                looked_up += 1;
+            }
+            if heard.iter().any(|h| !h.recordings.is_empty()) {
+                let recordings: Vec<_> = heard.into_iter().map(|h| h.recordings).collect();
+                matches = releases
+                    .iter()
+                    .map(|r| matching::score_with(tracks, r, &recordings))
+                    .collect();
+            }
+        }
 
         // MusicBrainz found nothing worth applying on its own: ask Discogs
         // for the same artist and album, and let the two compete on distance.
