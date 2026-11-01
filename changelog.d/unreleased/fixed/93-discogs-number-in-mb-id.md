@@ -1,0 +1,1 @@
+- **Artists are credited on albums whose MusicBrainz id is a Discogs number.** beets' discogs plugin writes the Discogs release number into `MUSICBRAINZ_ALBUMID`; crediting sent it to MusicBrainz and gave up on the album. A bare number there is now read as a Discogs release, and a release that cannot be fetched leaves the credit to be split.
