@@ -174,6 +174,21 @@ pub fn source_of(id: &str) -> Source {
     }
 }
 
+/// The release the files say they come from, as an id
+/// [`Importer::release`] takes. beets' discogs plugin writes the Discogs
+/// number into the MusicBrainz album id, which no MusicBrainz id is, so a
+/// bare number there is read as Discogs.
+fn named_release(tracks: &[Track]) -> Option<String> {
+    let discogs = |id: String| format!("discogs:{id}");
+    match matching::consensus(tracks.iter().map(|t| t.mb_album_id.as_deref())) {
+        Some(id) if id.bytes().all(|b| b.is_ascii_digit()) => Some(discogs(id)),
+        Some(id) => Some(id),
+        None => {
+            matching::consensus(tracks.iter().map(|t| t.discogs_album_id.as_deref())).map(discogs)
+        }
+    }
+}
+
 pub struct Importer {
     pub cfg: Config,
     mb: MusicBrainz,
@@ -522,24 +537,39 @@ impl Importer {
         if !tracks.iter().any(pending) {
             return Ok(out);
         }
-        let release = match tracks.iter().find_map(|t| t.mb_album_id.clone()) {
-            Some(id) if source_of(&id) == Source::MusicBrainz => match self.mb.release(&id).await {
+        // A release that cannot be fetched leaves the credit to be split,
+        // as for files that name none.
+        let release = match self.tagged_release(tracks) {
+            Some(id) => match self.release(&id).await {
                 Ok(r) => Some(r),
                 Err(e) => {
                     out.problems.push(format!("artist credits: {e}"));
-                    return Ok(out);
+                    None
                 }
             },
-            _ => None,
+            None => None,
         };
-        for t in tracks.iter().filter(|t| pending(t)) {
+        // Discogs has no ids for tracks, so files are paired with its
+        // tracks by matching.
+        let paired = release
+            .as_ref()
+            .map(|r| matching::score(tracks, r).pairs)
+            .unwrap_or_default();
+        for (i, t) in tracks.iter().enumerate().filter(|(_, t)| pending(t)) {
             let empty = Vec::new;
             let (artists, artist_ids, album_artists, album_artist_ids) = match &release {
                 Some(r) => {
-                    let rt = r.tracks().map(|(_, rt)| rt).find(|rt| {
-                        t.mb_track_id.as_ref() == Some(&rt.id)
-                            || t.mb_recording_id.as_ref() == Some(&rt.recording.id)
-                    });
+                    let rt = r
+                        .tracks()
+                        .map(|(_, rt)| rt)
+                        .find(|rt| {
+                            t.mb_track_id.as_ref() == Some(&rt.id)
+                                || t.mb_recording_id.as_ref() == Some(&rt.recording.id)
+                        })
+                        .or_else(|| {
+                            let &(_, r_i) = paired.iter().find(|(l, _)| *l == i)?;
+                            r.tracks().nth(r_i).map(|(_, rt)| rt)
+                        });
                     // A file matched to no track of the release takes the
                     // release's artists, unless the release is a compilation,
                     // whose tracks each have their own.
@@ -551,7 +581,20 @@ impl Importer {
                         _ => credited(&r.artist_credit).unzip(),
                     };
                     let (album_artists, album_artist_ids) = credited(&r.artist_credit).unzip();
-                    (artists, artist_ids, album_artists, album_artist_ids)
+                    // Discogs' artists have no MusicBrainz ids.
+                    let ids = |ids: Vec<String>| {
+                        if ids.iter().any(String::is_empty) {
+                            empty()
+                        } else {
+                            ids
+                        }
+                    };
+                    (
+                        artists,
+                        ids(artist_ids),
+                        album_artists,
+                        ids(album_artist_ids),
+                    )
                 }
                 None => {
                     let split = |credit: Option<&str>| {
@@ -1015,6 +1058,12 @@ impl Importer {
         }
     }
 
+    /// [`named_release`], when it is on a service this importer can ask.
+    fn tagged_release(&self, tracks: &[Track]) -> Option<String> {
+        named_release(tracks)
+            .filter(|id| source_of(id) == Source::MusicBrainz || self.discogs.is_some())
+    }
+
     /// A release by id, dispatched to whichever service it names.
     async fn release(&self, id: &str) -> Result<Release, ImportError> {
         match source_of(id) {
@@ -1043,20 +1092,12 @@ impl Importer {
         let mut releases: Vec<Release> = Vec::new();
         // Files that already name their release are the strongest evidence
         // there is.
-        if let Some(id) = matching::consensus(tracks.iter().map(|t| t.mb_album_id.as_deref())) {
+        if let Some(id) = self.tagged_release(tracks) {
             let _ = writeln!(log, "files are tagged with release {id}");
-            if let Ok(r) = self.mb.release(&id).await {
-                releases.push(r);
-            }
-        } else if self.discogs.is_some()
-            && let Some(id) =
-                matching::consensus(tracks.iter().map(|t| t.discogs_album_id.as_deref()))
-        {
-            let _ = writeln!(log, "files are tagged with discogs release {id}");
-            match self.release(&format!("discogs:{id}")).await {
+            match self.release(&id).await {
                 Ok(r) => releases.push(r),
                 Err(e) => {
-                    let _ = writeln!(log, "discogs release {id}: {e}");
+                    let _ = writeln!(log, "release {id}: {e}");
                 }
             }
         }
