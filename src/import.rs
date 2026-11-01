@@ -178,7 +178,7 @@ pub fn source_of(id: &str) -> Source {
 /// [`Importer::release`] takes. beets' discogs plugin writes the Discogs
 /// number into the MusicBrainz album id, which no MusicBrainz id is, so a
 /// bare number there is read as Discogs.
-fn tagged_release(tracks: &[Track]) -> Option<String> {
+fn named_release(tracks: &[Track]) -> Option<String> {
     let discogs = |id: String| format!("discogs:{id}");
     match matching::consensus(tracks.iter().map(|t| t.mb_album_id.as_deref())) {
         Some(id) if id.bytes().all(|b| b.is_ascii_digit()) => Some(discogs(id)),
@@ -555,14 +555,21 @@ impl Importer {
             .as_ref()
             .map(|r| matching::score(tracks, r).pairs)
             .unwrap_or_default();
-        for t in tracks.iter().filter(|t| pending(t)) {
+        for (i, t) in tracks.iter().enumerate().filter(|(_, t)| pending(t)) {
             let empty = Vec::new;
             let (artists, artist_ids, album_artists, album_artist_ids) = match &release {
                 Some(r) => {
-                    let rt = r.tracks().map(|(_, rt)| rt).find(|rt| {
-                        t.mb_track_id.as_ref() == Some(&rt.id)
-                            || t.mb_recording_id.as_ref() == Some(&rt.recording.id)
-                    });
+                    let rt = r
+                        .tracks()
+                        .map(|(_, rt)| rt)
+                        .find(|rt| {
+                            t.mb_track_id.as_ref() == Some(&rt.id)
+                                || t.mb_recording_id.as_ref() == Some(&rt.recording.id)
+                        })
+                        .or_else(|| {
+                            let &(_, r_i) = paired.iter().find(|(l, _)| *l == i)?;
+                            r.tracks().nth(r_i).map(|(_, rt)| rt)
+                        });
                     // A file matched to no track of the release takes the
                     // release's artists, unless the release is a compilation,
                     // whose tracks each have their own.
@@ -574,7 +581,20 @@ impl Importer {
                         _ => credited(&r.artist_credit).unzip(),
                     };
                     let (album_artists, album_artist_ids) = credited(&r.artist_credit).unzip();
-                    (artists, artist_ids, album_artists, album_artist_ids)
+                    // Discogs' artists have no MusicBrainz ids.
+                    let ids = |ids: Vec<String>| {
+                        if ids.iter().any(String::is_empty) {
+                            empty()
+                        } else {
+                            ids
+                        }
+                    };
+                    (
+                        artists,
+                        ids(artist_ids),
+                        album_artists,
+                        ids(album_artist_ids),
+                    )
                 }
                 None => {
                     let split = |credit: Option<&str>| {
@@ -1036,6 +1056,12 @@ impl Importer {
         } else {
             None
         }
+    }
+
+    /// [`named_release`], when it is on a service this importer can ask.
+    fn tagged_release(&self, tracks: &[Track]) -> Option<String> {
+        named_release(tracks)
+            .filter(|id| source_of(id) == Source::MusicBrainz || self.discogs.is_some())
     }
 
     /// A release by id, dispatched to whichever service it names.
