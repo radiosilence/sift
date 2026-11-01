@@ -29,6 +29,11 @@ const CREDIT: &str = "Orchestre Tout Puissant Marcel Duchamp × Frànçois & the
 
 /// Answers every request with `RELEASE`.
 async fn serve() -> String {
+    serve_with("200 OK", RELEASE).await
+}
+
+/// Answers every request with `status` and `body`.
+async fn serve_with(status: &'static str, body: &'static str) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}/ws/2", listener.local_addr().unwrap());
     tokio::spawn(async move {
@@ -44,8 +49,8 @@ async fn serve() -> String {
                 req.extend_from_slice(&buf[..n]);
             }
             let resp = format!(
-                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{RELEASE}",
-                RELEASE.len()
+                "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
             );
             let _ = sock.write_all(resp.as_bytes()).await;
         }
@@ -77,6 +82,12 @@ fn wav(path: &Path) {
 /// Two tracks tagged with the one-string credit, as files carry it before
 /// each artist is credited; `release` adds the ids an older import wrote.
 fn album(dir: &Path, release: bool) {
+    album_from(dir, release.then_some("rel"));
+}
+
+/// [`album`], naming `release` as the MusicBrainz album id.
+fn album_from(dir: &Path, release: Option<&str>) {
+    let ids = release == Some("rel");
     for (n, title) in [(1, "Revenant du nord"), (2, "Siilent")] {
         let f = dir.join(format!("{n}.wav"));
         wav(&f);
@@ -91,9 +102,9 @@ fn album(dir: &Path, release: bool) {
                 track_total: 2,
                 disc: 1,
                 disc_total: 1,
-                mb_album_id: release.then(|| "rel".into()),
-                mb_track_id: release.then(|| format!("t{n}")),
-                mb_artist_ids: if release {
+                mb_album_id: release.map(str::to_string),
+                mb_track_id: ids.then(|| format!("t{n}")),
+                mb_artist_ids: if ids {
                     vec!["otpmd".into()]
                 } else {
                     Vec::new()
@@ -224,4 +235,52 @@ async fn a_credit_plan_lists_each_write_and_makes_none() {
     assert_eq!(split.files.len(), 2);
     assert_eq!(split.files[0].release, None, "split from the known artists");
     assert!(split.files[0].artist_ids.is_empty());
+}
+
+fn known_pair(lib: &Path) -> Known {
+    let mut known = Known::default();
+    known.add("Orchestre Tout Puissant Marcel Duchamp", &lib.join("a"));
+    known.add("Frànçois & the Atlas Mountains", &lib.join("b"));
+    known
+}
+
+#[tokio::test]
+async fn a_discogs_number_in_the_musicbrainz_id_is_not_asked_of_musicbrainz() {
+    let root = tempfile::tempdir().unwrap();
+    let lib = root.path().join("lib");
+    let dir = lib.join("album");
+    album_from(&dir, Some("3938965"));
+    let importer = importer(&lib).await;
+
+    let plan = importer.credit_plan(&dir, &known_pair(&lib)).await.unwrap();
+    assert!(plan.problems.is_empty(), "{:?}", plan.problems);
+    assert_eq!(plan.files.len(), 2);
+    assert_eq!(
+        plan.files[0].release, None,
+        "split, not MusicBrainz's release"
+    );
+    assert_eq!(plan.files[0].album_artists, both());
+}
+
+#[tokio::test]
+async fn a_release_that_cannot_be_fetched_leaves_the_credit_to_be_split() {
+    let root = tempfile::tempdir().unwrap();
+    let lib = root.path().join("lib");
+    let dir = lib.join("album");
+    album(&dir, true);
+    let cfg = Config {
+        directory: lib.clone(),
+        fetch_art: false,
+        move_files: false,
+        cache_dir: None,
+        ..Config::default()
+    };
+    let mb = MusicBrainz::with_base(&serve_with("400 Bad Request", "{}").await, "test");
+    let importer = Importer::with_musicbrainz(cfg, mb);
+
+    let plan = importer.credit_plan(&dir, &known_pair(&lib)).await.unwrap();
+    assert_eq!(plan.problems.len(), 1, "the failure is reported");
+    assert_eq!(plan.files.len(), 2);
+    assert_eq!(plan.files[0].artists, both());
+    assert!(plan.files[0].artist_ids.is_empty());
 }
