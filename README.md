@@ -20,7 +20,7 @@ sift = { package = "sift-music", version = "0.10", default-features = false }
 ```
 
 ```console
-$ mise use -g github:radiosilence/sift        # or brew install radiosilence/sift/sift,
+$ mise use -g github:radiosilence/sift        # or brew install radiosilence/tap/sift,
                                               # or a static binary from the releases
                                               # (macOS: Apple silicon only)
 $ sift migrate-config                         # ~/.config/beets → ~/.config/sift

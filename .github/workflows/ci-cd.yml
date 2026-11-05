@@ -610,7 +610,7 @@ jobs:
           }
           MAC_ARM=$(sha macos-arm64)
           LIN_ARM=$(sha linux-arm64); LIN_X86=$(sha linux-x86_64)
-          git clone "https://x-access-token:${GITHUB_TOKEN}@github.com/radiosilence/homebrew-sift.git" tap
+          git clone "https://x-access-token:${GITHUB_TOKEN}@github.com/radiosilence/homebrew-tap.git" tap
           cd tap
           mkdir -p Formula
           BASE="https://github.com/radiosilence/sift/releases/download/v${VERSION}"
