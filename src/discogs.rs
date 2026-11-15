@@ -24,6 +24,10 @@ const BASE: &str = "https://api.discogs.com";
 const SPACING: Duration = Duration::from_millis(1050);
 const MAX_SPACING: Duration = Duration::from_secs(10);
 const ATTEMPTS: u32 = 10;
+/// How long one request keeps trying a refusing service before it is
+/// reported unavailable, so an outage puts imports off rather than holding
+/// each for minutes.
+const PATIENCE: Duration = Duration::from_secs(45);
 const RELEASE_TTL: Duration = Duration::from_secs(7 * 24 * 3600);
 const SEARCH_TTL: Duration = Duration::from_secs(24 * 3600);
 
@@ -133,6 +137,7 @@ impl Discogs {
     ) -> Result<reqwest::Response, DiscogsError> {
         let mut gate = self.gate.lock().await;
         let mut attempt = 0;
+        let started = tokio::time::Instant::now();
         loop {
             gate.wait().await;
             let sent = self
@@ -164,7 +169,7 @@ impl Discogs {
                 Err(e) if e.is_timeout() || e.is_connect() => (backoff, DiscogsError::Http(e)),
                 Err(e) => return Err(e.into()),
             };
-            if attempt >= ATTEMPTS {
+            if attempt >= ATTEMPTS || started.elapsed() + wait > PATIENCE {
                 return Err(failure);
             }
             gate.refused(wait.clamp(Duration::from_secs(1), Duration::from_secs(60)));

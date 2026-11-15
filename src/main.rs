@@ -356,7 +356,15 @@ async fn run() -> anyhow::Result<ExitCode> {
                 {
                     continue;
                 }
-                match mb.genres(&id).await {
+                let found = loop {
+                    match mb.genres(&id).await {
+                        Err(e) if let Some(rest) = e.resting_for() => {
+                            tokio::time::sleep(rest).await
+                        }
+                        found => break found,
+                    }
+                };
+                match found {
                     Ok(g) if g.is_empty() => none += 1,
                     Ok(g) => {
                         let genre = g.join("; ");
@@ -726,12 +734,20 @@ async fn imports(
 ) -> anyhow::Result<ExitCode> {
     let mut failed = false;
     for (dir, release) in jobs {
-        let outcome = if as_is {
-            importer.import_as_is(&dir, &sift::Edits::default()).await
-        } else if in_place {
-            importer.reimport(&dir, release.as_deref()).await
-        } else {
-            importer.import(&dir, release.as_deref()).await
+        // One album finding MusicBrainz unavailable rests the client; the
+        // albums after it wait the rest out rather than fail one by one.
+        let outcome = loop {
+            let outcome = if as_is {
+                importer.import_as_is(&dir, &sift::Edits::default()).await
+            } else if in_place {
+                importer.reimport(&dir, release.as_deref()).await
+            } else {
+                importer.import(&dir, release.as_deref()).await
+            };
+            match outcome.as_ref().err().and_then(|e| e.resting_for()) {
+                Some(rest) => tokio::time::sleep(rest).await,
+                None => break outcome,
+            }
         };
         let line = match outcome {
             Ok(Outcome::Imported {

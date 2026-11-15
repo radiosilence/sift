@@ -200,10 +200,25 @@ instead of disambiguated.
   agent. The service also has a global budget shared by every client, and
   refuses everyone when it runs out, so pacing adapts: refusals slow requests
   down, successes speed them back up, and a nearly spent budget is waited out.
-  Refusals, server errors and dropped connections are retried; responses are
-  cached on disk so a retried import asks for nothing twice. Cover art comes
-  from the Cover Art Archive's own thumbnails, so no image is decoded or
-  re-encoded here.
+  Refusals, server errors and dropped connections are retried for up to 45
+  seconds, honouring `Retry-After`. A request still refused then reports
+  MusicBrainz unavailable, and requests after it fail at once, without being
+  sent, until the service's last requested wait is over: an embedder queueing
+  many imports learns of an outage in seconds and can put them off, rather
+  than each import sitting through its own minutes of retries. The CLI waits
+  such a rest out between albums. Under load MusicBrainz sheds searches
+  across the whole service (a 503 in its `search` rate-limit zone with
+  `Retry-After: 0`); that is retried after a few jittered seconds without
+  slowing the client, and rests only searches, so lookups by id carry on.
+  Responses are cached on disk so a retried import asks for nothing twice.
+  Cover art comes from the Cover Art Archive's own thumbnails, so no image is
+  decoded or re-encoded here.
+- **Progress.** An embedder that shows imports as they run wraps the call in
+  `sift::progress::scope`, which hands it each stage the import reaches
+  (searching MusicBrainz, comparing candidates, a wait on MusicBrainz with
+  its reason and length, fingerprinting, Discogs, cover art, writing tags,
+  moving into the library, ReplayGain, genres, lyrics), so a slow step can be
+  told from a stuck one.
 
 - **The library index is derived, never authoritative.** `sift update`
   reads the files into SQLite so queries are milliseconds instead of a read

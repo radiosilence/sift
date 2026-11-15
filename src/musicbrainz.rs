@@ -6,8 +6,18 @@
 //! `X-RateLimit-*` headers; when that runs dry everyone is refused, however
 //! politely they ask. So the gate paces itself: refusals widen the spacing,
 //! successes relax it, and a nearly spent budget is waited out until it
-//! resets. Refusals, server errors and dropped connections are retried rather
-//! than reported.
+//! resets. Refusals, server errors and dropped connections are retried for a
+//! short while; a service still refusing after that is reported unavailable,
+//! and the client rests, failing requests at once without asking, until the
+//! last wait (its `Retry-After`, when it gave one) has passed. A caller
+//! queueing many requests behind one outage hears about it in seconds rather
+//! than each waiting out its own round of retries.
+//!
+//! Under load MusicBrainz also sheds searches across the whole service: a
+//! 503 in its `search` rate-limit zone with `Retry-After: 0`. That says
+//! nothing about this client's budget, so it does not widen the spacing, is
+//! retried after a few seconds, and rests only searches: lookups by id, which
+//! are not shed, go on.
 
 use std::time::Duration;
 
@@ -15,10 +25,19 @@ use serde::Deserialize;
 use tokio::sync::Mutex;
 use tokio::time::Instant;
 
+pub use crate::progress::Wait;
+
 const BASE: &str = "https://musicbrainz.org/ws/2";
 const SPACING: Duration = Duration::from_millis(1100);
 const MAX_SPACING: Duration = Duration::from_secs(10);
-const ATTEMPTS: u32 = 10;
+const ATTEMPTS: u32 = 5;
+/// How far after its first attempt a request may still try a refusing
+/// service before it is reported unavailable. Longer than the client's
+/// timeout, so a request that timed out is tried again.
+const PATIENCE: Duration = Duration::from_secs(45);
+const TIMEOUT: Duration = Duration::from_secs(30);
+/// The longest `Retry-After` taken at its word.
+const MAX_RETRY_AFTER: Duration = Duration::from_secs(600);
 
 #[derive(Debug, thiserror::Error)]
 pub enum MbError {
@@ -28,12 +47,17 @@ pub enum MbError {
     Unavailable(u16),
     #[error("MusicBrainz sent something unreadable: {0}")]
     Decode(String),
+    #[error("MusicBrainz was unavailable moments ago; not asking it again for {0} s")]
+    Resting(u64),
 }
 
 pub struct MusicBrainz {
     http: reqwest::Client,
     base: String,
     gate: Mutex<Gate>,
+    /// Kept apart from the gate, which a request holds through its retries,
+    /// so reading them never waits on MusicBrainz.
+    stats: std::sync::Mutex<Stats>,
     /// Responses kept on disk. Releases barely change and a retried import
     /// asks for the same ones again, so a cache is most of what stands
     /// between an import and the rate limit.
@@ -53,13 +77,20 @@ impl MusicBrainz {
         Self {
             http: reqwest::Client::builder()
                 .user_agent(agent)
-                .timeout(Duration::from_secs(30))
+                .timeout(TIMEOUT)
                 .build()
                 .expect("static client config"),
             base: base.trim_end_matches('/').to_string(),
             gate: Mutex::new(Gate::default()),
+            stats: std::sync::Mutex::new(Stats::default()),
             cache: None,
         }
+    }
+
+    /// What this client has asked of MusicBrainz, and the service's budget
+    /// as it last reported it.
+    pub fn stats(&self) -> Stats {
+        *self.stats.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Keep responses under `dir`.
@@ -103,10 +134,19 @@ impl MusicBrainz {
     }
 
     async fn send(&self, path: &str, query: &[(&str, &str)]) -> Result<reqwest::Response, MbError> {
+        let search = query.iter().any(|(k, _)| *k == "query");
         let mut gate = self.gate.lock().await;
+        if let Some(left) = gate.resting(search) {
+            return Err(MbError::Resting(left.as_secs().max(1)));
+        }
+        let started = Instant::now();
         let mut attempt = 0;
         loop {
+            let paused = gate.announce();
             gate.wait().await;
+            if paused {
+                crate::progress::resume();
+            }
             let sent = self
                 .http
                 .get(format!("{}/{path}", self.base))
@@ -114,29 +154,62 @@ impl MusicBrainz {
                 .query(&[("fmt", "json")])
                 .send()
                 .await;
+            {
+                let mut stats = self.stats.lock().unwrap_or_else(|e| e.into_inner());
+                stats.requests += 1;
+                match &sent {
+                    Ok(resp) if retryable(resp.status()) => stats.refused += 1,
+                    Ok(resp) => {
+                        if let Some(budget) = budget(resp.headers()) {
+                            stats.budget = Some(budget);
+                        }
+                    }
+                    Err(_) => stats.refused += 1,
+                }
+            }
             attempt += 1;
-            let backoff = Duration::from_secs(2u64 << attempt.min(5));
-            let (wait, failure) = match sent {
+            let backoff = jitter(Duration::from_secs(1u64 << attempt.min(5)));
+            let (wait, why, failure) = match sent {
                 Ok(resp) if retryable(resp.status()) => {
-                    let wait = resp
-                        .headers()
+                    let status = resp.status().as_u16();
+                    let headers = resp.headers();
+                    let shed = headers
+                        .get("x-ratelimit-zone")
+                        .is_some_and(|z| z.as_bytes().eq_ignore_ascii_case(b"search"));
+                    // `Retry-After: 0` asks for no wait at all; a short,
+                    // jittered one keeps clients refused together apart.
+                    let wait = match headers
                         .get(reqwest::header::RETRY_AFTER)
                         .and_then(|v| v.to_str().ok())
                         .and_then(|v| v.trim().parse::<u64>().ok())
-                        .map_or(backoff, Duration::from_secs);
-                    (wait, MbError::Unavailable(resp.status().as_u16()))
+                    {
+                        Some(secs) if secs > 0 => Duration::from_secs(secs),
+                        _ => backoff,
+                    };
+                    let why = if shed {
+                        Wait::Shed
+                    } else {
+                        Wait::Refused(status)
+                    };
+                    (wait, why, MbError::Unavailable(status))
                 }
                 Ok(resp) => {
                     gate.succeeded(resp.headers());
                     return Ok(resp);
                 }
-                Err(e) if e.is_timeout() || e.is_connect() => (backoff, MbError::Http(e)),
+                Err(e) if e.is_timeout() || e.is_connect() => {
+                    (backoff, Wait::Unreachable, MbError::Http(e))
+                }
                 Err(e) => return Err(e.into()),
             };
-            if attempt >= ATTEMPTS {
+            gate.refused(wait.clamp(Duration::from_secs(1), MAX_RETRY_AFTER), why);
+            let next_try = gate
+                .next
+                .map_or(Duration::ZERO, |n| n.saturating_duration_since(started));
+            if attempt >= ATTEMPTS || next_try > PATIENCE {
+                gate.rest(why == Wait::Shed);
                 return Err(failure);
             }
-            gate.refused(wait.clamp(Duration::from_secs(1), Duration::from_secs(60)));
         }
     }
 
@@ -318,12 +391,16 @@ fn title_case(name: &str) -> String {
         .join(" ")
 }
 
-/// Escape the characters Lucene gives meaning to, so a title like
-/// `AC/DC: Live!` is a phrase rather than syntax.
 #[derive(Debug)]
 struct Gate {
     next: Option<Instant>,
     spacing: Duration,
+    /// Until when requests fail without being sent, after one gave up.
+    resting: Option<Instant>,
+    /// The same for searches alone, after a shed search gave up.
+    resting_searches: Option<Instant>,
+    /// Why the gate holds the next request back.
+    why: Wait,
 }
 
 impl Default for Gate {
@@ -331,11 +408,31 @@ impl Default for Gate {
         Self {
             next: None,
             spacing: SPACING,
+            resting: None,
+            resting_searches: None,
+            why: Wait::Pacing,
         }
     }
 }
 
 impl Gate {
+    /// Report the wait before the next request when it is long enough to
+    /// notice; whether it did.
+    fn announce(&self) -> bool {
+        let Some(left) = self
+            .next
+            .and_then(|n| n.checked_duration_since(Instant::now()))
+            .filter(|left| *left >= Duration::from_secs(2))
+        else {
+            return false;
+        };
+        crate::progress::waiting(crate::progress::Stage::WaitingOnMusicBrainz {
+            why: self.why,
+            retry_in: left,
+        });
+        true
+    }
+
     async fn wait(&self) {
         if let Some(t) = self.next {
             tokio::time::sleep_until(t).await;
@@ -344,6 +441,7 @@ impl Gate {
 
     fn succeeded(&mut self, headers: &reqwest::header::HeaderMap) {
         self.spacing = self.spacing.mul_f64(0.9).max(SPACING);
+        self.why = Wait::Pacing;
         let mut next = Instant::now() + self.spacing;
         if let Some(reset) = budget_reset(headers) {
             next = next.max(Instant::now() + reset);
@@ -351,14 +449,62 @@ impl Gate {
         self.next = Some(next);
     }
 
-    fn refused(&mut self, wait: Duration) {
-        self.spacing = (self.spacing * 2).min(MAX_SPACING);
+    /// A refusal widens the spacing, unless it was a shed search, which
+    /// says nothing about this client's pace.
+    fn refused(&mut self, wait: Duration, why: Wait) {
+        if why != Wait::Shed {
+            self.spacing = (self.spacing * 2).min(MAX_SPACING);
+        }
+        self.why = why;
         self.next = Some(Instant::now() + wait.max(self.spacing));
     }
+
+    /// Fail requests unsent, or only searches, until the wait the last
+    /// refusal set is over.
+    fn rest(&mut self, searches: bool) {
+        if searches {
+            self.resting_searches = self.next;
+        } else {
+            self.resting = self.next;
+        }
+    }
+
+    /// How much of a rest is left for a request, a search or not.
+    fn resting(&self, search: bool) -> Option<Duration> {
+        let now = Instant::now();
+        let left = |t: Option<Instant>| t.and_then(|t| t.checked_duration_since(now));
+        let left = left(self.resting).max(left(self.resting_searches).filter(|_| search))?;
+        (!left.is_zero()).then_some(left)
+    }
+}
+
+/// `d` give or take a quarter, so clients refused together do not all
+/// return together.
+fn jitter(d: Duration) -> Duration {
+    use std::hash::BuildHasher;
+    let r = std::collections::hash_map::RandomState::new().hash_one(std::time::SystemTime::now());
+    d.mul_f64(0.75 + (r % 1000) as f64 / 2000.0)
 }
 
 fn retryable(status: reqwest::StatusCode) -> bool {
     status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
+}
+
+/// Counts of what a client has sent, for a caller showing them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Stats {
+    /// Requests sent, retries included; answers from the cache are not.
+    pub requests: u64,
+    /// Of those, refused or never answered.
+    pub refused: u64,
+    /// `(remaining, limit)` of the service's rate-limit budget, as the last
+    /// answer that reported one gave it.
+    pub budget: Option<(u64, u64)>,
+}
+
+fn budget(headers: &reqwest::header::HeaderMap) -> Option<(u64, u64)> {
+    let num = |name: &str| -> Option<u64> { headers.get(name)?.to_str().ok()?.trim().parse().ok() };
+    Some((num("x-ratelimit-remaining")?, num("x-ratelimit-limit")?))
 }
 
 /// How long until the global budget resets, when less than a twentieth of it
@@ -379,11 +525,19 @@ fn budget_reset(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
 }
 
 impl MbError {
+    /// How long the client will refuse to ask, when this is a rest.
+    pub fn resting_for(&self) -> Option<Duration> {
+        match self {
+            Self::Resting(secs) => Some(Duration::from_secs(*secs)),
+            _ => None,
+        }
+    }
+
     /// Whether trying again later could succeed: the service was busy or
     /// unreachable, not wrong about what was asked.
     pub fn is_transient(&self) -> bool {
         match self {
-            Self::Unavailable(_) => true,
+            Self::Unavailable(_) | Self::Resting(_) => true,
             Self::Http(e) => e.is_timeout() || e.is_connect() || e.status().is_some_and(retryable),
             Self::Decode(_) => false,
         }
@@ -399,6 +553,8 @@ fn various(artist: &str) -> &str {
     }
 }
 
+/// Escape the characters Lucene gives meaning to, so a title like
+/// `AC/DC: Live!` is a phrase rather than syntax.
 fn lucene(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
@@ -630,13 +786,32 @@ mod tests {
     fn spacing_widens_on_refusal_and_relaxes_on_success() {
         let mut gate = Gate::default();
         for _ in 0..10 {
-            gate.refused(Duration::from_secs(1));
+            gate.refused(Duration::from_secs(1), Wait::Shed);
+        }
+        assert_eq!(
+            gate.spacing, SPACING,
+            "a shed search is not this client's pace"
+        );
+        for _ in 0..10 {
+            gate.refused(Duration::from_secs(1), Wait::Refused(503));
         }
         assert_eq!(gate.spacing, MAX_SPACING);
         for _ in 0..100 {
             gate.succeeded(&reqwest::header::HeaderMap::new());
         }
         assert_eq!(gate.spacing, SPACING);
+    }
+
+    #[test]
+    fn a_shed_search_rests_searches_and_not_lookups() {
+        let mut gate = Gate::default();
+        gate.refused(Duration::from_secs(5), Wait::Shed);
+        gate.rest(true);
+        assert!(gate.resting(true).is_some());
+        assert!(gate.resting(false).is_none());
+        gate.refused(Duration::from_secs(5), Wait::Refused(503));
+        gate.rest(false);
+        assert!(gate.resting(false).is_some());
     }
 
     #[test]

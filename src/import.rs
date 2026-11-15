@@ -43,6 +43,15 @@ pub enum ImportError {
 }
 
 impl ImportError {
+    /// How long MusicBrainz will not be asked, when this is its rest: a
+    /// caller working through many albums waits that long and tries again.
+    pub fn resting_for(&self) -> Option<std::time::Duration> {
+        match self {
+            Self::MusicBrainz(e) => e.resting_for(),
+            _ => None,
+        }
+    }
+
     /// Whether the same import could succeed later without anything
     /// changing here.
     pub fn is_transient(&self) -> bool {
@@ -383,6 +392,11 @@ impl Importer {
         }
     }
 
+    /// What the importer has asked of MusicBrainz so far.
+    pub fn musicbrainz_stats(&self) -> crate::musicbrainz::Stats {
+        self.mb.stats()
+    }
+
     /// Identify weakly matched files by their audio through `acoustid`,
     /// whatever the configuration says.
     pub fn with_acoustid(mut self, acoustid: crate::acoustid::AcoustId) -> Self {
@@ -654,6 +668,7 @@ impl Importer {
         };
         let paths: Vec<PathBuf> = tracks.iter().map(|t| t.path.clone()).collect();
 
+        crate::progress::report(crate::progress::Stage::ReplayGain);
         let measured = {
             let paths = paths.clone();
             tokio::task::spawn_blocking(move || crate::replaygain::album(&paths, 2))
@@ -766,6 +781,7 @@ impl Importer {
             .iter()
             .all(|t| t.genre.as_deref().is_none_or(|g| g.trim().is_empty()));
         if untagged && let Some(id) = tracks.iter().find_map(|t| t.mb_album_id.clone()) {
+            crate::progress::report(crate::progress::Stage::Genres);
             match self.mb.genres(&id).await {
                 Ok(g) => out.genres = g,
                 Err(e) => out.problems.push(format!("genres: {e}")),
@@ -782,6 +798,7 @@ impl Importer {
         })
         .await
         .expect("tag reader panicked");
+        crate::progress::report(crate::progress::Stage::Lyrics);
         for ((t, artist, title), has) in wanted.into_iter().zip(has) {
             if has {
                 continue;
@@ -840,7 +857,10 @@ impl Importer {
         }
 
         let mut matches = match release_id {
-            Some(id) => vec![matching::score(&tracks, &self.release(id).await?)],
+            Some(id) => {
+                crate::progress::report(crate::progress::Stage::AskingMusicBrainz);
+                vec![matching::score(&tracks, &self.release(id).await?)]
+            }
             None => self.candidates(dir, &tracks, &mut log).await?,
         };
         matches.sort_by(|a, b| a.distance.total_cmp(&b.distance));
@@ -1094,8 +1114,10 @@ impl Importer {
         // there is.
         if let Some(id) = self.tagged_release(tracks) {
             let _ = writeln!(log, "files are tagged with release {id}");
+            crate::progress::report(crate::progress::Stage::AskingMusicBrainz);
             match self.release(&id).await {
                 Ok(r) => releases.push(r),
+                Err(e) if e.is_transient() => return Err(e),
                 Err(e) => {
                     let _ = writeln!(log, "release {id}: {e}");
                 }
@@ -1107,6 +1129,7 @@ impl Importer {
         // fallback, for the release whose edition really is in its name.
         let base = matching::base_title(&album);
         let mut hits = Vec::new();
+        crate::progress::report(crate::progress::Stage::SearchingMusicBrainz);
         for title in std::iter::once(base.as_str()).chain((base != album).then_some(album.as_str()))
         {
             let _ = writeln!(log, "searching for {artist:?} — {title:?}");
@@ -1120,6 +1143,14 @@ impl Importer {
         // lookups run out before the list does.
         hits.retain(|h| h.score >= 50);
         hits.sort_by_key(|h| h.track_count.abs_diff(tracks.len()));
+        let to_look_up = hits
+            .iter()
+            .filter(|h| !releases.iter().any(|r| r.id == h.id))
+            .take(LOOKUPS)
+            .count();
+        crate::progress::report(crate::progress::Stage::Comparing(
+            releases.len() + to_look_up,
+        ));
         let mut looked_up = 0;
         for hit in hits {
             if looked_up == LOOKUPS {
@@ -1146,6 +1177,7 @@ impl Importer {
         if let Some(acoustid) = &self.acoustid
             && best > self.cfg.strong_threshold
         {
+            crate::progress::report(crate::progress::Stage::Fingerprinting);
             let heard = self.listen(acoustid, tracks, log).await;
             let mut votes: HashMap<&str, usize> = HashMap::new();
             for h in &heard {
@@ -1166,6 +1198,9 @@ impl Importer {
                 let _ = writeln!(log, "acoustid: release {id} holds {n} of the files");
                 match self.mb.release(id).await {
                     Ok(r) => releases.push(r),
+                    // Unavailable now is unavailable for the rest: the
+                    // import is put off, not decided on what was reached.
+                    Err(e) if e.is_transient() => return Err(e.into()),
                     Err(e) => {
                         let _ = writeln!(log, "release {id}: {e}");
                     }
@@ -1191,6 +1226,7 @@ impl Importer {
             && best > self.cfg.strong_threshold
         {
             let _ = writeln!(log, "searching discogs for {artist:?} — {album:?}");
+            crate::progress::report(crate::progress::Stage::AskingDiscogs);
             match discogs.search(&artist, &album).await {
                 Ok(ids) => {
                     let index_tracks = self.cfg.discogs.as_ref().is_some_and(|d| d.index_tracks);
@@ -1401,6 +1437,7 @@ impl Importer {
         taken.sort();
         taken.dedup();
 
+        crate::progress::report(crate::progress::Stage::CoverArt);
         let cover_art = if self.cfg.fetch_art {
             self.cover(release, tracks).await
         } else {
@@ -1446,6 +1483,12 @@ impl Importer {
         // dropped import future cannot stop it half way: it finishes, or
         // its journal puts every file back where it was. Tags already
         // written to a moved file's source stay written.
+        let progress = crate::progress::sink();
+        let report = move |stage| {
+            if let Some(p) = &progress {
+                p(&stage);
+            }
+        };
         let replaced = {
             let new_dir = new_dir.clone();
             tokio::task::spawn_blocking(move || -> Result<Vec<(PathBuf, PathBuf)>, ImportError> {
@@ -1471,12 +1514,18 @@ impl Importer {
                     }
                     Ok(())
                 };
-                for (from, to, stays, tags, same) in &work {
-                    // Moving: the source is ours to change, so tag it and
-                    // move it. Copying: the source must come out untouched,
-                    // so copy first and tag the copy.
-                    if moving {
+                report(crate::progress::Stage::WritingTags);
+                // Moving: the source is ours to change, so tag it and move
+                // it. Copying: the source must come out untouched, so copy
+                // first and tag the copy.
+                if moving {
+                    for (from, _, _, tags, same) in &work {
                         write(from, tags, *same)?;
+                    }
+                }
+                report(crate::progress::Stage::Moving);
+                for (from, to, stays, tags, same) in &work {
+                    if moving {
                         if !stays {
                             journal.transfer(from, to, true)?;
                         }

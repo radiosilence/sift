@@ -58,7 +58,65 @@ async fn refusals_and_server_errors_are_waited_out() {
     let found = mb.search_releases("a", "b", 5).await.unwrap();
     assert!(found.is_empty());
     assert_eq!(hits.load(Ordering::SeqCst), 4);
+    let stats = mb.stats();
+    assert_eq!((stats.requests, stats.refused), (4, 3));
     assert!(started.elapsed() >= Duration::from_secs(3));
+}
+
+#[tokio::test]
+async fn a_long_retry_after_gives_up_and_rests_until_it_is_over() {
+    let (base, hits) = serve(vec![(503, "retry-after: 45\r\n", "")]).await;
+    let mb = MusicBrainz::with_base(&base, "test");
+    let started = Instant::now();
+    let err = mb.search_releases("a", "b", 5).await.unwrap_err();
+    assert!(err.is_transient());
+    assert!(started.elapsed() < Duration::from_secs(5), "not waited out");
+    // Every request after it fails at once, unsent, until the 45 seconds
+    // the service asked for are over.
+    let err = mb.search_releases("a", "c", 5).await.unwrap_err();
+    assert!(err.is_transient());
+    assert!(err.to_string().contains("not asking it again"), "{err}");
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn a_wait_on_a_refusal_is_reported_to_the_progress_scope() {
+    let (base, _) = serve(vec![(503, "retry-after: 2\r\n", ""), (200, "", EMPTY)]).await;
+    let mb = MusicBrainz::with_base(&base, "test");
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let log = seen.clone();
+    sift::progress::scope(
+        move |s: &sift::progress::Stage| log.lock().unwrap().push(s.to_string()),
+        mb.search_releases("a", "b", 5),
+    )
+    .await
+    .unwrap();
+    let seen = seen.lock().unwrap();
+    assert!(
+        seen.iter()
+            .any(|s| s.starts_with("waiting on MusicBrainz (HTTP 503), retrying in")),
+        "{seen:?}"
+    );
+}
+
+const SHED: &str = "x-ratelimit-zone: search\r\nx-ratelimit-who: search-shed\r\nretry-after: 0\r\n";
+
+#[tokio::test]
+async fn a_shed_search_is_retried_soon_without_slowing_the_client() {
+    let (base, hits) = serve(vec![(503, SHED, ""), (200, "", EMPTY), (200, "", EMPTY)]).await;
+    let mb = MusicBrainz::with_base(&base, "test");
+    let started = Instant::now();
+    mb.search_releases("a", "b", 5).await.unwrap();
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "seconds, not minutes"
+    );
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+    // Spacing is as before the shed: the next request is not held back
+    // the way an ordinary refusal holds it.
+    let started = Instant::now();
+    mb.search_releases("a", "c", 5).await.unwrap();
+    assert!(started.elapsed() < Duration::from_millis(1500));
 }
 
 #[tokio::test]

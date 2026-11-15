@@ -34,6 +34,8 @@ mod par;
 #[cfg(feature = "tagger")]
 pub mod paths;
 #[cfg(feature = "tagger")]
+pub mod progress;
+#[cfg(feature = "tagger")]
 pub mod replaygain;
 
 #[cfg(feature = "tagger")]
