@@ -8,7 +8,7 @@ The library is published to crates.io as `sift-music`, since `sift` was taken;
 it is still imported as `sift`:
 
 ```toml
-sift = { package = "sift-music", version = "0.10" }
+sift = { package = "sift-music", version = "0.11" }
 ```
 
 The `tagger` feature, on by default, is everything but `sift::format`, the
@@ -16,7 +16,7 @@ fb2k-style template engine. A program that only formats paths can turn it off
 and build none of the tagger's dependencies:
 
 ```toml
-sift = { package = "sift-music", version = "0.10", default-features = false }
+sift = { package = "sift-music", version = "0.11", default-features = false }
 ```
 
 ```console
