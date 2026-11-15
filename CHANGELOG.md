@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.11.0
+
+### Added
+
+- **Import progress.** `sift::progress::scope` passes each stage an import reaches, including waits on MusicBrainz with their reason and length, to a callback, and `Importer::musicbrainz_stats` gives the requests sent, refused and the rate-limit budget last reported, for embedders that show imports live.
+
+### Changed
+
+- **One Homebrew tap.** Install from `radiosilence/tap`, which holds every radiosilence formula and cask; `brew update` moves installs from the old per-project tap.
+
+### Fixed
+
+- **A refusing MusicBrainz is reported in seconds, not minutes, and shed searches no longer slow the client.** A request used to retry for about six minutes while holding the pacing gate, so every import queued behind an outage waited through its own round. It now retries for up to 45 seconds, honouring `Retry-After`, then fails requests unsent until the requested wait is over; the CLI waits that rest out between albums. A 503 that sheds searches service-wide (`x-ratelimit-zone: search`, `Retry-After: 0`) is retried after a few jittered seconds, leaves the pacing alone and rests only searches, so lookups by id continue.
+
 ## 0.10.2
 
 ### Fixed
