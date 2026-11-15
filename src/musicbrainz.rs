@@ -8,10 +8,16 @@
 //! successes relax it, and a nearly spent budget is waited out until it
 //! resets. Refusals, server errors and dropped connections are retried for a
 //! short while; a service still refusing after that is reported unavailable,
-//! and the client rests, failing every request at once without asking, until
-//! the last wait (its `Retry-After`, when it gave one) has passed. A caller
+//! and the client rests, failing requests at once without asking, until the
+//! last wait (its `Retry-After`, when it gave one) has passed. A caller
 //! queueing many requests behind one outage hears about it in seconds rather
 //! than each waiting out its own round of retries.
+//!
+//! Under load MusicBrainz also sheds searches across the whole service: a
+//! 503 in its `search` rate-limit zone with `Retry-After: 0`. That says
+//! nothing about this client's budget, so it does not widen the spacing, is
+//! retried after a few seconds, and rests only searches: lookups by id, which
+//! are not shed, go on.
 
 use std::time::Duration;
 
@@ -19,13 +25,17 @@ use serde::Deserialize;
 use tokio::sync::Mutex;
 use tokio::time::Instant;
 
+pub use crate::progress::Wait;
+
 const BASE: &str = "https://musicbrainz.org/ws/2";
 const SPACING: Duration = Duration::from_millis(1100);
 const MAX_SPACING: Duration = Duration::from_secs(10);
 const ATTEMPTS: u32 = 5;
-/// How long one request keeps trying a refusing service before it is
-/// reported unavailable.
-const PATIENCE: Duration = Duration::from_secs(30);
+/// How far after its first attempt a request may still try a refusing
+/// service before it is reported unavailable. Longer than the client's
+/// timeout, so a request that timed out is tried again.
+const PATIENCE: Duration = Duration::from_secs(45);
+const TIMEOUT: Duration = Duration::from_secs(30);
 /// The longest `Retry-After` taken at its word.
 const MAX_RETRY_AFTER: Duration = Duration::from_secs(600);
 
@@ -64,7 +74,7 @@ impl MusicBrainz {
         Self {
             http: reqwest::Client::builder()
                 .user_agent(agent)
-                .timeout(Duration::from_secs(30))
+                .timeout(TIMEOUT)
                 .build()
                 .expect("static client config"),
             base: base.trim_end_matches('/').to_string(),
@@ -114,28 +124,18 @@ impl MusicBrainz {
     }
 
     async fn send(&self, path: &str, query: &[(&str, &str)]) -> Result<reqwest::Response, MbError> {
+        let search = query.iter().any(|(k, _)| *k == "query");
         let mut gate = self.gate.lock().await;
-        if let Some(left) = gate.resting() {
+        if let Some(left) = gate.resting(search) {
             return Err(MbError::Resting(left.as_secs().max(1)));
         }
         let started = Instant::now();
         let mut attempt = 0;
-        let mut paused = false;
         loop {
-            if let Some(next) = gate.next
-                && let Some(left) = next.checked_duration_since(Instant::now())
-                && left >= Duration::from_secs(2)
-            {
-                crate::progress::waiting(crate::progress::Stage::WaitingOnMusicBrainz {
-                    status: gate.refused_with,
-                    retry_in: left,
-                });
-                paused = true;
-            }
+            let paused = gate.announce();
             gate.wait().await;
             if paused {
                 crate::progress::resume();
-                paused = false;
             }
             let sent = self
                 .http
@@ -146,27 +146,45 @@ impl MusicBrainz {
                 .await;
             attempt += 1;
             let backoff = jitter(Duration::from_secs(1u64 << attempt.min(5)));
-            let (wait, failure) = match sent {
+            let (wait, why, failure) = match sent {
                 Ok(resp) if retryable(resp.status()) => {
-                    let wait = resp
-                        .headers()
+                    let status = resp.status().as_u16();
+                    let headers = resp.headers();
+                    let shed = headers
+                        .get("x-ratelimit-zone")
+                        .is_some_and(|z| z.as_bytes().eq_ignore_ascii_case(b"search"));
+                    // `Retry-After: 0` asks for no wait at all; a short,
+                    // jittered one keeps clients refused together apart.
+                    let wait = match headers
                         .get(reqwest::header::RETRY_AFTER)
                         .and_then(|v| v.to_str().ok())
                         .and_then(|v| v.trim().parse::<u64>().ok())
-                        .map_or(backoff, Duration::from_secs);
-                    gate.refused_with = Some(resp.status().as_u16());
-                    (wait, MbError::Unavailable(resp.status().as_u16()))
+                    {
+                        Some(secs) if secs > 0 => Duration::from_secs(secs),
+                        _ => backoff,
+                    };
+                    let why = if shed {
+                        Wait::Shed
+                    } else {
+                        Wait::Refused(status)
+                    };
+                    (wait, why, MbError::Unavailable(status))
                 }
                 Ok(resp) => {
                     gate.succeeded(resp.headers());
                     return Ok(resp);
                 }
-                Err(e) if e.is_timeout() || e.is_connect() => (backoff, MbError::Http(e)),
+                Err(e) if e.is_timeout() || e.is_connect() => {
+                    (backoff, Wait::Unreachable, MbError::Http(e))
+                }
                 Err(e) => return Err(e.into()),
             };
-            gate.refused(wait.clamp(Duration::from_secs(1), MAX_RETRY_AFTER));
-            if attempt >= ATTEMPTS || started.elapsed() + wait > PATIENCE {
-                gate.rest();
+            gate.refused(wait.clamp(Duration::from_secs(1), MAX_RETRY_AFTER), why);
+            let next_try = gate
+                .next
+                .map_or(Duration::ZERO, |n| n.saturating_duration_since(started));
+            if attempt >= ATTEMPTS || next_try > PATIENCE {
+                gate.rest(why == Wait::Shed);
                 return Err(failure);
             }
         }
@@ -356,8 +374,10 @@ struct Gate {
     spacing: Duration,
     /// Until when requests fail without being sent, after one gave up.
     resting: Option<Instant>,
-    /// The status of the refusal behind the current wait, if one is.
-    refused_with: Option<u16>,
+    /// The same for searches alone, after a shed search gave up.
+    resting_searches: Option<Instant>,
+    /// Why the gate holds the next request back.
+    why: Wait,
 }
 
 impl Default for Gate {
@@ -366,12 +386,30 @@ impl Default for Gate {
             next: None,
             spacing: SPACING,
             resting: None,
-            refused_with: None,
+            resting_searches: None,
+            why: Wait::Pacing,
         }
     }
 }
 
 impl Gate {
+    /// Report the wait before the next request when it is long enough to
+    /// notice; whether it did.
+    fn announce(&self) -> bool {
+        let Some(left) = self
+            .next
+            .and_then(|n| n.checked_duration_since(Instant::now()))
+            .filter(|left| *left >= Duration::from_secs(2))
+        else {
+            return false;
+        };
+        crate::progress::waiting(crate::progress::Stage::WaitingOnMusicBrainz {
+            why: self.why,
+            retry_in: left,
+        });
+        true
+    }
+
     async fn wait(&self) {
         if let Some(t) = self.next {
             tokio::time::sleep_until(t).await;
@@ -380,7 +418,7 @@ impl Gate {
 
     fn succeeded(&mut self, headers: &reqwest::header::HeaderMap) {
         self.spacing = self.spacing.mul_f64(0.9).max(SPACING);
-        self.refused_with = None;
+        self.why = Wait::Pacing;
         let mut next = Instant::now() + self.spacing;
         if let Some(reset) = budget_reset(headers) {
             next = next.max(Instant::now() + reset);
@@ -388,19 +426,31 @@ impl Gate {
         self.next = Some(next);
     }
 
-    fn refused(&mut self, wait: Duration) {
-        self.spacing = (self.spacing * 2).min(MAX_SPACING);
+    /// A refusal widens the spacing, unless it was a shed search, which
+    /// says nothing about this client's pace.
+    fn refused(&mut self, wait: Duration, why: Wait) {
+        if why != Wait::Shed {
+            self.spacing = (self.spacing * 2).min(MAX_SPACING);
+        }
+        self.why = why;
         self.next = Some(Instant::now() + wait.max(self.spacing));
     }
 
-    /// Fail requests unsent until the wait the last refusal set is over.
-    fn rest(&mut self) {
-        self.resting = self.next;
+    /// Fail requests unsent, or only searches, until the wait the last
+    /// refusal set is over.
+    fn rest(&mut self, searches: bool) {
+        if searches {
+            self.resting_searches = self.next;
+        } else {
+            self.resting = self.next;
+        }
     }
 
-    /// How much of a rest is left.
-    fn resting(&self) -> Option<Duration> {
-        let left = self.resting?.checked_duration_since(Instant::now())?;
+    /// How much of a rest is left for a request, a search or not.
+    fn resting(&self, search: bool) -> Option<Duration> {
+        let now = Instant::now();
+        let left = |t: Option<Instant>| t.and_then(|t| t.checked_duration_since(now));
+        let left = left(self.resting).max(left(self.resting_searches).filter(|_| search))?;
         (!left.is_zero()).then_some(left)
     }
 }
@@ -435,6 +485,14 @@ fn budget_reset(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
 }
 
 impl MbError {
+    /// How long the client will refuse to ask, when this is a rest.
+    pub fn resting_for(&self) -> Option<Duration> {
+        match self {
+            Self::Resting(secs) => Some(Duration::from_secs(*secs)),
+            _ => None,
+        }
+    }
+
     /// Whether trying again later could succeed: the service was busy or
     /// unreachable, not wrong about what was asked.
     pub fn is_transient(&self) -> bool {

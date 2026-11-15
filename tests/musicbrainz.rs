@@ -97,6 +97,26 @@ async fn a_wait_on_a_refusal_is_reported_to_the_progress_scope() {
     );
 }
 
+const SHED: &str = "x-ratelimit-zone: search\r\nx-ratelimit-who: search-shed\r\nretry-after: 0\r\n";
+
+#[tokio::test]
+async fn a_shed_search_is_retried_soon_without_slowing_the_client() {
+    let (base, hits) = serve(vec![(503, SHED, ""), (200, "", EMPTY), (200, "", EMPTY)]).await;
+    let mb = MusicBrainz::with_base(&base, "test");
+    let started = Instant::now();
+    mb.search_releases("a", "b", 5).await.unwrap();
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "seconds, not minutes"
+    );
+    assert_eq!(hits.load(Ordering::SeqCst), 2);
+    // Spacing is as before the shed: the next request is not held back
+    // the way an ordinary refusal holds it.
+    let started = Instant::now();
+    mb.search_releases("a", "c", 5).await.unwrap();
+    assert!(started.elapsed() < Duration::from_millis(1500));
+}
+
 #[tokio::test]
 async fn a_bad_request_is_not_retried() {
     let (base, hits) = serve(vec![(400, "", "{}")]).await;

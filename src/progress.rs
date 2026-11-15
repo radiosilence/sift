@@ -13,18 +13,46 @@ pub enum Stage {
     SearchingMusicBrainz,
     /// Looking up the releases a search found, to compare against the files.
     Comparing(usize),
-    /// Paused before asking MusicBrainz again: refused with `status`, or
-    /// pacing itself when `status` is `None`.
+    /// Looking up a release already named, by the files or the caller.
+    AskingMusicBrainz,
+    /// Paused before asking MusicBrainz again.
     WaitingOnMusicBrainz {
-        status: Option<u16>,
+        why: Wait,
         retry_in: Duration,
     },
     Fingerprinting,
     AskingDiscogs,
+    CoverArt,
     WritingTags,
     ReplayGain,
+    Genres,
     Lyrics,
     Moving,
+}
+
+/// Why MusicBrainz is being waited on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Wait {
+    /// Refused with this status.
+    Refused(u16),
+    /// Searches shed across the whole service, not this client's doing.
+    Shed,
+    /// No connection, or no answer in time.
+    Unreachable,
+    /// Keeping to its pace, or to a nearly spent budget.
+    Pacing,
+}
+
+impl std::fmt::Display for Wait {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Refused(429) => f.write_str("rate limited"),
+            Self::Refused(s) => write!(f, "HTTP {s}"),
+            Self::Shed => f.write_str("searches shed under load"),
+            Self::Unreachable => f.write_str("unreachable"),
+            Self::Pacing => f.write_str("pacing"),
+        }
+    }
 }
 
 impl std::fmt::Display for Stage {
@@ -36,12 +64,8 @@ impl std::fmt::Display for Stage {
                 "comparing {n} candidate{}",
                 if *n == 1 { "" } else { "s" }
             ),
-            Self::WaitingOnMusicBrainz { status, retry_in } => {
-                let why = match status {
-                    Some(429) => "rate limited".to_string(),
-                    Some(s) => format!("HTTP {s}"),
-                    None => "pacing".to_string(),
-                };
+            Self::AskingMusicBrainz => f.write_str("asking MusicBrainz"),
+            Self::WaitingOnMusicBrainz { why, retry_in } => {
                 write!(
                     f,
                     "waiting on MusicBrainz ({why}), retrying in {}s",
@@ -50,8 +74,10 @@ impl std::fmt::Display for Stage {
             }
             Self::Fingerprinting => f.write_str("fingerprinting on AcoustID"),
             Self::AskingDiscogs => f.write_str("asking Discogs"),
+            Self::CoverArt => f.write_str("fetching cover art"),
             Self::WritingTags => f.write_str("writing tags"),
             Self::ReplayGain => f.write_str("measuring ReplayGain"),
+            Self::Genres => f.write_str("fetching genres"),
             Self::Lyrics => f.write_str("fetching lyrics"),
             Self::Moving => f.write_str("moving into the library"),
         }
@@ -121,7 +147,7 @@ mod tests {
             async {
                 report(Stage::SearchingMusicBrainz);
                 waiting(Stage::WaitingOnMusicBrainz {
-                    status: Some(503),
+                    why: Wait::Refused(503),
                     retry_in: Duration::from_millis(1500),
                 });
                 resume();

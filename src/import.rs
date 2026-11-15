@@ -43,6 +43,15 @@ pub enum ImportError {
 }
 
 impl ImportError {
+    /// How long MusicBrainz will not be asked, when this is its rest: a
+    /// caller working through many albums waits that long and tries again.
+    pub fn resting_for(&self) -> Option<std::time::Duration> {
+        match self {
+            Self::MusicBrainz(e) => e.resting_for(),
+            _ => None,
+        }
+    }
+
     /// Whether the same import could succeed later without anything
     /// changing here.
     pub fn is_transient(&self) -> bool {
@@ -767,6 +776,7 @@ impl Importer {
             .iter()
             .all(|t| t.genre.as_deref().is_none_or(|g| g.trim().is_empty()));
         if untagged && let Some(id) = tracks.iter().find_map(|t| t.mb_album_id.clone()) {
+            crate::progress::report(crate::progress::Stage::Genres);
             match self.mb.genres(&id).await {
                 Ok(g) => out.genres = g,
                 Err(e) => out.problems.push(format!("genres: {e}")),
@@ -842,7 +852,10 @@ impl Importer {
         }
 
         let mut matches = match release_id {
-            Some(id) => vec![matching::score(&tracks, &self.release(id).await?)],
+            Some(id) => {
+                crate::progress::report(crate::progress::Stage::AskingMusicBrainz);
+                vec![matching::score(&tracks, &self.release(id).await?)]
+            }
             None => self.candidates(dir, &tracks, &mut log).await?,
         };
         matches.sort_by(|a, b| a.distance.total_cmp(&b.distance));
@@ -1096,8 +1109,10 @@ impl Importer {
         // there is.
         if let Some(id) = self.tagged_release(tracks) {
             let _ = writeln!(log, "files are tagged with release {id}");
+            crate::progress::report(crate::progress::Stage::AskingMusicBrainz);
             match self.release(&id).await {
                 Ok(r) => releases.push(r),
+                Err(e) if e.is_transient() => return Err(e),
                 Err(e) => {
                     let _ = writeln!(log, "release {id}: {e}");
                 }
@@ -1123,8 +1138,13 @@ impl Importer {
         // lookups run out before the list does.
         hits.retain(|h| h.score >= 50);
         hits.sort_by_key(|h| h.track_count.abs_diff(tracks.len()));
+        let to_look_up = hits
+            .iter()
+            .filter(|h| !releases.iter().any(|r| r.id == h.id))
+            .take(LOOKUPS)
+            .count();
         crate::progress::report(crate::progress::Stage::Comparing(
-            releases.len() + hits.len().min(LOOKUPS),
+            releases.len() + to_look_up,
         ));
         let mut looked_up = 0;
         for hit in hits {
@@ -1173,6 +1193,9 @@ impl Importer {
                 let _ = writeln!(log, "acoustid: release {id} holds {n} of the files");
                 match self.mb.release(id).await {
                     Ok(r) => releases.push(r),
+                    // Unavailable now is unavailable for the rest: the
+                    // import is put off, not decided on what was reached.
+                    Err(e) if e.is_transient() => return Err(e.into()),
                     Err(e) => {
                         let _ = writeln!(log, "release {id}: {e}");
                     }
@@ -1409,7 +1432,7 @@ impl Importer {
         taken.sort();
         taken.dedup();
 
-        crate::progress::report(crate::progress::Stage::WritingTags);
+        crate::progress::report(crate::progress::Stage::CoverArt);
         let cover_art = if self.cfg.fetch_art {
             self.cover(release, tracks).await
         } else {
@@ -1486,6 +1509,7 @@ impl Importer {
                     }
                     Ok(())
                 };
+                report(crate::progress::Stage::WritingTags);
                 // Moving: the source is ours to change, so tag it and move
                 // it. Copying: the source must come out untouched, so copy
                 // first and tag the copy.
