@@ -746,13 +746,32 @@ mod tests {
     fn spacing_widens_on_refusal_and_relaxes_on_success() {
         let mut gate = Gate::default();
         for _ in 0..10 {
-            gate.refused(Duration::from_secs(1));
+            gate.refused(Duration::from_secs(1), Wait::Shed);
+        }
+        assert_eq!(
+            gate.spacing, SPACING,
+            "a shed search is not this client's pace"
+        );
+        for _ in 0..10 {
+            gate.refused(Duration::from_secs(1), Wait::Refused(503));
         }
         assert_eq!(gate.spacing, MAX_SPACING);
         for _ in 0..100 {
             gate.succeeded(&reqwest::header::HeaderMap::new());
         }
         assert_eq!(gate.spacing, SPACING);
+    }
+
+    #[test]
+    fn a_shed_search_rests_searches_and_not_lookups() {
+        let mut gate = Gate::default();
+        gate.refused(Duration::from_secs(5), Wait::Shed);
+        gate.rest(true);
+        assert!(gate.resting(true).is_some());
+        assert!(gate.resting(false).is_none());
+        gate.refused(Duration::from_secs(5), Wait::Refused(503));
+        gate.rest(false);
+        assert!(gate.resting(false).is_some());
     }
 
     #[test]
