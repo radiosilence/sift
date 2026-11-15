@@ -62,6 +62,22 @@ async fn refusals_and_server_errors_are_waited_out() {
 }
 
 #[tokio::test]
+async fn a_long_retry_after_gives_up_and_rests_until_it_is_over() {
+    let (base, hits) = serve(vec![(503, "retry-after: 45\r\n", "")]).await;
+    let mb = MusicBrainz::with_base(&base, "test");
+    let started = Instant::now();
+    let err = mb.search_releases("a", "b", 5).await.unwrap_err();
+    assert!(err.is_transient());
+    assert!(started.elapsed() < Duration::from_secs(5), "not waited out");
+    // Every request after it fails at once, unsent, until the 45 seconds
+    // the service asked for are over.
+    let err = mb.search_releases("a", "c", 5).await.unwrap_err();
+    assert!(err.is_transient());
+    assert!(err.to_string().contains("not asking it again"), "{err}");
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
 async fn a_bad_request_is_not_retried() {
     let (base, hits) = serve(vec![(400, "", "{}")]).await;
     let mb = MusicBrainz::with_base(&base, "test");

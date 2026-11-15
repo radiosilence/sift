@@ -200,7 +200,12 @@ instead of disambiguated.
   agent. The service also has a global budget shared by every client, and
   refuses everyone when it runs out, so pacing adapts: refusals slow requests
   down, successes speed them back up, and a nearly spent budget is waited out.
-  Refusals, server errors and dropped connections are retried; responses are
+  Refusals, server errors and dropped connections are retried for up to 30
+  seconds, honouring `Retry-After`. A request still refused then reports
+  MusicBrainz unavailable, and requests after it fail at once, without being
+  sent, until the service's last requested wait is over: an embedder queueing
+  many imports learns of an outage in seconds and can put them off, rather
+  than each import sitting through its own minutes of retries. Responses are
   cached on disk so a retried import asks for nothing twice. Cover art comes
   from the Cover Art Archive's own thumbnails, so no image is decoded or
   re-encoded here.

@@ -6,8 +6,12 @@
 //! `X-RateLimit-*` headers; when that runs dry everyone is refused, however
 //! politely they ask. So the gate paces itself: refusals widen the spacing,
 //! successes relax it, and a nearly spent budget is waited out until it
-//! resets. Refusals, server errors and dropped connections are retried rather
-//! than reported.
+//! resets. Refusals, server errors and dropped connections are retried for a
+//! short while; a service still refusing after that is reported unavailable,
+//! and the client rests, failing every request at once without asking, until
+//! the last wait (its `Retry-After`, when it gave one) has passed. A caller
+//! queueing many requests behind one outage hears about it in seconds rather
+//! than each waiting out its own round of retries.
 
 use std::time::Duration;
 
@@ -18,7 +22,12 @@ use tokio::time::Instant;
 const BASE: &str = "https://musicbrainz.org/ws/2";
 const SPACING: Duration = Duration::from_millis(1100);
 const MAX_SPACING: Duration = Duration::from_secs(10);
-const ATTEMPTS: u32 = 10;
+const ATTEMPTS: u32 = 5;
+/// How long one request keeps trying a refusing service before it is
+/// reported unavailable.
+const PATIENCE: Duration = Duration::from_secs(30);
+/// The longest `Retry-After` taken at its word.
+const MAX_RETRY_AFTER: Duration = Duration::from_secs(600);
 
 #[derive(Debug, thiserror::Error)]
 pub enum MbError {
@@ -28,6 +37,8 @@ pub enum MbError {
     Unavailable(u16),
     #[error("MusicBrainz sent something unreadable: {0}")]
     Decode(String),
+    #[error("MusicBrainz was unavailable moments ago; not asking it again for {0} s")]
+    Resting(u64),
 }
 
 pub struct MusicBrainz {
@@ -104,6 +115,10 @@ impl MusicBrainz {
 
     async fn send(&self, path: &str, query: &[(&str, &str)]) -> Result<reqwest::Response, MbError> {
         let mut gate = self.gate.lock().await;
+        if let Some(left) = gate.resting() {
+            return Err(MbError::Resting(left.as_secs().max(1)));
+        }
+        let started = Instant::now();
         let mut attempt = 0;
         loop {
             gate.wait().await;
@@ -115,7 +130,7 @@ impl MusicBrainz {
                 .send()
                 .await;
             attempt += 1;
-            let backoff = Duration::from_secs(2u64 << attempt.min(5));
+            let backoff = jitter(Duration::from_secs(1u64 << attempt.min(5)));
             let (wait, failure) = match sent {
                 Ok(resp) if retryable(resp.status()) => {
                     let wait = resp
@@ -133,10 +148,11 @@ impl MusicBrainz {
                 Err(e) if e.is_timeout() || e.is_connect() => (backoff, MbError::Http(e)),
                 Err(e) => return Err(e.into()),
             };
-            if attempt >= ATTEMPTS {
+            gate.refused(wait.clamp(Duration::from_secs(1), MAX_RETRY_AFTER));
+            if attempt >= ATTEMPTS || started.elapsed() + wait > PATIENCE {
+                gate.rest();
                 return Err(failure);
             }
-            gate.refused(wait.clamp(Duration::from_secs(1), Duration::from_secs(60)));
         }
     }
 
@@ -318,12 +334,12 @@ fn title_case(name: &str) -> String {
         .join(" ")
 }
 
-/// Escape the characters Lucene gives meaning to, so a title like
-/// `AC/DC: Live!` is a phrase rather than syntax.
 #[derive(Debug)]
 struct Gate {
     next: Option<Instant>,
     spacing: Duration,
+    /// Until when requests fail without being sent, after one gave up.
+    resting: Option<Instant>,
 }
 
 impl Default for Gate {
@@ -331,6 +347,7 @@ impl Default for Gate {
         Self {
             next: None,
             spacing: SPACING,
+            resting: None,
         }
     }
 }
@@ -355,6 +372,25 @@ impl Gate {
         self.spacing = (self.spacing * 2).min(MAX_SPACING);
         self.next = Some(Instant::now() + wait.max(self.spacing));
     }
+
+    /// Fail requests unsent until the wait the last refusal set is over.
+    fn rest(&mut self) {
+        self.resting = self.next;
+    }
+
+    /// How much of a rest is left.
+    fn resting(&self) -> Option<Duration> {
+        let left = self.resting?.checked_duration_since(Instant::now())?;
+        (!left.is_zero()).then_some(left)
+    }
+}
+
+/// `d` give or take a quarter, so clients refused together do not all
+/// return together.
+fn jitter(d: Duration) -> Duration {
+    use std::hash::BuildHasher;
+    let r = std::collections::hash_map::RandomState::new().hash_one(std::time::SystemTime::now());
+    d.mul_f64(0.75 + (r % 1000) as f64 / 2000.0)
 }
 
 fn retryable(status: reqwest::StatusCode) -> bool {
@@ -383,7 +419,7 @@ impl MbError {
     /// unreachable, not wrong about what was asked.
     pub fn is_transient(&self) -> bool {
         match self {
-            Self::Unavailable(_) => true,
+            Self::Unavailable(_) | Self::Resting(_) => true,
             Self::Http(e) => e.is_timeout() || e.is_connect() || e.status().is_some_and(retryable),
             Self::Decode(_) => false,
         }
@@ -399,6 +435,8 @@ fn various(artist: &str) -> &str {
     }
 }
 
+/// Escape the characters Lucene gives meaning to, so a title like
+/// `AC/DC: Live!` is a phrase rather than syntax.
 fn lucene(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
