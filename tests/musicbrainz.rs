@@ -58,6 +58,8 @@ async fn refusals_and_server_errors_are_waited_out() {
     let found = mb.search_releases("a", "b", 5).await.unwrap();
     assert!(found.is_empty());
     assert_eq!(hits.load(Ordering::SeqCst), 4);
+    let stats = mb.stats();
+    assert_eq!((stats.requests, stats.refused), (4, 3));
     assert!(started.elapsed() >= Duration::from_secs(3));
 }
 

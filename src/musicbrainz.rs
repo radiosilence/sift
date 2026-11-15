@@ -55,6 +55,9 @@ pub struct MusicBrainz {
     http: reqwest::Client,
     base: String,
     gate: Mutex<Gate>,
+    /// Kept apart from the gate, which a request holds through its retries,
+    /// so reading them never waits on MusicBrainz.
+    stats: std::sync::Mutex<Stats>,
     /// Responses kept on disk. Releases barely change and a retried import
     /// asks for the same ones again, so a cache is most of what stands
     /// between an import and the rate limit.
@@ -79,8 +82,15 @@ impl MusicBrainz {
                 .expect("static client config"),
             base: base.trim_end_matches('/').to_string(),
             gate: Mutex::new(Gate::default()),
+            stats: std::sync::Mutex::new(Stats::default()),
             cache: None,
         }
+    }
+
+    /// What this client has asked of MusicBrainz, and the service's budget
+    /// as it last reported it.
+    pub fn stats(&self) -> Stats {
+        *self.stats.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// Keep responses under `dir`.
@@ -144,6 +154,19 @@ impl MusicBrainz {
                 .query(&[("fmt", "json")])
                 .send()
                 .await;
+            {
+                let mut stats = self.stats.lock().unwrap_or_else(|e| e.into_inner());
+                stats.requests += 1;
+                match &sent {
+                    Ok(resp) if retryable(resp.status()) => stats.refused += 1,
+                    Ok(resp) => {
+                        if let Some(budget) = budget(resp.headers()) {
+                            stats.budget = Some(budget);
+                        }
+                    }
+                    Err(_) => stats.refused += 1,
+                }
+            }
             attempt += 1;
             let backoff = jitter(Duration::from_secs(1u64 << attempt.min(5)));
             let (wait, why, failure) = match sent {
@@ -465,6 +488,23 @@ fn jitter(d: Duration) -> Duration {
 
 fn retryable(status: reqwest::StatusCode) -> bool {
     status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
+}
+
+/// Counts of what a client has sent, for a caller showing them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Stats {
+    /// Requests sent, retries included; answers from the cache are not.
+    pub requests: u64,
+    /// Of those, refused or never answered.
+    pub refused: u64,
+    /// `(remaining, limit)` of the service's rate-limit budget, as the last
+    /// answer that reported one gave it.
+    pub budget: Option<(u64, u64)>,
+}
+
+fn budget(headers: &reqwest::header::HeaderMap) -> Option<(u64, u64)> {
+    let num = |name: &str| -> Option<u64> { headers.get(name)?.to_str().ok()?.trim().parse().ok() };
+    Some((num("x-ratelimit-remaining")?, num("x-ratelimit-limit")?))
 }
 
 /// How long until the global budget resets, when less than a twentieth of it

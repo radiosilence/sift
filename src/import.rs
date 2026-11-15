@@ -392,6 +392,11 @@ impl Importer {
         }
     }
 
+    /// What the importer has asked of MusicBrainz so far.
+    pub fn musicbrainz_stats(&self) -> crate::musicbrainz::Stats {
+        self.mb.stats()
+    }
+
     /// Identify weakly matched files by their audio through `acoustid`,
     /// whatever the configuration says.
     pub fn with_acoustid(mut self, acoustid: crate::acoustid::AcoustId) -> Self {
