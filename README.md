@@ -206,7 +206,12 @@ instead of disambiguated.
   sent, until the service's last requested wait is over: an embedder queueing
   many imports learns of an outage in seconds and can put them off, rather
   than each import sitting through its own minutes of retries. Responses are
-  cached on disk so a retried import asks for nothing twice. Cover art comes
+  cached on disk so a retried import asks for nothing twice.
+- **Progress.** An embedder that shows imports as they run wraps the call in
+  `sift::progress::scope`, which hands it each stage the import reaches
+  (searching MusicBrainz, comparing candidates, a wait on MusicBrainz and how
+  long it is, fingerprinting, Discogs, writing tags, ReplayGain, lyrics,
+  moving into the library), so a slow step can be told from a stuck one. Cover art comes
   from the Cover Art Archive's own thumbnails, so no image is decoded or
   re-encoded here.
 

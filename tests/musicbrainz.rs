@@ -78,6 +78,26 @@ async fn a_long_retry_after_gives_up_and_rests_until_it_is_over() {
 }
 
 #[tokio::test]
+async fn a_wait_on_a_refusal_is_reported_to_the_progress_scope() {
+    let (base, _) = serve(vec![(503, "retry-after: 2\r\n", ""), (200, "", EMPTY)]).await;
+    let mb = MusicBrainz::with_base(&base, "test");
+    let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let log = seen.clone();
+    sift::progress::scope(
+        move |s: &sift::progress::Stage| log.lock().unwrap().push(s.to_string()),
+        mb.search_releases("a", "b", 5),
+    )
+    .await
+    .unwrap();
+    let seen = seen.lock().unwrap();
+    assert!(
+        seen.iter()
+            .any(|s| s.starts_with("waiting on MusicBrainz (HTTP 503), retrying in")),
+        "{seen:?}"
+    );
+}
+
+#[tokio::test]
 async fn a_bad_request_is_not_retried() {
     let (base, hits) = serve(vec![(400, "", "{}")]).await;
     let mb = MusicBrainz::with_base(&base, "test");

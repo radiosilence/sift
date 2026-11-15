@@ -120,8 +120,23 @@ impl MusicBrainz {
         }
         let started = Instant::now();
         let mut attempt = 0;
+        let mut paused = false;
         loop {
+            if let Some(next) = gate.next
+                && let Some(left) = next.checked_duration_since(Instant::now())
+                && left >= Duration::from_secs(2)
+            {
+                crate::progress::waiting(crate::progress::Stage::WaitingOnMusicBrainz {
+                    status: gate.refused_with,
+                    retry_in: left,
+                });
+                paused = true;
+            }
             gate.wait().await;
+            if paused {
+                crate::progress::resume();
+                paused = false;
+            }
             let sent = self
                 .http
                 .get(format!("{}/{path}", self.base))
@@ -139,6 +154,7 @@ impl MusicBrainz {
                         .and_then(|v| v.to_str().ok())
                         .and_then(|v| v.trim().parse::<u64>().ok())
                         .map_or(backoff, Duration::from_secs);
+                    gate.refused_with = Some(resp.status().as_u16());
                     (wait, MbError::Unavailable(resp.status().as_u16()))
                 }
                 Ok(resp) => {
@@ -340,6 +356,8 @@ struct Gate {
     spacing: Duration,
     /// Until when requests fail without being sent, after one gave up.
     resting: Option<Instant>,
+    /// The status of the refusal behind the current wait, if one is.
+    refused_with: Option<u16>,
 }
 
 impl Default for Gate {
@@ -348,6 +366,7 @@ impl Default for Gate {
             next: None,
             spacing: SPACING,
             resting: None,
+            refused_with: None,
         }
     }
 }
@@ -361,6 +380,7 @@ impl Gate {
 
     fn succeeded(&mut self, headers: &reqwest::header::HeaderMap) {
         self.spacing = self.spacing.mul_f64(0.9).max(SPACING);
+        self.refused_with = None;
         let mut next = Instant::now() + self.spacing;
         if let Some(reset) = budget_reset(headers) {
             next = next.max(Instant::now() + reset);

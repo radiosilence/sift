@@ -1,0 +1,1 @@
+- **Import progress.** `sift::progress::scope` passes each stage an import reaches, including waits on MusicBrainz and their length, to a callback, for embedders that show imports live.

@@ -654,6 +654,7 @@ impl Importer {
         };
         let paths: Vec<PathBuf> = tracks.iter().map(|t| t.path.clone()).collect();
 
+        crate::progress::report(crate::progress::Stage::ReplayGain);
         let measured = {
             let paths = paths.clone();
             tokio::task::spawn_blocking(move || crate::replaygain::album(&paths, 2))
@@ -782,6 +783,7 @@ impl Importer {
         })
         .await
         .expect("tag reader panicked");
+        crate::progress::report(crate::progress::Stage::Lyrics);
         for ((t, artist, title), has) in wanted.into_iter().zip(has) {
             if has {
                 continue;
@@ -1107,6 +1109,7 @@ impl Importer {
         // fallback, for the release whose edition really is in its name.
         let base = matching::base_title(&album);
         let mut hits = Vec::new();
+        crate::progress::report(crate::progress::Stage::SearchingMusicBrainz);
         for title in std::iter::once(base.as_str()).chain((base != album).then_some(album.as_str()))
         {
             let _ = writeln!(log, "searching for {artist:?} — {title:?}");
@@ -1120,6 +1123,9 @@ impl Importer {
         // lookups run out before the list does.
         hits.retain(|h| h.score >= 50);
         hits.sort_by_key(|h| h.track_count.abs_diff(tracks.len()));
+        crate::progress::report(crate::progress::Stage::Comparing(
+            releases.len() + hits.len().min(LOOKUPS),
+        ));
         let mut looked_up = 0;
         for hit in hits {
             if looked_up == LOOKUPS {
@@ -1146,6 +1152,7 @@ impl Importer {
         if let Some(acoustid) = &self.acoustid
             && best > self.cfg.strong_threshold
         {
+            crate::progress::report(crate::progress::Stage::Fingerprinting);
             let heard = self.listen(acoustid, tracks, log).await;
             let mut votes: HashMap<&str, usize> = HashMap::new();
             for h in &heard {
@@ -1191,6 +1198,7 @@ impl Importer {
             && best > self.cfg.strong_threshold
         {
             let _ = writeln!(log, "searching discogs for {artist:?} — {album:?}");
+            crate::progress::report(crate::progress::Stage::AskingDiscogs);
             match discogs.search(&artist, &album).await {
                 Ok(ids) => {
                     let index_tracks = self.cfg.discogs.as_ref().is_some_and(|d| d.index_tracks);
@@ -1401,6 +1409,7 @@ impl Importer {
         taken.sort();
         taken.dedup();
 
+        crate::progress::report(crate::progress::Stage::WritingTags);
         let cover_art = if self.cfg.fetch_art {
             self.cover(release, tracks).await
         } else {
@@ -1446,6 +1455,12 @@ impl Importer {
         // dropped import future cannot stop it half way: it finishes, or
         // its journal puts every file back where it was. Tags already
         // written to a moved file's source stay written.
+        let progress = crate::progress::sink();
+        let report = move |stage| {
+            if let Some(p) = &progress {
+                p(&stage);
+            }
+        };
         let replaced = {
             let new_dir = new_dir.clone();
             tokio::task::spawn_blocking(move || -> Result<Vec<(PathBuf, PathBuf)>, ImportError> {
@@ -1471,12 +1486,17 @@ impl Importer {
                     }
                     Ok(())
                 };
-                for (from, to, stays, tags, same) in &work {
-                    // Moving: the source is ours to change, so tag it and
-                    // move it. Copying: the source must come out untouched,
-                    // so copy first and tag the copy.
-                    if moving {
+                // Moving: the source is ours to change, so tag it and move
+                // it. Copying: the source must come out untouched, so copy
+                // first and tag the copy.
+                if moving {
+                    for (from, _, _, tags, same) in &work {
                         write(from, tags, *same)?;
+                    }
+                }
+                report(crate::progress::Stage::Moving);
+                for (from, to, stays, tags, same) in &work {
+                    if moving {
                         if !stays {
                             journal.transfer(from, to, true)?;
                         }
