@@ -157,6 +157,9 @@ pub enum Outcome {
         /// The release applied; none for an import as-is.
         release: Option<Candidate>,
         log: String,
+        /// Why MusicBrainz could not be asked, when Discogs was searched in
+        /// its place.
+        musicbrainz_unavailable: Option<String>,
     },
     /// Nothing was changed. `candidates` is best first; importing again with
     /// one of their ids applies it.
@@ -164,6 +167,9 @@ pub enum Outcome {
         reason: String,
         candidates: Vec<Candidate>,
         log: String,
+        /// Why MusicBrainz could not be asked, when Discogs was searched in
+        /// its place.
+        musicbrainz_unavailable: Option<String>,
     },
 }
 
@@ -856,10 +862,13 @@ impl Importer {
             );
         }
 
-        let mut matches = match release_id {
+        let (mut matches, musicbrainz_unavailable) = match release_id {
             Some(id) => {
                 crate::progress::report(crate::progress::Stage::AskingMusicBrainz);
-                vec![matching::score(&tracks, &self.release(id).await?)]
+                (
+                    vec![matching::score(&tracks, &self.release(id).await?)],
+                    None,
+                )
             }
             None => self.candidates(dir, &tracks, &mut log).await?,
         };
@@ -869,6 +878,7 @@ impl Importer {
                 reason: "no candidates found on MusicBrainz".into(),
                 candidates: Vec::new(),
                 log,
+                musicbrainz_unavailable,
             });
         };
         let _ = writeln!(
@@ -884,10 +894,17 @@ impl Importer {
         if release_id.is_none()
             && let Some(reason) = self.review_reason(best)
         {
+            let reason = match &musicbrainz_unavailable {
+                Some(e) => {
+                    format!("{reason}; Discogs searched because MusicBrainz was unavailable ({e})")
+                }
+                None => reason,
+            };
             return Ok(Outcome::Review {
                 reason,
                 candidates: matches.iter().take(5).map(Candidate::from).collect(),
                 log,
+                musicbrainz_unavailable,
             });
         }
         let best = best.clone();
@@ -896,6 +913,7 @@ impl Importer {
             dir: dest,
             release: Some(Candidate::from(&best)),
             log,
+            musicbrainz_unavailable,
         })
     }
 
@@ -950,6 +968,7 @@ impl Importer {
             dir: dest,
             release: None,
             log,
+            musicbrainz_unavailable: None,
         })
     }
 
@@ -981,7 +1000,7 @@ impl Importer {
     /// choice rather than apply it.
     pub async fn rematch(&self, dir: &Path) -> Result<Rematch, ImportError> {
         let (tracks, _) = one_copy_each(read_dir(dir).await?);
-        let mut matches = self.candidates(dir, &tracks, &mut String::new()).await?;
+        let (mut matches, _) = self.candidates(dir, &tracks, &mut String::new()).await?;
         matches.sort_by(|a, b| a.distance.total_cmp(&b.distance));
         Ok(Rematch {
             best: matches.first().map(|m| comparison(&tracks, m)),
@@ -1103,10 +1122,83 @@ impl Importer {
         }
     }
 
+    /// Releases the files might be, scored: MusicBrainz's, with Discogs'
+    /// beside them when MusicBrainz found nothing strong. When MusicBrainz is
+    /// unavailable, Discogs is searched in its place and the error comes
+    /// back beside its matches; only when Discogs has nothing either is the
+    /// error returned, for the import to be put off.
     async fn candidates(
         &self,
         dir: &Path,
         tracks: &[Track],
+        log: &mut String,
+    ) -> Result<(Vec<Match>, Option<String>), ImportError> {
+        let (artist, album) = self.query_terms(dir, tracks);
+        let (mut matches, unavailable) = match self
+            .musicbrainz_candidates(tracks, &artist, &album, log)
+            .await
+        {
+            Ok(matches) => (matches, None),
+            Err(e) if e.is_transient() && self.discogs.is_some() => {
+                let _ = writeln!(
+                    log,
+                    "musicbrainz unavailable ({e}); searching discogs in its place"
+                );
+                (Vec::new(), Some(e))
+            }
+            Err(e) => return Err(e),
+        };
+
+        // MusicBrainz found nothing worth applying on its own: ask Discogs
+        // for the same artist and album, and let the two compete on distance.
+        let best = matches
+            .iter()
+            .map(|m| m.distance)
+            .fold(f64::INFINITY, f64::min);
+        if let Some(discogs) = &self.discogs
+            && best > self.cfg.strong_threshold
+        {
+            let _ = writeln!(log, "searching discogs for {artist:?} — {album:?}");
+            crate::progress::report(crate::progress::Stage::AskingDiscogs);
+            match discogs.search(&artist, &album).await {
+                Ok(ids) => {
+                    let index_tracks = self.cfg.discogs.as_ref().is_some_and(|d| d.index_tracks);
+                    for id in ids.into_iter().take(5) {
+                        match discogs.release(id, index_tracks).await {
+                            Ok(r) => matches.push(matching::score(tracks, &r)),
+                            Err(e) => {
+                                let _ = writeln!(log, "discogs release {id}: {e}");
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    let _ = writeln!(log, "discogs search failed: {e}");
+                }
+            }
+        }
+        match unavailable {
+            Some(e) if matches.is_empty() => {
+                let _ = writeln!(log, "discogs had nothing either; waiting for musicbrainz");
+                Err(e)
+            }
+            Some(e) => {
+                let _ = writeln!(log, "discogs used because musicbrainz was unavailable");
+                Ok((matches, Some(e.to_string())))
+            }
+            None => Ok((matches, None)),
+        }
+    }
+
+    /// MusicBrainz's candidates: the release the files name, a search by
+    /// artist and album, and AcoustID's releases when those are not strong.
+    /// Any transient failure fails the lot: a match decided on part of the
+    /// evidence would be a guess.
+    async fn musicbrainz_candidates(
+        &self,
+        tracks: &[Track],
+        artist: &str,
+        album: &str,
         log: &mut String,
     ) -> Result<Vec<Match>, ImportError> {
         let mut releases: Vec<Release> = Vec::new();
@@ -1123,17 +1215,15 @@ impl Importer {
                 }
             }
         }
-        let (artist, album) = self.query_terms(dir, tracks);
         // The plain title first: an edition suffix is in the tags far more
         // often than in MusicBrainz's title. The title as tagged is the
         // fallback, for the release whose edition really is in its name.
-        let base = matching::base_title(&album);
+        let base = matching::base_title(album);
         let mut hits = Vec::new();
         crate::progress::report(crate::progress::Stage::SearchingMusicBrainz);
-        for title in std::iter::once(base.as_str()).chain((base != album).then_some(album.as_str()))
-        {
+        for title in std::iter::once(base.as_str()).chain((base != album).then_some(album)) {
             let _ = writeln!(log, "searching for {artist:?} — {title:?}");
-            hits = self.mb.search_releases(&artist, title, 10).await?;
+            hits = self.mb.search_releases(artist, title, 10).await?;
             if hits.iter().any(|h| h.score >= 50) {
                 break;
             }
@@ -1213,35 +1303,6 @@ impl Importer {
                     .iter()
                     .map(|r| matching::score_with(tracks, r, &recordings))
                     .collect();
-            }
-        }
-
-        // MusicBrainz found nothing worth applying on its own: ask Discogs
-        // for the same artist and album, and let the two compete on distance.
-        let best = matches
-            .iter()
-            .map(|m| m.distance)
-            .fold(f64::INFINITY, f64::min);
-        if let Some(discogs) = &self.discogs
-            && best > self.cfg.strong_threshold
-        {
-            let _ = writeln!(log, "searching discogs for {artist:?} — {album:?}");
-            crate::progress::report(crate::progress::Stage::AskingDiscogs);
-            match discogs.search(&artist, &album).await {
-                Ok(ids) => {
-                    let index_tracks = self.cfg.discogs.as_ref().is_some_and(|d| d.index_tracks);
-                    for id in ids.into_iter().take(5) {
-                        match discogs.release(id, index_tracks).await {
-                            Ok(r) => matches.push(matching::score(tracks, &r)),
-                            Err(e) => {
-                                let _ = writeln!(log, "discogs release {id}: {e}");
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    let _ = writeln!(log, "discogs search failed: {e}");
-                }
             }
         }
         Ok(matches)
@@ -2028,12 +2089,46 @@ fn names_in(list: &[String], credit: &str) -> Vec<String> {
     if fits { list.to_vec() } else { Vec::new() }
 }
 
+/// A lone file with no album tag, as a single: its own album, named by its
+/// title, as track 1. A store's single (Bandcamp's among them) is tagged
+/// this way, often titled "Title / Artist"; the artist is dropped from the
+/// title when it repeats the file's artist.
+fn as_single(t: &Track) -> Option<Track> {
+    let (number, name) = number_and_title(&t.path);
+    let title = t.title.clone().filter(|s| !s.trim().is_empty()).or(name)?;
+    let title = match (title.rsplit_once(" / "), t.artist.as_deref()) {
+        (Some((name, credit)), Some(artist))
+            if !name.trim().is_empty() && !names_in(&[artist.to_string()], credit).is_empty() =>
+        {
+            name.trim().to_string()
+        }
+        _ => title,
+    };
+    Some(Track {
+        album: Some(title.clone()),
+        title: Some(title),
+        track: t.track.or(number).or(Some(1)),
+        ..t.clone()
+    })
+}
+
 /// Tags for filing each file as it is, or why its tags cannot be trusted to.
 fn as_is_tags(
     tracks: &[Track],
     ft: Option<&crate::config::FtInTitle>,
 ) -> Result<Vec<(usize, Tags)>, ImportError> {
     let norm = |s: Option<&str>| s.map(matching::normalise).filter(|s| !s.is_empty());
+    let single;
+    let tracks = match tracks {
+        [t] if norm(t.album.as_deref()).is_none() => match as_single(t) {
+            Some(t) => {
+                single = [t];
+                &single[..]
+            }
+            None => tracks,
+        },
+        _ => tracks,
+    };
     let album = matching::consensus(tracks.iter().map(|t| t.album.as_deref()))
         .ok_or_else(|| ImportError::Untagged("no album tag".into()))?;
     let disagree = tracks
@@ -2384,13 +2479,10 @@ mod tests {
 
     #[test]
     fn empty_edited_values_do_not_pass_for_tags() {
-        let mut tracks = vec![tagged(
-            "a/untitled.flac",
-            None,
-            Some("A"),
-            Some(1),
-            Some("x"),
-        )];
+        let mut tracks = vec![
+            tagged("a/01 x.flac", None, Some("A"), Some(1), Some("x")),
+            tagged("a/02 y.flac", None, Some("A"), Some(2), Some("y")),
+        ];
         let e = Edits {
             album: Some("   ".into()),
             ..Edits::default()
@@ -2432,6 +2524,145 @@ mod tests {
         assert_eq!(entries[0].1.album_artist, "ANNA");
     }
 
+    /// A local server answering each request with the next of `script`
+    /// (status, extra headers, body), repeating the last.
+    async fn serve(script: Vec<(u16, &'static str, &'static str)>) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            for n in 0.. {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let (status, headers, body) = script[n.min(script.len() - 1)];
+                let mut buf = [0u8; 4096];
+                let mut req = Vec::new();
+                while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let read = sock.read(&mut buf).await.unwrap();
+                    if read == 0 {
+                        break;
+                    }
+                    req.extend_from_slice(&buf[..read]);
+                }
+                let resp = format!(
+                    "HTTP/1.1 {status} X\r\n{headers}content-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+            }
+        });
+        base
+    }
+
+    /// An importer whose MusicBrainz sheds every search, and whose Discogs
+    /// answers from `discogs`.
+    async fn musicbrainz_down(discogs: Vec<(u16, &'static str, &'static str)>) -> Importer {
+        let mb = serve(vec![(503, "retry-after: 45\r\n", "")]).await;
+        let discogs = serve(discogs).await;
+        Importer::with_clients(
+            Config::default(),
+            MusicBrainz::with_base(&mb, "test"),
+            Some(Discogs::with_base(&discogs, "token", "test")),
+        )
+    }
+
+    fn geogaddi() -> Vec<Track> {
+        ["Ready Lets Go", "Music Is Math"]
+            .iter()
+            .enumerate()
+            .map(|(i, title)| {
+                let mut t = tagged(
+                    &format!("a/0{} {title}.flac", i + 1),
+                    Some("Geogaddi"),
+                    Some("Boards of Canada"),
+                    Some(i as u32 + 1),
+                    Some(title),
+                );
+                t.duration = std::time::Duration::from_secs([59, 321][i]);
+                t
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn discogs_stands_in_for_an_unavailable_musicbrainz() {
+        let importer = musicbrainz_down(vec![
+            (200, "", r#"{"results":[{"id":1811056}]}"#),
+            (
+                200,
+                "",
+                r#"{"title": "Geogaddi",
+                    "artists": [{"name": "Boards of Canada", "join": ""}],
+                    "tracklist": [
+                        {"position": "A1", "type_": "track", "title": "Ready Lets Go", "duration": "0:59"},
+                        {"position": "A2", "type_": "track", "title": "Music Is Math", "duration": "5:21"}
+                    ]}"#,
+            ),
+        ])
+        .await;
+        let mut log = String::new();
+        let (matches, unavailable) = importer
+            .candidates(Path::new("a"), &geogaddi(), &mut log)
+            .await
+            .unwrap();
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].release.id, "discogs:1811056");
+        assert!(
+            matches[0].distance <= importer.cfg.strong_threshold,
+            "{log}"
+        );
+        assert!(unavailable.is_some());
+        assert!(
+            log.contains("discogs used because musicbrainz was unavailable"),
+            "{log}"
+        );
+    }
+
+    #[tokio::test]
+    async fn with_nothing_on_discogs_either_the_import_waits_for_musicbrainz() {
+        let importer = musicbrainz_down(vec![(200, "", r#"{"results":[]}"#)]).await;
+        let err = importer
+            .candidates(Path::new("a"), &geogaddi(), &mut String::new())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ImportError::MusicBrainz(_)), "{err}");
+        assert!(err.is_transient());
+    }
+
+    #[test]
+    fn as_is_files_a_lone_untagged_file_as_a_single() {
+        let entries = as_is_tags(
+            &[tagged(
+                "a/Hannah Moule x Pink Oyster - Mulch Me.flac",
+                None,
+                Some("Hannah Moule x Pink Oyster"),
+                None,
+                Some("Mulch Me / Hannah Moule x Pink Oyster"),
+            )],
+            None,
+        )
+        .unwrap();
+        let t = &entries[0].1;
+        assert_eq!(
+            (t.album.as_str(), t.title.as_str(), t.album_artist.as_str()),
+            ("Mulch Me", "Mulch Me", "Hannah Moule x Pink Oyster")
+        );
+        assert_eq!((t.track, t.track_total), (1, 1));
+
+        // A slash that does not credit the artist is part of the title.
+        let entries = as_is_tags(
+            &[tagged(
+                "a/x.flac",
+                None,
+                Some("A"),
+                None,
+                Some("Either / Or"),
+            )],
+            None,
+        )
+        .unwrap();
+        assert_eq!(entries[0].1.album, "Either / Or");
+    }
+
     #[test]
     fn as_is_calls_many_artists_a_compilation() {
         let entries = as_is_tags(
@@ -2454,7 +2685,10 @@ mod tests {
             other => panic!("expected a refusal about {why:?}, got {other:?}"),
         };
         refuse(
-            &[tagged("a/01 x.flac", None, Some("A"), Some(1), Some("x"))],
+            &[
+                tagged("a/01 x.flac", None, Some("A"), Some(1), Some("x")),
+                tagged("a/02 y.flac", None, Some("A"), Some(2), Some("y")),
+            ],
             "no album",
         );
         refuse(

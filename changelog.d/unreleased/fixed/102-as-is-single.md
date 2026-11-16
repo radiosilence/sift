@@ -1,0 +1,1 @@
+- **A lone file with no album tag is filed as-is as a single.** Its title names the album, with a trailing " / Artist" dropped when it repeats the artist, the artist names the album artist and it becomes track 1. Store singles, Bandcamp's among them, are tagged this way and were refused for having no album tag.
