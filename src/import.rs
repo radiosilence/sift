@@ -2531,9 +2531,11 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move {
-            for n in 0.. {
+            let mut n = 0;
+            loop {
                 let (mut sock, _) = listener.accept().await.unwrap();
                 let (status, headers, body) = script[n.min(script.len() - 1)];
+                n += 1;
                 let mut buf = [0u8; 4096];
                 let mut req = Vec::new();
                 while !req.windows(4).any(|w| w == b"\r\n\r\n") {
