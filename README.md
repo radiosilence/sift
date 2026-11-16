@@ -203,9 +203,11 @@ instead of disambiguated.
   Refusals, server errors and dropped connections are retried for up to 45
   seconds, honouring `Retry-After`. A request still refused then reports
   MusicBrainz unavailable, and requests after it fail at once, without being
-  sent, until the service's last requested wait is over: an embedder queueing
-  many imports learns of an outage in seconds and can put them off, rather
-  than each import sitting through its own minutes of retries. The CLI waits
+  sent, until the service's last requested wait is over or for at least half
+  a minute, doubling with each give-up in a row up to ten minutes: an
+  embedder queueing many imports learns of an outage in seconds and can put
+  them off, rather than each import sitting through its own minutes of
+  retries, and a long outage is asked about less and less often. The CLI waits
   such a rest out between albums. Under load MusicBrainz sheds searches
   across the whole service (a 503 in its `search` rate-limit zone with
   `Retry-After: 0`); that is retried after a few jittered seconds without
