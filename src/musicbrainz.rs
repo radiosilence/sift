@@ -835,40 +835,44 @@ mod tests {
         assert!(gate.resting(false).is_some());
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn each_give_up_in_a_row_rests_longer_until_a_success() {
+    fn secs(d: Option<Duration>) -> u64 {
+        d.unwrap().as_secs_f64().round() as u64
+    }
+
+    #[test]
+    fn each_give_up_in_a_row_rests_longer_until_a_success() {
         let mut gate = Gate::default();
         let rests: Vec<u64> = (0..7)
             .map(|_| {
                 gate.refused(Duration::from_secs(1), Wait::Refused(503));
                 gate.rest(false);
-                gate.resting(false).unwrap().as_secs()
+                secs(gate.resting(false))
             })
             .collect();
         assert_eq!(rests, [30, 60, 120, 240, 480, 600, 600]);
         gate.succeeded(&reqwest::header::HeaderMap::new(), false);
         gate.refused(Duration::from_secs(1), Wait::Refused(503));
         gate.rest(false);
-        assert_eq!(gate.resting(false).unwrap().as_secs(), 30);
+        assert_eq!(secs(gate.resting(false)), 30);
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn a_long_retry_after_outlasts_the_rest() {
+    #[test]
+    fn a_long_retry_after_outlasts_the_rest() {
         let mut gate = Gate::default();
         gate.refused(Duration::from_secs(300), Wait::Refused(503));
         gate.rest(false);
-        assert_eq!(gate.resting(false).unwrap().as_secs(), 300);
+        assert_eq!(secs(gate.resting(false)), 300);
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn a_lookup_answered_does_not_forgive_shed_searches() {
+    #[test]
+    fn a_lookup_answered_does_not_forgive_shed_searches() {
         let mut gate = Gate::default();
         gate.refused(Duration::from_secs(1), Wait::Shed);
         gate.rest(true);
         gate.succeeded(&reqwest::header::HeaderMap::new(), false);
         gate.refused(Duration::from_secs(1), Wait::Shed);
         gate.rest(true);
-        assert_eq!(gate.resting(true).unwrap().as_secs(), 60);
+        assert_eq!(secs(gate.resting(true)), 60);
     }
 
     #[test]
