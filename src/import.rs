@@ -1139,7 +1139,15 @@ impl Importer {
             .await
         {
             Ok(matches) => (matches, None),
-            Err(e) if e.is_transient() && self.discogs.is_some() => {
+            // Not for files that name their MusicBrainz release: that is
+            // the answer, and it is worth waiting for.
+            Err(e @ ImportError::MusicBrainz(_))
+                if e.is_transient()
+                    && self.discogs.is_some()
+                    && self
+                        .tagged_release(tracks)
+                        .is_none_or(|id| source_of(&id) != Source::MusicBrainz) =>
+            {
                 let _ = writeln!(
                     log,
                     "musicbrainz unavailable ({e}); searching discogs in its place"
@@ -2090,24 +2098,28 @@ fn names_in(list: &[String], credit: &str) -> Vec<String> {
 }
 
 /// A lone file with no album tag, as a single: its own album, named by its
-/// title, as track 1. A store's single (Bandcamp's among them) is tagged
-/// this way, often titled "Title / Artist"; the artist is dropped from the
-/// title when it repeats the file's artist.
+/// title, as track 1 of 1. A store's single (Bandcamp's among them) is
+/// tagged this way, often titled "Title / Artist" and named "Artist -
+/// Title"; the artist is dropped from either when it repeats the file's.
 fn as_single(t: &Track) -> Option<Track> {
-    let (number, name) = number_and_title(&t.path);
+    let (_, name) = number_and_title(&t.path);
     let title = t.title.clone().filter(|s| !s.trim().is_empty()).or(name)?;
-    let title = match (title.rsplit_once(" / "), t.artist.as_deref()) {
-        (Some((name, credit)), Some(artist))
-            if !name.trim().is_empty() && !names_in(&[artist.to_string()], credit).is_empty() =>
-        {
-            name.trim().to_string()
-        }
-        _ => title,
+    let credits = |credit: &str| {
+        t.artist
+            .as_deref()
+            .is_some_and(|a| !names_in(&[a.to_string()], credit).is_empty())
     };
+    let title = match (title.rsplit_once(" / "), title.split_once(" - ")) {
+        (Some((name, credit)), _) if !name.trim().is_empty() && credits(credit) => name,
+        (_, Some((credit, name))) if !name.trim().is_empty() && credits(credit) => name,
+        _ => &title,
+    }
+    .trim()
+    .to_string();
     Some(Track {
         album: Some(title.clone()),
         title: Some(title),
-        track: t.track.or(number).or(Some(1)),
+        track: Some(1),
         ..t.clone()
     })
 }
@@ -2630,6 +2642,20 @@ mod tests {
         assert!(err.is_transient());
     }
 
+    #[tokio::test]
+    async fn files_naming_their_musicbrainz_release_wait_for_it() {
+        let importer = musicbrainz_down(vec![(200, "", r#"{"results":[{"id":1}]}"#)]).await;
+        let mut tracks = geogaddi();
+        for t in &mut tracks {
+            t.mb_album_id = Some("6f5e0b1c-1f1a-4d0e-9a8e-2a3c4b5d6e7f".into());
+        }
+        let err = importer
+            .candidates(Path::new("a"), &tracks, &mut String::new())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ImportError::MusicBrainz(_)), "{err}");
+    }
+
     #[test]
     fn as_is_files_a_lone_untagged_file_as_a_single() {
         let entries = as_is_tags(
@@ -2649,6 +2675,18 @@ mod tests {
             ("Mulch Me", "Mulch Me", "Hannah Moule x Pink Oyster")
         );
         assert_eq!((t.track, t.track_total), (1, 1));
+
+        // Untitled, the file name gives it, less the artist before it.
+        let entries = as_is_tags(
+            &[tagged("a/07 A - Song.flac", None, Some("A"), Some(7), None)],
+            None,
+        )
+        .unwrap();
+        let t = &entries[0].1;
+        assert_eq!(
+            (t.album.as_str(), t.title.as_str(), t.track),
+            ("Song", "Song", 1)
+        );
 
         // A slash that does not credit the artist is part of the title.
         let entries = as_is_tags(
