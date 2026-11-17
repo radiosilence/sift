@@ -9,9 +9,12 @@
 //! resets. Refusals, server errors and dropped connections are retried for a
 //! short while; a service still refusing after that is reported unavailable,
 //! and the client rests, failing requests at once without asking, until the
-//! last wait (its `Retry-After`, when it gave one) has passed. A caller
-//! queueing many requests behind one outage hears about it in seconds rather
-//! than each waiting out its own round of retries.
+//! last wait (its `Retry-After`, when it gave one) has passed, or longer when
+//! it has given up again since its last success: each give-up in a row
+//! doubles the rest, from half a minute to ten. A caller queueing many
+//! requests behind one outage hears about it in seconds rather than each
+//! waiting out its own round of retries, and an outage that outlasts a rest
+//! is asked about less and less often.
 //!
 //! Under load MusicBrainz also sheds searches across the whole service: a
 //! 503 in its `search` rate-limit zone with `Retry-After: 0`. That says
@@ -38,6 +41,9 @@ const PATIENCE: Duration = Duration::from_secs(45);
 const TIMEOUT: Duration = Duration::from_secs(30);
 /// The longest `Retry-After` taken at its word.
 const MAX_RETRY_AFTER: Duration = Duration::from_secs(600);
+/// The least rest after giving up, doubled for each give-up in a row.
+const REST: Duration = Duration::from_secs(30);
+const MAX_REST: Duration = Duration::from_secs(600);
 
 #[derive(Debug, thiserror::Error)]
 pub enum MbError {
@@ -194,7 +200,7 @@ impl MusicBrainz {
                     (wait, why, MbError::Unavailable(status))
                 }
                 Ok(resp) => {
-                    gate.succeeded(resp.headers());
+                    gate.succeeded(resp.headers(), search);
                     return Ok(resp);
                 }
                 Err(e) if e.is_timeout() || e.is_connect() => {
@@ -399,6 +405,10 @@ struct Gate {
     resting: Option<Instant>,
     /// The same for searches alone, after a shed search gave up.
     resting_searches: Option<Instant>,
+    /// Give-ups since the last success, and of shed searches since the last
+    /// search answered: each lengthens the next rest.
+    gave_up: u32,
+    gave_up_searches: u32,
     /// Why the gate holds the next request back.
     why: Wait,
 }
@@ -410,6 +420,8 @@ impl Default for Gate {
             spacing: SPACING,
             resting: None,
             resting_searches: None,
+            gave_up: 0,
+            gave_up_searches: 0,
             why: Wait::Pacing,
         }
     }
@@ -439,7 +451,11 @@ impl Gate {
         }
     }
 
-    fn succeeded(&mut self, headers: &reqwest::header::HeaderMap) {
+    fn succeeded(&mut self, headers: &reqwest::header::HeaderMap, search: bool) {
+        self.gave_up = 0;
+        if search {
+            self.gave_up_searches = 0;
+        }
         self.spacing = self.spacing.mul_f64(0.9).max(SPACING);
         self.why = Wait::Pacing;
         let mut next = Instant::now() + self.spacing;
@@ -460,13 +476,18 @@ impl Gate {
     }
 
     /// Fail requests unsent, or only searches, until the wait the last
-    /// refusal set is over.
+    /// refusal set is over, or for [`REST`] doubled for each earlier
+    /// give-up in a row, whichever is longer.
     fn rest(&mut self, searches: bool) {
-        if searches {
-            self.resting_searches = self.next;
+        let (until, gave_up) = if searches {
+            (&mut self.resting_searches, &mut self.gave_up_searches)
         } else {
-            self.resting = self.next;
-        }
+            (&mut self.resting, &mut self.gave_up)
+        };
+        let rest = REST.saturating_mul(1 << (*gave_up).min(5)).min(MAX_REST);
+        *gave_up += 1;
+        let end = Instant::now() + rest;
+        *until = Some(self.next.map_or(end, |n| n.max(end)));
     }
 
     /// How much of a rest is left for a request, a search or not.
@@ -797,7 +818,7 @@ mod tests {
         }
         assert_eq!(gate.spacing, MAX_SPACING);
         for _ in 0..100 {
-            gate.succeeded(&reqwest::header::HeaderMap::new());
+            gate.succeeded(&reqwest::header::HeaderMap::new(), false);
         }
         assert_eq!(gate.spacing, SPACING);
     }
@@ -812,6 +833,46 @@ mod tests {
         gate.refused(Duration::from_secs(5), Wait::Refused(503));
         gate.rest(false);
         assert!(gate.resting(false).is_some());
+    }
+
+    fn secs(d: Option<Duration>) -> u64 {
+        d.unwrap().as_secs_f64().round() as u64
+    }
+
+    #[test]
+    fn each_give_up_in_a_row_rests_longer_until_a_success() {
+        let mut gate = Gate::default();
+        let rests: Vec<u64> = (0..7)
+            .map(|_| {
+                gate.refused(Duration::from_secs(1), Wait::Refused(503));
+                gate.rest(false);
+                secs(gate.resting(false))
+            })
+            .collect();
+        assert_eq!(rests, [30, 60, 120, 240, 480, 600, 600]);
+        gate.succeeded(&reqwest::header::HeaderMap::new(), false);
+        gate.refused(Duration::from_secs(1), Wait::Refused(503));
+        gate.rest(false);
+        assert_eq!(secs(gate.resting(false)), 30);
+    }
+
+    #[test]
+    fn a_long_retry_after_outlasts_the_rest() {
+        let mut gate = Gate::default();
+        gate.refused(Duration::from_secs(300), Wait::Refused(503));
+        gate.rest(false);
+        assert_eq!(secs(gate.resting(false)), 300);
+    }
+
+    #[test]
+    fn a_lookup_answered_does_not_forgive_shed_searches() {
+        let mut gate = Gate::default();
+        gate.refused(Duration::from_secs(1), Wait::Shed);
+        gate.rest(true);
+        gate.succeeded(&reqwest::header::HeaderMap::new(), false);
+        gate.refused(Duration::from_secs(1), Wait::Shed);
+        gate.rest(true);
+        assert_eq!(secs(gate.resting(true)), 60);
     }
 
     #[test]

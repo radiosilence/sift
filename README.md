@@ -203,13 +203,18 @@ instead of disambiguated.
   Refusals, server errors and dropped connections are retried for up to 45
   seconds, honouring `Retry-After`. A request still refused then reports
   MusicBrainz unavailable, and requests after it fail at once, without being
-  sent, until the service's last requested wait is over: an embedder queueing
-  many imports learns of an outage in seconds and can put them off, rather
-  than each import sitting through its own minutes of retries. The CLI waits
+  sent, for whichever is longer of the service's last requested wait and a
+  rest of half a minute that doubles with each give-up in a row up to ten
+  minutes: an
+  embedder queueing many imports learns of an outage in seconds and can put
+  them off, rather than each import sitting through its own minutes of
+  retries, and a long outage is asked about less and less often. The CLI waits
   such a rest out between albums. Under load MusicBrainz sheds searches
   across the whole service (a 503 in its `search` rate-limit zone with
   `Retry-After: 0`); that is retried after a few jittered seconds without
-  slowing the client, and rests only searches, so lookups by id carry on.
+  slowing the client, and a search that still gives up rests only searches,
+  on the same doubling rest, until a search is answered, so lookups by id
+  carry on.
   Responses are cached on disk so a retried import asks for nothing twice.
   Cover art comes from the Cover Art Archive's own thumbnails, so no image is
   decoded or re-encoded here.
