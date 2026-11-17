@@ -1805,6 +1805,11 @@ impl Importer {
                 )
             }
         };
+        // "Greatest Hits" by Various Artists names many compilations.
+        if matching::normalise(&artist) == "various artists" {
+            let _ = writeln!(log, "cover art: itunes: not searched for a compilation");
+            return None;
+        }
         self.itunes_cover(&artist, &album, rules, log).await
     }
 
@@ -1945,19 +1950,27 @@ impl Importer {
             }
         };
         let (artist, album) = (matching::normalise(artist), matching::normalise(album));
-        let Some(artwork) = found
+        let hits: Vec<Hit> = found
             .results
             .into_iter()
             .filter(|h| matching::normalise(&h.artist_name) == artist)
-            .find(|h| {
-                let title = h.collection_name.as_str();
-                let title = title
-                    .strip_suffix(" - Single")
-                    .or_else(|| title.strip_suffix(" - EP"))
-                    .unwrap_or(title);
-                matching::normalise(title) == album
+            .collect();
+        // An exact title first, so an album is not given the cover of its
+        // title track's single.
+        let exact = hits
+            .iter()
+            .find(|h| matching::normalise(&h.collection_name) == album);
+        let Some(artwork) = exact
+            .or_else(|| {
+                hits.iter().find(|h| {
+                    let title = h.collection_name.as_str();
+                    title
+                        .strip_suffix(" - Single")
+                        .or_else(|| title.strip_suffix(" - EP"))
+                        .is_some_and(|t| matching::normalise(t) == album)
+                })
             })
-            .and_then(|h| h.artwork_url100)
+            .and_then(|h| h.artwork_url100.clone())
         else {
             let _ = writeln!(
                 log,
@@ -2823,6 +2836,8 @@ mod tests {
                 {"artistName": "Someone Else", "collectionName": "Little Death",
                  "artworkUrl100": "{base}/wrong/100x100bb.jpg"},
                 {"artistName": "Pete and the Pirates", "collectionName": "Little Death - Single",
+                 "artworkUrl100": "{base}/single/100x100bb.jpg"},
+                {"artistName": "Pete and the Pirates", "collectionName": "Little Death",
                  "artworkUrl100": "{base}/art/100x100bb.jpg"}
             ]}"#,
         )
@@ -2838,6 +2853,50 @@ mod tests {
         let art = importer.cover(None, &tracks, &mut log).await.unwrap();
         assert_eq!(art.source, "itunes");
         assert!(!art.resized, "asked for at the largest width embedded");
+    }
+
+    #[tokio::test]
+    async fn a_single_stands_in_only_when_the_title_is_not_listed_bare() {
+        let mut importer = Importer::new(Config::default());
+        importer.itunes = itunes(
+            r#"{"results": [
+                {"artistName": "Pete and the Pirates", "collectionName": "Knots - Single",
+                 "artworkUrl100": "{base}/art/100x100bb.jpg"}
+            ]}"#,
+        )
+        .await;
+        let tracks = vec![tagged(
+            "a/01 Knots.flac",
+            Some("Knots"),
+            Some("Pete & The Pirates"),
+            Some(1),
+            Some("Knots"),
+        )];
+        let mut log = String::new();
+        let art = importer.cover(None, &tracks, &mut log).await;
+        assert_eq!(art.map(|a| a.source), Some("itunes"), "{log}");
+    }
+
+    #[tokio::test]
+    async fn a_compilation_is_not_looked_up_by_name() {
+        let mut importer = Importer::new(Config::default());
+        importer.itunes = itunes(
+            r#"{"results": [
+                {"artistName": "Various Artists", "collectionName": "Greatest Hits",
+                 "artworkUrl100": "{base}/art/100x100bb.jpg"}
+            ]}"#,
+        )
+        .await;
+        let tracks = vec![tagged(
+            "a/01 Song.flac",
+            Some("Greatest Hits"),
+            Some("Various Artists"),
+            Some(1),
+            Some("Song"),
+        )];
+        let mut log = String::new();
+        assert!(importer.cover(None, &tracks, &mut log).await.is_none());
+        assert!(log.contains("not searched for a compilation"), "{log}");
     }
 
     #[tokio::test]

@@ -219,8 +219,9 @@ instead of disambiguated.
   Responses are cached on disk so a retried import asks for nothing twice.
   Cover art comes from the Cover Art Archive's own thumbnails, so no image is
   decoded or re-encoded here. The Apple Music catalogue is searched only for
-  an album neither the archive nor its files have a cover for, once per
-  import.
+  an album neither its release (on Discogs or the Cover Art Archive) nor its
+  files have a cover for, once per import, and never for a Various Artists
+  compilation.
 - **Progress.** An embedder that shows imports as they run wraps the call in
   `sift::progress::scope`, which hands it each stage the import reaches
   (searching MusicBrainz, comparing candidates, a wait on MusicBrainz with

@@ -639,8 +639,6 @@ fn relative_to(dir: &Path, file: &Path) -> PathBuf {
     out
 }
 
-/// Drop `.` components and resolve `..` lexically, so `a/./b.yaml` and
-/// `a/c/../b.yaml` both compare as `a/b.yaml`.
 /// Whether beets' `fetchart.sources` names `source`: as a list entry, a
 /// key of one, or a word of a single string.
 fn names_source(sources: &serde_json::Value, source: &str) -> bool {
@@ -652,6 +650,8 @@ fn names_source(sources: &serde_json::Value, source: &str) -> bool {
     }
 }
 
+/// Drop `.` components and resolve `..` lexically, so `a/./b.yaml` and
+/// `a/c/../b.yaml` both compare as `a/b.yaml`.
 fn normalise(path: &Path) -> PathBuf {
     use std::path::Component;
     let mut out = PathBuf::new();
