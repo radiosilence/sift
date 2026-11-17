@@ -1006,7 +1006,7 @@ fn under_bounds(dir: &Path) -> (String, String) {
     const SEP: char = std::path::MAIN_SEPARATOR;
     const AFTER: char = (SEP as u8 + 1) as char;
     let dir = dir.to_string_lossy();
-    let dir = dir.trim_end_matches(SEP);
+    let dir = dir.trim_end_matches(std::path::is_separator);
     (format!("{dir}{SEP}"), format!("{dir}{AFTER}"))
 }
 
