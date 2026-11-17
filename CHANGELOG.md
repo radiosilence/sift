@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.13.1
+
+### Fixed
+
+- **Tags and art can be written on Windows.** A tag edit flushed its finished copy through a read-only handle before renaming it over the file, which Windows refuses with "Access is denied", so every tag and art edit failed there.
+- **Folders are found on Windows.** `Library::albums_in` and `Library::set_added` bounded their range of indexed paths with `/`, so on Windows, where indexed paths use `\`, they matched no files: an album at a known folder was never found, and a re-imported album lost its added date.
+
 ## 0.13.0
 
 ### Added
