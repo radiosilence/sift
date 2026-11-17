@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.13.0
+
+### Added
+
+- **Covers from the Apple Music catalogue.** An album with no cover from Discogs or the Cover Art Archive, and none in its files, takes the catalogue's cover for the same artist and title, as beets' `itunes` art source does. Many older releases have no art in the archive. An exact title is preferred over a " - Single" or " - EP" listing, and Various Artists compilations are never looked up by name. A `fetchart.sources` list that leaves out `itunes` turns this off.
+
+### Fixed
+
+- **The import log says why an album has no cover.** Each source that was tried and passed over now logs its reason (an HTTP status, a failed Discogs image request, a release with no image, or an image outside the width and ratio limits). Before, an import matched on Discogs while MusicBrainz was unavailable logged only `cover art: none`.
+
 ## 0.12.1
 
 ### Changed
