@@ -1,0 +1,1 @@
+- **Tags and art can be written on Windows.** A tag edit flushed its finished copy through a read-only handle before renaming it over the file, which Windows refuses with "Access is denied", so every tag and art edit failed there.

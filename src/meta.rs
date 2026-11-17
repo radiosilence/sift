@@ -522,7 +522,12 @@ impl Scratch {
 
     /// Sync the copy and rename it over `path`.
     fn replace(mut self, path: &Path, original: &std::fs::Metadata) -> Result<(), MetaError> {
-        let file = std::fs::File::open(&self.0).map_err(lofty(path))?;
+        // Opened to write: Windows flushes a file only through a handle
+        // that may write to it.
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&self.0)
+            .map_err(lofty(path))?;
         // Copies belong to whoever made them; best effort, as only root may
         // give a file away, though the group alone may still be set.
         #[cfg(unix)]
