@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.12.1
+
+### Changed
+
+- **A MusicBrainz outage is asked about less and less often.** After giving up on a refusing service, the client rests for at least 30 seconds, doubling with each give-up in a row up to ten minutes and resetting on the next answer. Before, it rested only through the last wait, often under 15 seconds, so many imports deferred together kept returning to a service that was still refusing. Shed searches rest searches alone on the same schedule, reset by the next answered search.
+
 ## 0.12.0
 
 ### Changed
