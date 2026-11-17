@@ -1,0 +1,1 @@
+- **Covers from the Apple Music catalogue.** An album with no cover from Discogs or the Cover Art Archive, and none in its files, takes the catalogue's cover for the same artist and title, as beets' `itunes` art source does. Many older releases have no art in the archive. A `fetchart.sources` list that leaves out `itunes` turns this off.

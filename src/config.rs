@@ -71,6 +71,10 @@ pub struct Config {
     /// Prefer the Cover Art Archive's full-size original over its
     /// thumbnails.
     pub art_high_resolution: bool,
+    /// Fall back to the Apple Music catalogue's cover when neither the
+    /// release nor the files have one: on unless `fetchart.sources` is
+    /// given and leaves out `itunes`, as in beets.
+    pub art_itunes: bool,
     /// Below this distance a match is applied without asking.
     pub strong_threshold: f64,
     pub musicbrainz_contact: String,
@@ -131,6 +135,7 @@ impl Default for Config {
             art_quality: 90,
             art_ratio: None,
             art_high_resolution: false,
+            art_itunes: true,
             strong_threshold: 0.04,
             musicbrainz_contact: "https://github.com/radiosilence/sift".into(),
             cache_dir: dirs::cache_dir().map(|d| d.join("sift")),
@@ -270,6 +275,10 @@ struct RawArt {
     enforce_ratio: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     high_resolution: Option<bool>,
+    /// beets' list of art sources: names, or one-key maps of a name to
+    /// its options.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sources: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Default, PartialEq, Deserialize, Serialize)]
@@ -339,6 +348,7 @@ impl Config {
         let mut art_quality = None;
         let mut art_ratio = None;
         let mut art_high_resolution = None;
+        let mut art_sources = None;
         let mut fetchart = false;
         let mut ftintitle_enabled = false;
         let mut ft_auto = None;
@@ -400,6 +410,7 @@ impl Config {
                 .high_resolution
                 .or(raw.fetchart.high_resolution)
                 .or(art_high_resolution);
+            art_sources = raw.fetchart.sources.or(art_sources);
             art_ratio = raw
                 .embedart
                 .enforce_ratio
@@ -443,6 +454,9 @@ impl Config {
         }
         if let Some(h) = art_high_resolution {
             cfg.art_high_resolution = h;
+        }
+        if let Some(sources) = art_sources {
+            cfg.art_itunes = names_source(&sources, "itunes");
         }
         let token = std::env::var("DISCOGS_TOKEN").ok().or(discogs_token);
         cfg.discogs = discogs_enabled
@@ -627,6 +641,17 @@ fn relative_to(dir: &Path, file: &Path) -> PathBuf {
 
 /// Drop `.` components and resolve `..` lexically, so `a/./b.yaml` and
 /// `a/c/../b.yaml` both compare as `a/b.yaml`.
+/// Whether beets' `fetchart.sources` names `source`: as a list entry, a
+/// key of one, or a word of a single string.
+fn names_source(sources: &serde_json::Value, source: &str) -> bool {
+    match sources {
+        serde_json::Value::String(s) => s.split_whitespace().any(|w| w == source),
+        serde_json::Value::Array(items) => items.iter().any(|i| names_source(i, source)),
+        serde_json::Value::Object(map) => map.contains_key(source),
+        _ => false,
+    }
+}
+
 fn normalise(path: &Path) -> PathBuf {
     use std::path::Component;
     let mut out = PathBuf::new();
@@ -922,6 +947,24 @@ mod tests {
         assert_eq!(cfg.art_quality, 95);
         assert_eq!(cfg.art_ratio, Some(Ratio::Percent(10.0)));
         assert!(cfg.art_high_resolution);
+    }
+
+    #[test]
+    fn itunes_art_follows_beets_fetchart_sources() {
+        let load = |yaml: &str| {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("config.yaml"), yaml).unwrap();
+            Config::load(&dir.path().join("config.yaml"))
+                .unwrap()
+                .art_itunes
+        };
+        assert!(load("directory: /music\n"));
+        assert!(load("fetchart:\n  sources: [coverart, itunes]\n"));
+        assert!(load(
+            "fetchart:\n  sources:\n    - coverart: release\n    - itunes\n"
+        ));
+        assert!(load("fetchart:\n  sources: filesystem itunes\n"));
+        assert!(!load("fetchart:\n  sources: [filesystem, coverart]\n"));
     }
 
     #[test]

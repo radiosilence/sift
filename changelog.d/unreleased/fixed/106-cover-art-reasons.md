@@ -1,0 +1,1 @@
+- **The import log says why an album has no cover.** Each source that was tried and passed over now logs its reason (an HTTP status, a failed Discogs image request, a release with no image, or an image outside the width and ratio limits). Before, an import matched on Discogs while MusicBrainz was unavailable logged only `cover art: none`.
