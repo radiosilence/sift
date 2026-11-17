@@ -998,12 +998,16 @@ impl Library {
     }
 }
 
-/// The range of indexed paths under `dir`, at any depth: from `dir/` to just
-/// before `dir0`, as '0' follows '/'. A range the primary key answers.
+/// The range of indexed paths under `dir`, at any depth: from `dir` and the
+/// platform's separator to just before `dir` and the character after it
+/// (`dir/` to `dir0` on Unix, `dir\` to `dir]` on Windows). A range the
+/// primary key answers.
 fn under_bounds(dir: &Path) -> (String, String) {
+    const SEP: char = std::path::MAIN_SEPARATOR;
+    const AFTER: char = (SEP as u8 + 1) as char;
     let dir = dir.to_string_lossy();
-    let dir = dir.trim_end_matches('/');
-    (format!("{dir}/"), format!("{dir}0"))
+    let dir = dir.trim_end_matches(SEP);
+    (format!("{dir}{SEP}"), format!("{dir}{AFTER}"))
 }
 
 /// Items gathered into the directories that hold them, each in disc and

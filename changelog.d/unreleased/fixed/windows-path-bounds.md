@@ -1,0 +1,1 @@
+- **Folders are found on Windows.** `Library::albums_in` and `Library::set_added` bounded their range of indexed paths with `/`, so on Windows, where indexed paths use `\`, they matched no files: an album at a known folder was never found, and a re-imported album lost its added date.
