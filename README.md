@@ -94,7 +94,8 @@ working as it is. sift reads `directory`, `include`, `import.move`/`import.copy`
 `paths.default` and `paths.comp`, `replace` (in file order), `asciify_paths`,
 `original_date`, `per_disc_numbering`, `match.strong_rec_thresh`, the
 `plugins` it acts on (`fetchart`, `importadded`, `ftintitle`, `discogs`), the
-`fetchart`/`embedart` size, quality and ratio options, `ftintitle` and
+`fetchart`/`embedart` size, quality and ratio options, whether
+`fetchart.sources` names `itunes`, `ftintitle` and
 `discogs` options. Everything else is ignored rather than rejected.
 
 `include:` paths are relative to the including file and are read first, so a
@@ -217,7 +218,10 @@ instead of disambiguated.
   carry on.
   Responses are cached on disk so a retried import asks for nothing twice.
   Cover art comes from the Cover Art Archive's own thumbnails, so no image is
-  decoded or re-encoded here.
+  decoded or re-encoded here. The Apple Music catalogue is searched only for
+  an album neither its release (on Discogs or the Cover Art Archive) nor its
+  files have a cover for, once per import, and never for a Various Artists
+  compilation.
 - **Progress.** An embedder that shows imports as they run wraps the call in
   `sift::progress::scope`, which hands it each stage the import reaches
   (searching MusicBrainz, comparing candidates, a wait on MusicBrainz with

@@ -211,6 +211,8 @@ pub struct Importer {
     acoustid: Option<crate::acoustid::AcoustId>,
     http: reqwest::Client,
     lyrics: crate::lyrics::Client,
+    /// Where the Apple Music catalogue is searched for covers.
+    itunes: String,
 }
 
 /// What [`Importer::enrich`] added.
@@ -351,6 +353,8 @@ pub struct Rematch {
 /// request, so this is the time an import spends at MusicBrainz.
 const LOOKUPS: usize = 5;
 
+const ITUNES: &str = "https://itunes.apple.com";
+
 impl Importer {
     pub fn new(cfg: Config) -> Self {
         let mut mb = MusicBrainz::new(&cfg.musicbrainz_contact);
@@ -395,6 +399,7 @@ impl Importer {
             acoustid,
             http,
             lyrics: crate::lyrics::Client::new(),
+            itunes: ITUNES.into(),
         }
     }
 
@@ -1508,7 +1513,7 @@ impl Importer {
 
         crate::progress::report(crate::progress::Stage::CoverArt);
         let cover_art = if self.cfg.fetch_art {
-            self.cover(release, tracks).await
+            self.cover(release, tracks, log).await
         } else {
             None
         };
@@ -1754,14 +1759,22 @@ impl Importer {
         }
     }
 
-    /// The release's front cover: for a Discogs release, its primary image;
+    /// The album's front cover. For a Discogs release, its primary image;
     /// otherwise the Cover Art Archive's, then the release group's. When
     /// `art_high_resolution` is set, each source's full-size original is
     /// tried before its thumbnail. Whatever the files already carry comes
-    /// last. A candidate narrower than `art_min_width` or failing `art_ratio`
-    /// is skipped for the next one; one wider than `art_max_width` is resized
-    /// down and re-encoded as JPEG at `art_quality`.
-    async fn cover(&self, release: Option<&Release>, tracks: &[Track]) -> Option<CoverArt> {
+    /// next, then, with `art_itunes`, the Apple Music catalogue's cover,
+    /// which holds art for many releases the archive lacks. A candidate
+    /// narrower than `art_min_width` or failing `art_ratio` is skipped for
+    /// the next one; one wider than `art_max_width` is resized down and
+    /// re-encoded as JPEG at `art_quality`. Why each candidate was passed
+    /// over is written to `log`.
+    async fn cover(
+        &self,
+        release: Option<&Release>,
+        tracks: &[Track],
+        log: &mut String,
+    ) -> Option<CoverArt> {
         let rules = ArtRules {
             min_width: self.cfg.art_min_width,
             max_width: self.cfg.art_max_width,
@@ -1769,20 +1782,64 @@ impl Importer {
             ratio: self.cfg.art_ratio,
         };
         if let Some(release) = release
-            && source_of(&release.id) == Source::Discogs
+            && let Some(art) = self.release_cover(release, rules, log).await
         {
-            if let (Some(url), Some(discogs)) = (&release.cover_url, &self.discogs)
-                && let Ok(bytes) = discogs.image(url).await
-                && !bytes.is_empty()
-                && let Some(prepared) = prepare(bytes, rules).await
-            {
-                return Some(CoverArt {
-                    bytes: prepared.bytes,
-                    source: "discogs",
-                    resized: prepared.resized,
-                });
+            return Some(art);
+        }
+        if let Some(art) = Self::embedded_cover(tracks, rules).await {
+            return Some(art);
+        }
+        if !self.cfg.art_itunes {
+            return None;
+        }
+        let (artist, album) = match release {
+            Some(r) => (r.artist(), r.title.clone()),
+            None => {
+                let first = tracks.first()?;
+                (
+                    first
+                        .album_artist
+                        .clone()
+                        .or_else(|| first.artist.clone())?,
+                    first.album.clone()?,
+                )
             }
-            return Self::embedded_cover(tracks, rules).await;
+        };
+        // "Greatest Hits" by Various Artists names many compilations.
+        if matching::normalise(&artist) == "various artists" {
+            let _ = writeln!(log, "cover art: itunes: not searched for a compilation");
+            return None;
+        }
+        self.itunes_cover(&artist, &album, rules, log).await
+    }
+
+    /// The release's own cover, from Discogs or the Cover Art Archive.
+    async fn release_cover(
+        &self,
+        release: &Release,
+        rules: ArtRules,
+        log: &mut String,
+    ) -> Option<CoverArt> {
+        if source_of(&release.id) == Source::Discogs {
+            let Some(discogs) = &self.discogs else {
+                let _ = writeln!(log, "cover art: discogs: Discogs is not configured");
+                return None;
+            };
+            let Some(url) = &release.cover_url else {
+                let _ = writeln!(log, "cover art: discogs: the release lists no image");
+                return None;
+            };
+            return match discogs.image(url).await {
+                Ok(bytes) if !bytes.is_empty() => accept(bytes, "discogs", rules, log).await,
+                Ok(_) => {
+                    let _ = writeln!(log, "cover art: discogs: empty image");
+                    None
+                }
+                Err(e) => {
+                    let _ = writeln!(log, "cover art: discogs: {e}");
+                    None
+                }
+            };
         }
         let size = match self.cfg.art_max_width {
             w if w >= 1200 => "1200",
@@ -1790,51 +1847,162 @@ impl Importer {
             _ => "250",
         };
         let mut candidates: Vec<(String, &'static str)> = Vec::new();
-        if let Some(release) = release {
-            if self.cfg.art_high_resolution {
-                candidates.push((
-                    format!("https://coverartarchive.org/release/{}/front", release.id),
-                    "release (original)",
-                ));
-                if let Some(g) = &release.release_group {
-                    candidates.push((
-                        format!("https://coverartarchive.org/release-group/{}/front", g.id),
-                        "release group (original)",
-                    ));
-                }
-            }
+        if self.cfg.art_high_resolution {
             candidates.push((
-                format!(
-                    "https://coverartarchive.org/release/{}/front-{size}",
-                    release.id
-                ),
-                "release",
+                format!("https://coverartarchive.org/release/{}/front", release.id),
+                "release (original)",
             ));
             if let Some(g) = &release.release_group {
                 candidates.push((
-                    format!(
-                        "https://coverartarchive.org/release-group/{}/front-{size}",
-                        g.id
-                    ),
-                    "release group",
+                    format!("https://coverartarchive.org/release-group/{}/front", g.id),
+                    "release group (original)",
                 ));
             }
         }
+        candidates.push((
+            format!(
+                "https://coverartarchive.org/release/{}/front-{size}",
+                release.id
+            ),
+            "release",
+        ));
+        if let Some(g) = &release.release_group {
+            candidates.push((
+                format!(
+                    "https://coverartarchive.org/release-group/{}/front-{size}",
+                    g.id
+                ),
+                "release group",
+            ));
+        }
         for (url, source) in candidates {
-            if let Ok(resp) = self.http.get(&url).send().await
-                && resp.status().is_success()
-                && let Some(bytes) = art::read_capped(resp, art::MAX_FETCH_BYTES).await
-                && !bytes.is_empty()
-                && let Some(prepared) = prepare(bytes, rules).await
-            {
-                return Some(CoverArt {
-                    bytes: prepared.bytes,
-                    source,
-                    resized: prepared.resized,
-                });
+            match self.fetch_image(&url).await {
+                Ok(bytes) => {
+                    if let Some(art) = accept(bytes, source, rules, log).await {
+                        return Some(art);
+                    }
+                }
+                Err(why) => {
+                    let _ = writeln!(log, "cover art: {source}: {why}");
+                }
             }
         }
-        Self::embedded_cover(tracks, rules).await
+        None
+    }
+
+    /// The Apple Music catalogue's cover for `album` by `artist`: the first
+    /// album its search returns whose artist and title both match, as
+    /// [`matching::normalise`] compares them, with a " - Single" or " - EP"
+    /// suffix ignored. Asked for at `art_max_width`, which the catalogue
+    /// serves up to the size of its original.
+    async fn itunes_cover(
+        &self,
+        artist: &str,
+        album: &str,
+        rules: ArtRules,
+        log: &mut String,
+    ) -> Option<CoverArt> {
+        #[derive(serde::Deserialize)]
+        struct Results {
+            #[serde(default)]
+            results: Vec<Hit>,
+        }
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Hit {
+            #[serde(default)]
+            artist_name: String,
+            #[serde(default)]
+            collection_name: String,
+            artwork_url100: Option<String>,
+        }
+        let term = format!("{artist} {album}");
+        let sent = self
+            .http
+            .get(format!("{}/search", self.itunes))
+            .query(&[
+                ("term", term.as_str()),
+                ("media", "music"),
+                ("entity", "album"),
+                ("limit", "25"),
+            ])
+            .send()
+            .await;
+        let found: Results = match sent {
+            Ok(resp) if resp.status().is_success() => match resp.json().await {
+                Ok(found) => found,
+                Err(e) => {
+                    let _ = writeln!(log, "cover art: itunes: unreadable search: {e}");
+                    return None;
+                }
+            },
+            Ok(resp) => {
+                let _ = writeln!(
+                    log,
+                    "cover art: itunes: search HTTP {}",
+                    resp.status().as_u16()
+                );
+                return None;
+            }
+            Err(e) => {
+                let _ = writeln!(log, "cover art: itunes: {e}");
+                return None;
+            }
+        };
+        let (artist, album) = (matching::normalise(artist), matching::normalise(album));
+        let hits: Vec<Hit> = found
+            .results
+            .into_iter()
+            .filter(|h| matching::normalise(&h.artist_name) == artist)
+            .collect();
+        // An exact title first, so an album is not given the cover of its
+        // title track's single.
+        let exact = hits
+            .iter()
+            .find(|h| matching::normalise(&h.collection_name) == album);
+        let Some(artwork) = exact
+            .or_else(|| {
+                hits.iter().find(|h| {
+                    let title = h.collection_name.as_str();
+                    title
+                        .strip_suffix(" - Single")
+                        .or_else(|| title.strip_suffix(" - EP"))
+                        .is_some_and(|t| matching::normalise(t) == album)
+                })
+            })
+            .and_then(|h| h.artwork_url100.clone())
+        else {
+            let _ = writeln!(
+                log,
+                "cover art: itunes: no album with this artist and title"
+            );
+            return None;
+        };
+        let width = match rules.max_width {
+            0 => 3000,
+            w => w,
+        };
+        let url = artwork.replace("100x100bb", &format!("{width}x{width}bb"));
+        match self.fetch_image(&url).await {
+            Ok(bytes) => accept(bytes, "itunes", rules, log).await,
+            Err(why) => {
+                let _ = writeln!(log, "cover art: itunes: {why}");
+                None
+            }
+        }
+    }
+
+    /// An image's bytes, or why there are none.
+    async fn fetch_image(&self, url: &str) -> Result<Vec<u8>, String> {
+        let resp = self.http.get(url).send().await.map_err(|e| e.to_string())?;
+        if !resp.status().is_success() {
+            return Err(format!("HTTP {}", resp.status().as_u16()));
+        }
+        match art::read_capped(resp, art::MAX_FETCH_BYTES).await {
+            Some(bytes) if !bytes.is_empty() => Ok(bytes),
+            Some(_) => Err("empty response".into()),
+            None => Err("image too large or cut short".into()),
+        }
     }
 
     /// Whatever the files already carry, under the same rules as fetched art.
@@ -1853,7 +2021,27 @@ impl Importer {
     }
 }
 
-/// A cover ready to embed, with what the import log should say about it.
+/// `bytes` from `source`, if they pass `rules`; why not goes to `log`.
+async fn accept(
+    bytes: Vec<u8>,
+    source: &'static str,
+    rules: ArtRules,
+    log: &mut String,
+) -> Option<CoverArt> {
+    let Some(prepared) = prepare(bytes, rules).await else {
+        let _ = writeln!(
+            log,
+            "cover art: {source}: unreadable, or outside the width and ratio limits"
+        );
+        return None;
+    };
+    Some(CoverArt {
+        bytes: prepared.bytes,
+        source,
+        resized: prepared.resized,
+    })
+}
+
 struct CoverArt {
     bytes: Vec<u8>,
     source: &'static str,
@@ -2595,6 +2783,143 @@ mod tests {
                 t
             })
             .collect()
+    }
+
+    /// Serves the Apple Music search, answering `results`, and a 1200px
+    /// cover at `/art/1200x1200bb.jpg`; any other path is a 404.
+    async fn itunes(results: &'static str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let mut png = Vec::new();
+        image::RgbImage::new(1200, 1200)
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+        let search = results.replace("{base}", &base);
+        tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let mut buf = [0u8; 4096];
+                let mut req = Vec::new();
+                while !req.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let read = sock.read(&mut buf).await.unwrap();
+                    if read == 0 {
+                        break;
+                    }
+                    req.extend_from_slice(&buf[..read]);
+                }
+                let line = String::from_utf8_lossy(&req);
+                let path = line.split_whitespace().nth(1).unwrap_or("").to_string();
+                let (status, body) = if path.starts_with("/search") {
+                    (200, search.clone().into_bytes())
+                } else if path == "/art/1200x1200bb.jpg" {
+                    (200, png.clone())
+                } else {
+                    (404, Vec::new())
+                };
+                let head = format!(
+                    "HTTP/1.1 {status} X\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = sock.write_all(head.as_bytes()).await;
+                let _ = sock.write_all(&body).await;
+            }
+        });
+        base
+    }
+
+    #[tokio::test]
+    async fn the_apple_catalogue_covers_an_album_nothing_else_has() {
+        let mut importer = Importer::new(Config::default());
+        importer.itunes = itunes(
+            r#"{"results": [
+                {"artistName": "Someone Else", "collectionName": "Little Death",
+                 "artworkUrl100": "{base}/wrong/100x100bb.jpg"},
+                {"artistName": "Pete and the Pirates", "collectionName": "Little Death - Single",
+                 "artworkUrl100": "{base}/single/100x100bb.jpg"},
+                {"artistName": "Pete and the Pirates", "collectionName": "Little Death",
+                 "artworkUrl100": "{base}/art/100x100bb.jpg"}
+            ]}"#,
+        )
+        .await;
+        let tracks = vec![tagged(
+            "a/01 Ill Love.flac",
+            Some("Little Death"),
+            Some("Pete & The Pirates"),
+            Some(1),
+            Some("Ill Love"),
+        )];
+        let mut log = String::new();
+        let art = importer.cover(None, &tracks, &mut log).await.unwrap();
+        assert_eq!(art.source, "itunes");
+        assert!(!art.resized, "asked for at the largest width embedded");
+    }
+
+    #[tokio::test]
+    async fn a_single_stands_in_only_when_the_title_is_not_listed_bare() {
+        let mut importer = Importer::new(Config::default());
+        importer.itunes = itunes(
+            r#"{"results": [
+                {"artistName": "Pete and the Pirates", "collectionName": "Knots - Single",
+                 "artworkUrl100": "{base}/art/100x100bb.jpg"}
+            ]}"#,
+        )
+        .await;
+        let tracks = vec![tagged(
+            "a/01 Knots.flac",
+            Some("Knots"),
+            Some("Pete & The Pirates"),
+            Some(1),
+            Some("Knots"),
+        )];
+        let mut log = String::new();
+        let art = importer.cover(None, &tracks, &mut log).await;
+        assert_eq!(art.map(|a| a.source), Some("itunes"), "{log}");
+    }
+
+    #[tokio::test]
+    async fn a_compilation_is_not_looked_up_by_name() {
+        let mut importer = Importer::new(Config::default());
+        importer.itunes = itunes(
+            r#"{"results": [
+                {"artistName": "Various Artists", "collectionName": "Greatest Hits",
+                 "artworkUrl100": "{base}/art/100x100bb.jpg"}
+            ]}"#,
+        )
+        .await;
+        let tracks = vec![tagged(
+            "a/01 Song.flac",
+            Some("Greatest Hits"),
+            Some("Various Artists"),
+            Some(1),
+            Some("Song"),
+        )];
+        let mut log = String::new();
+        assert!(importer.cover(None, &tracks, &mut log).await.is_none());
+        assert!(log.contains("not searched for a compilation"), "{log}");
+    }
+
+    #[tokio::test]
+    async fn a_cover_not_found_says_why() {
+        let mut importer = Importer::new(Config::default());
+        importer.itunes = itunes(r#"{"results": []}"#).await;
+        let release: Release =
+            serde_json::from_str(r#"{"id": "discogs:1", "title": "Knots"}"#).unwrap();
+        let mut log = String::new();
+        assert!(
+            importer
+                .cover(Some(&release), &[], &mut log)
+                .await
+                .is_none()
+        );
+        assert!(
+            log.contains("cover art: discogs: Discogs is not configured"),
+            "{log}"
+        );
+        assert!(
+            log.contains("cover art: itunes: no album with this artist and title"),
+            "{log}"
+        );
     }
 
     #[tokio::test]
