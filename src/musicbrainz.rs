@@ -276,6 +276,15 @@ impl MusicBrainz {
     /// the credited artist's. At most three, and none with under a third of
     /// the top genre's votes, so one stray tag does not make the list.
     pub async fn genres(&self, release_id: &str) -> Result<Vec<String>, MbError> {
+        Ok(self.genres_and_types(release_id).await?.0)
+    }
+
+    /// [`MusicBrainz::genres`], and the release group's types as
+    /// [`ReleaseGroup::types`] gives them, from one request.
+    pub async fn genres_and_types(
+        &self,
+        release_id: &str,
+    ) -> Result<(Vec<String>, Vec<String>), MbError> {
         #[derive(serde::Deserialize, Default)]
         struct Genre {
             name: String,
@@ -286,6 +295,10 @@ impl MusicBrainz {
         struct Tagged {
             #[serde(default)]
             genres: Vec<Genre>,
+            #[serde(rename = "primary-type")]
+            primary_type: Option<String>,
+            #[serde(rename = "secondary-types", default)]
+            secondary_types: Vec<String>,
         }
         #[derive(serde::Deserialize)]
         struct Credit {
@@ -306,6 +319,10 @@ impl MusicBrainz {
                 &[("inc", "genres+release-groups+artist-credits")],
             )
             .await?;
+        let types = release_types(
+            r.release_group.primary_type.as_deref(),
+            &r.release_group.secondary_types,
+        );
         let mut genres = [
             r.genres,
             r.release_group.genres,
@@ -320,12 +337,13 @@ impl MusicBrainz {
         .unwrap_or_default();
         genres.sort_by(|a, b| b.count.cmp(&a.count).then(a.name.cmp(&b.name)));
         let top = genres.first().map_or(0, |g| g.count);
-        Ok(genres
+        let genres = genres
             .into_iter()
             .filter(|g| g.count * 3 >= top)
             .take(3)
             .map(|g| title_case(&g.name))
-            .collect())
+            .collect();
+        Ok((genres, types))
     }
 
     pub async fn release(&self, id: &str) -> Result<Release, MbError> {
@@ -674,6 +692,26 @@ pub struct Release {
 }
 
 impl Release {
+    /// The release group's types ([`ReleaseGroup::types`]), or, where it
+    /// names none, the one its track lengths suggest ([`type_by_length`]).
+    pub fn types(&self) -> Vec<String> {
+        let types = self
+            .release_group
+            .as_ref()
+            .map(ReleaseGroup::types)
+            .unwrap_or_default();
+        if !types.is_empty() {
+            return types;
+        }
+        let lengths: Vec<_> = self
+            .tracks()
+            .map(|(_, t)| {
+                std::time::Duration::from_millis(t.length.or(t.recording.length).unwrap_or(0))
+            })
+            .collect();
+        vec![type_by_length(&lengths).to_string()]
+    }
+
     pub fn artist(&self) -> String {
         credit_name(&self.artist_credit)
     }
@@ -723,6 +761,42 @@ pub struct ReleaseGroup {
     pub first_release_date: Option<String>,
     #[serde(rename = "primary-type")]
     pub primary_type: Option<String>,
+    #[serde(rename = "secondary-types", default)]
+    pub secondary_types: Vec<String>,
+}
+
+impl ReleaseGroup {
+    /// The group's types as Picard writes them to `RELEASETYPE`: lower
+    /// case, the primary type first. Empty when MusicBrainz gives no primary
+    /// type.
+    pub fn types(&self) -> Vec<String> {
+        release_types(self.primary_type.as_deref(), &self.secondary_types)
+    }
+}
+
+fn release_types(primary: Option<&str>, secondary: &[String]) -> Vec<String> {
+    let Some(primary) = primary else {
+        return Vec::new();
+    };
+    std::iter::once(primary)
+        .chain(secondary.iter().map(String::as_str))
+        .map(str::to_lowercase)
+        .collect()
+}
+
+/// The type a release with no type of its own is taken to be, from its
+/// tracks' lengths, by the rule the stores use: up to three tracks, none
+/// over ten minutes and under half an hour in all, is a single; up to six
+/// under half an hour is an EP; anything longer is an album.
+pub fn type_by_length(lengths: &[std::time::Duration]) -> &'static str {
+    let total: std::time::Duration = lengths.iter().sum();
+    let half_hour = std::time::Duration::from_secs(30 * 60);
+    let longest = lengths.iter().max().copied().unwrap_or_default();
+    match lengths.len() {
+        1..=3 if total < half_hour && longest < std::time::Duration::from_secs(10 * 60) => "single",
+        1..=6 if total < half_hour => "ep",
+        _ => "album",
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]

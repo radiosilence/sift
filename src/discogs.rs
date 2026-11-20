@@ -282,6 +282,32 @@ struct DLabel {
 }
 
 #[derive(Debug, Deserialize, Default)]
+struct DFormat {
+    #[serde(default)]
+    descriptions: Vec<String>,
+}
+
+/// A release's type and secondary types, from its formats' descriptions
+/// ("Album", "EP", "Single", "Compilation"…), named as MusicBrainz names
+/// them. No primary type when no description names one.
+fn types(formats: &[DFormat]) -> (Option<String>, Vec<String>) {
+    let mut primary = None;
+    let mut secondary = Vec::new();
+    for d in formats.iter().flat_map(|f| &f.descriptions) {
+        match d.as_str() {
+            "Single" | "Maxi-Single" => primary = primary.or(Some("Single")),
+            "EP" | "Mini-Album" => primary = primary.or(Some("EP")),
+            "Album" | "LP" => primary = primary.or(Some("Album")),
+            "Compilation" if !secondary.iter().any(|s| s == "Compilation") => {
+                secondary.push("Compilation".to_string())
+            }
+            _ => {}
+        }
+    }
+    (primary.map(str::to_string), secondary)
+}
+
+#[derive(Debug, Deserialize, Default)]
 struct DImage {
     #[serde(rename = "type", default)]
     kind: Option<String>,
@@ -318,6 +344,8 @@ struct DRelease {
     tracklist: Vec<DTrack>,
     #[serde(default)]
     images: Vec<DImage>,
+    #[serde(default)]
+    formats: Vec<DFormat>,
 }
 
 fn map_release(id: u64, r: DRelease, index_tracks: bool) -> Release {
@@ -328,6 +356,7 @@ fn map_release(id: u64, r: DRelease, index_tracks: bool) -> Release {
         .find(|i| i.kind.as_deref() == Some("primary"))
         .or_else(|| r.images.first())
         .and_then(|i| i.uri.clone());
+    let (primary_type, secondary_types) = types(&r.formats);
     Release {
         id: format!("discogs:{id}"),
         title: r.title,
@@ -339,7 +368,8 @@ fn map_release(id: u64, r: DRelease, index_tracks: bool) -> Release {
         release_group: Some(ReleaseGroup {
             id: String::new(),
             first_release_date: date,
-            primary_type: None,
+            primary_type,
+            secondary_types,
         }),
         label_info: r
             .labels

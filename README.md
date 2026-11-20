@@ -175,13 +175,22 @@ instead of disambiguated.
   of `enrich`): from the release when MusicBrainz has it, otherwise by
   splitting the credit only where every part is an artist the library
   already holds, since "&", "," and " x " also occur inside band names.
+- **Every album is typed.** `RELEASETYPE` (`MusicBrainz Album Type` in ID3
+  and MP4) holds the release group's types as Picard writes them, lower case
+  and primary first, since players sort an artist's singles and EPs apart
+  from albums by it. A Discogs match takes its type from the release's format
+  descriptions. An as-is import, or a release that names no type, is typed
+  by the stores' rule: up to three tracks under half an hour (none over ten
+  minutes) is a single, up to six under half an hour an EP, anything longer
+  an album. `enrich` types albums filed without one.
 - **Library writes can be previewed.** `Importer::credit_plan`,
   `Importer::enrich_plan` and `Importer::rematch` return what `credit`,
   `enrich` and `reimport` would write (each file's credits and their source,
   genres, each track's lyrics, the release a re-import would apply and why it
   might stop for review) without changing a file, so a front end can show a
   change before making it. Gain is the exception: measuring it decodes every
-  file, so it is only done to write it. `Importer::retag_plan` lists every
+  file, so it is only done to write it, and `enrich` skips it for an album
+  whose files all carry album gain. `Importer::retag_plan` lists every
   field a re-tag from a chosen release would change in each file, where each
   file and the album's other files would go, and whether the cover would be
   replaced. A hand edit is previewed with `Track::apply` and `meta::diff`.
