@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.14.0
+
+### Changed
+
+- **`enrich` skips gain already written.** An album whose files all carry album gain is not decoded again, so enriching a library already gained takes lookups rather than hours.
+
+### Fixed
+
+- **As-is imports keep what the files say about the release.** Original date, label, catalogue number, country, media and the MusicBrainz and Discogs identifiers were removed by the rewrite; each now keeps the value the files agree on, so a reissue keeps its original year.
+- **Discogs matches file various-artists releases as compilations, and clean their labels.** Discogs' "Various" is credited as Various Artists and flagged as a compilation, as a MusicBrainz match is. Labels lose Discogs' "(2)" suffixes, and its "Not On Label" and "none" placeholders are written as no label and no catalogue number.
+- **Imports write the release type.** `RELEASETYPE` (`MusicBrainz Album Type` in ID3 and MP4) holds the release group's primary and secondary types as Picard writes them, so players file singles, EPs, live albums and compilations under their own headings rather than among the albums. Discogs matches take the type from the release's format descriptions; as-is imports and releases that name none are typed by track count and length. `enrich` adds it to albums filed without one, and `modify` edits it as `albumtypes`.
+
 ## 0.13.1
 
 ### Fixed
