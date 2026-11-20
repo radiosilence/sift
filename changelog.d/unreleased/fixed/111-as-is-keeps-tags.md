@@ -1,0 +1,1 @@
+- **As-is imports keep what the files say about the release.** Original date, label, catalogue number, country, media and the MusicBrainz and Discogs identifiers were removed by the rewrite; each now keeps the value the files agree on, so a reissue keeps its original year.

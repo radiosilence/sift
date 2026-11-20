@@ -374,10 +374,15 @@ fn map_release(id: u64, r: DRelease, index_tracks: bool) -> Release {
         label_info: r
             .labels
             .iter()
+            // "Not On Label (Artist Self-released)" and catalogue number
+            // "none" are Discogs' placeholders for having neither.
             .map(|l| LabelInfo {
-                catalog_number: l.catno.clone().filter(|c| !c.is_empty()),
-                label: Some(Label {
-                    name: l.name.clone(),
+                catalog_number: l
+                    .catno
+                    .clone()
+                    .filter(|c| !c.is_empty() && !c.eq_ignore_ascii_case("none")),
+                label: (!l.name.starts_with("Not On Label")).then(|| Label {
+                    name: strip_disambiguation(&l.name),
                 }),
             })
             .collect(),
@@ -393,6 +398,17 @@ fn artist_credits(artists: &[DArtist]) -> Vec<ArtistCredit> {
         .iter()
         .map(|a| {
             let name = strip_disambiguation(&a.name);
+            // Discogs credits a various-artists release to "Various"; named
+            // and identified as MusicBrainz's Various Artists, it files and
+            // flags as a compilation as a MusicBrainz match does.
+            let (name, id) = if name == "Various" {
+                (
+                    "Various Artists".to_string(),
+                    crate::musicbrainz::VARIOUS_ARTISTS.to_string(),
+                )
+            } else {
+                (name, String::new())
+            };
             let join = a.join.trim();
             ArtistCredit {
                 joinphrase: if join.is_empty() {
@@ -401,7 +417,7 @@ fn artist_credits(artists: &[DArtist]) -> Vec<ArtistCredit> {
                     format!(" {join} ")
                 },
                 artist: Artist {
-                    id: String::new(),
+                    id,
                     name: name.clone(),
                 },
                 name,

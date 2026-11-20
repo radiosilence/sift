@@ -1001,7 +1001,7 @@ impl Importer {
                     let _ = writeln!(log, "year {year} found on MusicBrainz for {}", first.album);
                     for (_, t) in &mut entries {
                         t.date = Some(year.clone());
-                        t.original_date = Some(year.clone());
+                        t.original_date.get_or_insert_with(|| year.clone());
                     }
                 }
                 Ok(None) => {}
@@ -2421,6 +2421,18 @@ fn as_is_tags(
         .ok_or_else(|| ImportError::Untagged("no artist tag".into()))?;
     let date = matching::consensus(tracks.iter().map(|t| t.date.as_deref()));
     let release_types = as_is_types(tracks);
+    // What the files say about the release beyond what filing needs is
+    // kept, not wiped by the rewrite: their original date, label and
+    // identifiers, each the value most files agree on.
+    let agreed = |f: fn(&Track) -> Option<&str>| matching::consensus(tracks.iter().map(f));
+    let original_date = agreed(|t| t.original_date.as_deref());
+    let label = agreed(|t| t.label.as_deref());
+    let catalog_number = agreed(|t| t.catalog_number.as_deref());
+    let country = agreed(|t| t.country.as_deref());
+    let media = agreed(|t| t.media.as_deref());
+    let mb_album_id = agreed(|t| t.mb_album_id.as_deref());
+    let mb_release_group_id = agreed(|t| t.mb_release_group_id.as_deref());
+    let discogs_album_id = agreed(|t| t.discogs_album_id.as_deref());
 
     let mut problems = Vec::new();
     let mut seen = HashMap::new();
@@ -2450,6 +2462,10 @@ fn as_is_tags(
             continue;
         }
         let artist = t.artist.clone().unwrap_or_else(|| album_artist.clone());
+        // Against the credit before ftintitle moved a featured artist into
+        // the title: that artist is still on the track.
+        let artists = names_in(&t.artists, &artist);
+        let album_artists = names_in(&t.album_artists, &album_artist);
         let (artist, title) = match ft {
             Some(ft) => {
                 match crate::ftintitle::apply(&artist, &album_artist, &title, ft.drop, &ft.format) {
@@ -2472,10 +2488,29 @@ fn as_is_tags(
                 disc_total: 0,
                 date: date.clone(),
                 compilation: album_artist == "Various Artists",
-                // Against the credit before ftintitle moved a featured
-                // artist into the title: that artist is still on the track.
-                artists: names_in(&t.artists, t.artist.as_deref().unwrap_or(&album_artist)),
-                album_artists: names_in(&t.album_artists, &album_artist),
+                original_date: original_date.clone(),
+                label: label.clone(),
+                catalog_number: catalog_number.clone(),
+                country: country.clone(),
+                media: media.clone(),
+                mb_recording_id: t.mb_recording_id.clone(),
+                mb_track_id: t.mb_track_id.clone(),
+                mb_album_id: mb_album_id.clone(),
+                mb_release_group_id: mb_release_group_id.clone(),
+                discogs_album_id: discogs_album_id.clone(),
+                // Ids line up with the names only while every name is kept.
+                mb_artist_ids: if artists == t.artists {
+                    t.mb_artist_ids.clone()
+                } else {
+                    Vec::new()
+                },
+                mb_album_artist_ids: if album_artists == t.album_artists {
+                    t.mb_album_artist_ids.clone()
+                } else {
+                    Vec::new()
+                },
+                artists,
+                album_artists,
                 release_types: release_types.clone(),
                 ..Tags::default()
             },
@@ -2789,6 +2824,34 @@ mod tests {
             .collect();
         assert_eq!(t, [(1, "Intro", 2), (2, "Second Thing", 2)]);
         assert_eq!(entries[0].1.album_artist, "ANNA");
+    }
+
+    #[test]
+    fn as_is_keeps_what_the_files_say_about_the_release() {
+        let reissue = |path| Track {
+            original_date: Some("1979".into()),
+            label: Some("Factory".into()),
+            mb_album_id: Some("rel".into()),
+            ..tagged(
+                path,
+                Some("Unknown Pleasures"),
+                Some("Joy Division"),
+                None,
+                None,
+            )
+        };
+        let entries = as_is_tags(
+            &[
+                reissue("a/01 Disorder.flac"),
+                reissue("a/02 Day of the Lords.flac"),
+            ],
+            None,
+        )
+        .unwrap();
+        let t = &entries[0].1;
+        assert_eq!(t.original_date.as_deref(), Some("1979"));
+        assert_eq!(t.label.as_deref(), Some("Factory"));
+        assert_eq!(t.mb_album_id.as_deref(), Some("rel"));
     }
 
     /// A local server answering each request with the next of `script`
