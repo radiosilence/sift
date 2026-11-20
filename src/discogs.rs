@@ -282,6 +282,32 @@ struct DLabel {
 }
 
 #[derive(Debug, Deserialize, Default)]
+struct DFormat {
+    #[serde(default)]
+    descriptions: Vec<String>,
+}
+
+/// A release's type and secondary types, from its formats' descriptions
+/// ("Album", "EP", "Single", "Compilation"…), named as MusicBrainz names
+/// them. No primary type when no description names one.
+fn types(formats: &[DFormat]) -> (Option<String>, Vec<String>) {
+    let mut primary = None;
+    let mut secondary = Vec::new();
+    for d in formats.iter().flat_map(|f| &f.descriptions) {
+        match d.as_str() {
+            "Single" | "Maxi-Single" => primary = primary.or(Some("Single")),
+            "EP" | "Mini-Album" => primary = primary.or(Some("EP")),
+            "Album" | "LP" => primary = primary.or(Some("Album")),
+            "Compilation" if !secondary.iter().any(|s| s == "Compilation") => {
+                secondary.push("Compilation".to_string())
+            }
+            _ => {}
+        }
+    }
+    (primary.map(str::to_string), secondary)
+}
+
+#[derive(Debug, Deserialize, Default)]
 struct DImage {
     #[serde(rename = "type", default)]
     kind: Option<String>,
@@ -318,6 +344,8 @@ struct DRelease {
     tracklist: Vec<DTrack>,
     #[serde(default)]
     images: Vec<DImage>,
+    #[serde(default)]
+    formats: Vec<DFormat>,
 }
 
 fn map_release(id: u64, r: DRelease, index_tracks: bool) -> Release {
@@ -328,6 +356,7 @@ fn map_release(id: u64, r: DRelease, index_tracks: bool) -> Release {
         .find(|i| i.kind.as_deref() == Some("primary"))
         .or_else(|| r.images.first())
         .and_then(|i| i.uri.clone());
+    let (primary_type, secondary_types) = types(&r.formats);
     Release {
         id: format!("discogs:{id}"),
         title: r.title,
@@ -339,15 +368,21 @@ fn map_release(id: u64, r: DRelease, index_tracks: bool) -> Release {
         release_group: Some(ReleaseGroup {
             id: String::new(),
             first_release_date: date,
-            primary_type: None,
+            primary_type,
+            secondary_types,
         }),
         label_info: r
             .labels
             .iter()
+            // "Not On Label (Artist Self-released)" and catalogue number
+            // "none" are Discogs' placeholders for having neither.
             .map(|l| LabelInfo {
-                catalog_number: l.catno.clone().filter(|c| !c.is_empty()),
-                label: Some(Label {
-                    name: l.name.clone(),
+                catalog_number: l
+                    .catno
+                    .clone()
+                    .filter(|c| !c.is_empty() && !c.eq_ignore_ascii_case("none")),
+                label: (!l.name.starts_with("Not On Label")).then(|| Label {
+                    name: strip_disambiguation(&l.name),
                 }),
             })
             .collect(),
@@ -363,6 +398,17 @@ fn artist_credits(artists: &[DArtist]) -> Vec<ArtistCredit> {
         .iter()
         .map(|a| {
             let name = strip_disambiguation(&a.name);
+            // Discogs credits a various-artists release to "Various"; named
+            // and identified as MusicBrainz's Various Artists, it files and
+            // flags as a compilation as a MusicBrainz match does.
+            let (name, id) = if name == "Various" {
+                (
+                    "Various Artists".to_string(),
+                    crate::musicbrainz::VARIOUS_ARTISTS.to_string(),
+                )
+            } else {
+                (name, String::new())
+            };
             let join = a.join.trim();
             ArtistCredit {
                 joinphrase: if join.is_empty() {
@@ -371,7 +417,7 @@ fn artist_credits(artists: &[DArtist]) -> Vec<ArtistCredit> {
                     format!(" {join} ")
                 },
                 artist: Artist {
-                    id: String::new(),
+                    id,
                     name: name.clone(),
                 },
                 name,
@@ -519,6 +565,22 @@ fn build_media(flat: Vec<FlatTrack>) -> Vec<Medium> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn format_descriptions_name_the_type() {
+        let f = |d: &[&str]| DFormat {
+            descriptions: d.iter().map(|s| s.to_string()).collect(),
+        };
+        assert_eq!(
+            types(&[f(&["7\"", "Single", "45 RPM"])]),
+            (Some("Single".into()), vec![])
+        );
+        assert_eq!(
+            types(&[f(&["LP", "Compilation"])]),
+            (Some("Album".into()), vec!["Compilation".into()])
+        );
+        assert_eq!(types(&[f(&["Reissue"])]), (None, vec![]));
+    }
 
     #[test]
     fn strips_the_discogs_disambiguation_suffix() {

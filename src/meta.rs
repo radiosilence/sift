@@ -65,6 +65,9 @@ pub struct Track {
     pub country: Option<String>,
     pub media: Option<String>,
     pub mb_release_group_id: Option<String>,
+    /// The release group's types, as Picard's `RELEASETYPE` holds them:
+    /// lower case, the primary type first.
+    pub release_types: Vec<String>,
     /// The Discogs release the album was matched to, as a number.
     pub discogs_album_id: Option<String>,
     pub duration: Duration,
@@ -187,6 +190,13 @@ fn read_tag(t: &mut Track, tag: &Tag) {
     t.country = s(ItemKey::ReleaseCountry);
     t.media = s(ItemKey::OriginalMediaType);
     t.mb_release_group_id = s(ItemKey::MusicBrainzReleaseGroupId);
+    // One value per type, or several in one value ("album; live").
+    t.release_types = all(ItemKey::MusicBrainzReleaseType)
+        .iter()
+        .flat_map(|v| v.split([';', '/']))
+        .map(|v| v.trim().to_lowercase())
+        .filter(|v| !v.is_empty())
+        .collect();
 }
 
 /// The Discogs release id's tag, named after beets' `discogs_albumid`.
@@ -287,6 +297,8 @@ pub struct Tags {
     pub mb_artist_ids: Vec<String>,
     pub mb_album_artist_ids: Vec<String>,
     pub mb_release_group_id: Option<String>,
+    /// The release group's types, one value each. Empty removes the field.
+    pub release_types: Vec<String>,
     pub discogs_album_id: Option<String>,
 }
 
@@ -669,6 +681,7 @@ fn write_tags(tag: &mut Tag, tags: &Tags, cover: Option<&[u8]>) {
         },
         false,
     );
+    set_release_types(tag, &tags.release_types);
     tag.remove_key(ItemKey::FlagCompilation);
     if tags.compilation {
         tag.insert_text(ItemKey::FlagCompilation, "1".into());
@@ -718,6 +731,17 @@ fn set_credits(tag: &mut Tag, credits: &Credits, keep_unset: bool) {
     }
 }
 
+/// One `RELEASETYPE` value per type, as Picard writes them.
+fn set_release_types(tag: &mut Tag, types: &[String]) {
+    tag.remove_key(ItemKey::MusicBrainzReleaseType);
+    for t in types {
+        tag.push(TagItem::new(
+            ItemKey::MusicBrainzReleaseType,
+            ItemValue::Text(t.clone()),
+        ));
+    }
+}
+
 /// Write only the multi-valued artist fields given values, leaving every
 /// other tag as it is: for crediting each artist on files already filed.
 pub fn write_credits(path: &Path, credits: &Credits) -> Result<(), MetaError> {
@@ -741,6 +765,7 @@ pub struct Edit<'a> {
     /// As [`set`].
     pub changes: &'a [Change],
     pub lyrics: Option<&'a str>,
+    pub release_types: Option<&'a [String]>,
 }
 
 /// Make every change in `e` to `path` in one write.
@@ -768,6 +793,9 @@ pub fn apply(path: &Path, e: &Edit) -> Result<(), MetaError> {
             tag.remove_key(ItemKey::Lyrics);
             tag.insert_text(ItemKey::Lyrics, lyrics.to_string());
         }
+        if let Some(types) = e.release_types {
+            set_release_types(tag, types);
+        }
         Ok(())
     })
 }
@@ -794,7 +822,16 @@ pub const EDITABLE: &[&str] = &[
     "comp",
     "artists",
     "albumartists",
+    "albumtypes",
 ];
+
+/// Release types as typed, "; " between them, folded as they are written.
+fn release_type_list(value: Option<&str>) -> Vec<String> {
+    split_list(value)
+        .into_iter()
+        .map(|t| t.to_lowercase())
+        .collect()
+}
 
 /// A list field as typed: names separated by "; ".
 fn split_list(value: Option<&str>) -> Vec<String> {
@@ -830,6 +867,7 @@ impl Track {
             "albumartists" => {
                 (!self.album_artists.is_empty()).then(|| self.album_artists.join("; "))
             }
+            "albumtypes" => (!self.release_types.is_empty()).then(|| self.release_types.join("; ")),
             _ => None,
         }
     }
@@ -864,6 +902,7 @@ impl Track {
             mb_artist_ids: tags.mb_artist_ids.clone(),
             mb_album_artist_ids: tags.mb_album_artist_ids.clone(),
             mb_release_group_id: opt(&tags.mb_release_group_id),
+            release_types: tags.release_types.clone(),
             discogs_album_id: opt(&tags.discogs_album_id),
             ..self.clone()
         }
@@ -901,6 +940,7 @@ impl Track {
                     self.album_artists = split_list(value.as_deref());
                     self.mb_album_artist_ids.clear();
                 }
+                "albumtypes" => self.release_types = release_type_list(value.as_deref()),
                 _ => {}
             }
         }
@@ -1037,6 +1077,11 @@ pub fn diff(old: &Track, new: &Track) -> Vec<TagChange> {
             new.mb_release_group_id.clone(),
         ),
         (
+            "albumtypes",
+            list(&old.release_types),
+            list(&new.release_types),
+        ),
+        (
             "discogs_albumid",
             old.discogs_album_id.clone(),
             new.discogs_album_id.clone(),
@@ -1105,6 +1150,7 @@ fn set_tag(tag: &mut Tag, changes: &[Change]) {
                     tag.push(TagItem::new(names, ItemValue::Text(v)));
                 }
             }
+            "albumtypes" => set_release_types(tag, &release_type_list(value.as_deref())),
             name => {
                 let key = match name {
                     "title" => ItemKey::TrackTitle,
@@ -1621,6 +1667,7 @@ mod tests {
         apply(
             &path,
             &Edit {
+                release_types: None,
                 credits: Some(&Credits {
                     artists: &["A".into(), "B".into()],
                     artist_ids: &[],

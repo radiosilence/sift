@@ -1,0 +1,1 @@
+- **Discogs matches file various-artists releases as compilations, and clean their labels.** Discogs' "Various" is credited as Various Artists and flagged as a compilation, as a MusicBrainz match is. Labels lose Discogs' "(2)" suffixes, and its "Not On Label" and "none" placeholders are written as no label and no catalogue number.

@@ -1,0 +1,1 @@
+- **`enrich` skips gain already written.** An album whose files all carry album gain is not decoded again, so enriching a library already gained takes lookups rather than hours.
