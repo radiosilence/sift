@@ -846,6 +846,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn untyped_releases_are_typed_by_length() {
+        let mins = |m: &[u64]| -> Vec<_> {
+            m.iter()
+                .map(|m| std::time::Duration::from_secs(m * 60))
+                .collect()
+        };
+        assert_eq!(type_by_length(&mins(&[3])), "single");
+        assert_eq!(type_by_length(&mins(&[4, 4, 5])), "single");
+        assert_eq!(type_by_length(&mins(&[12])), "ep");
+        assert_eq!(type_by_length(&mins(&[4, 4, 4, 4, 4])), "ep");
+        assert_eq!(type_by_length(&mins(&[4; 7])), "album");
+        assert_eq!(type_by_length(&mins(&[40])), "album");
+    }
+
+    #[test]
+    fn group_types_read_as_picard_writes_them() {
+        let g: ReleaseGroup = serde_json::from_str(
+            r#"{"id":"x","primary-type":"Album","secondary-types":["Live","Compilation"]}"#,
+        )
+        .unwrap();
+        assert_eq!(g.types(), ["album", "live", "compilation"]);
+    }
+
+    #[test]
     fn genre_names_are_title_cased_with_acronyms_kept() {
         assert_eq!(title_case("future garage"), "Future Garage");
         assert_eq!(title_case("uk garage"), "UK Garage");

@@ -551,6 +551,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn format_descriptions_name_the_type() {
+        let f = |d: &[&str]| DFormat {
+            descriptions: d.iter().map(|s| s.to_string()).collect(),
+        };
+        assert_eq!(
+            types(&[f(&["7\"", "Single", "45 RPM"])]),
+            (Some("Single".into()), vec![])
+        );
+        assert_eq!(
+            types(&[f(&["LP", "Compilation"])]),
+            (Some("Album".into()), vec!["Compilation".into()])
+        );
+        assert_eq!(types(&[f(&["Reissue"])]), (None, vec![]));
+    }
+
+    #[test]
     fn strips_the_discogs_disambiguation_suffix() {
         assert_eq!(strip_disambiguation("Boards of Canada"), "Boards of Canada");
         assert_eq!(strip_disambiguation("Artist (2)"), "Artist");

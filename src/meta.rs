@@ -1667,6 +1667,7 @@ mod tests {
         apply(
             &path,
             &Edit {
+                release_types: None,
                 credits: Some(&Credits {
                     artists: &["A".into(), "B".into()],
                     artist_ids: &[],

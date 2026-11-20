@@ -220,6 +220,8 @@ pub struct Importer {
 pub struct Enriched {
     pub gain_db: Option<f64>,
     pub genres: Vec<String>,
+    /// Written to every track; empty when the album had types already.
+    pub release_types: Vec<String>,
     /// Tracks given lyrics.
     pub lyrics: usize,
     /// Artists credited one by one where the files named them only together.
@@ -265,6 +267,8 @@ pub struct EnrichPlan {
     /// Written to every track; empty when the album has genres already or
     /// MusicBrainz has none.
     pub genres: Vec<String>,
+    /// Written to every track; empty when the album has types already.
+    pub release_types: Vec<String>,
     /// Each track that has none and would be given lyrics.
     pub lyrics: Vec<PlannedLyrics>,
     pub problems: Vec<String>,
@@ -281,6 +285,7 @@ pub struct PlannedLyrics {
 #[derive(Default)]
 struct Lookups {
     genres: Vec<String>,
+    release_types: Vec<String>,
     lyrics: Vec<PlannedLyrics>,
     problems: Vec<String>,
 }
@@ -679,21 +684,33 @@ impl Importer {
         };
         let paths: Vec<PathBuf> = tracks.iter().map(|t| t.path.clone()).collect();
 
-        crate::progress::report(crate::progress::Stage::ReplayGain);
-        let measured = {
+        // Gain is measured only where a file lacks it: measuring decodes
+        // every file, and an album already gained would get the same values.
+        let gained = {
             let paths = paths.clone();
-            tokio::task::spawn_blocking(move || crate::replaygain::album(&paths, 2))
+            tokio::task::spawn_blocking(move || paths.iter().all(|p| meta::has_album_gain(p)))
                 .await
-                .expect("replaygain panicked")
+                .expect("tag reader panicked")
         };
-        let gains: Vec<Option<_>> = match measured {
-            Ok((gains, album)) => {
-                out.gain_db = Some(album.db);
-                gains.into_iter().map(|g| Some((g, album))).collect()
-            }
-            Err(e) => {
-                out.problems.push(format!("replaygain: {e}"));
-                vec![None; paths.len()]
+        let gains: Vec<Option<_>> = if gained {
+            vec![None; paths.len()]
+        } else {
+            crate::progress::report(crate::progress::Stage::ReplayGain);
+            let measured = {
+                let paths = paths.clone();
+                tokio::task::spawn_blocking(move || crate::replaygain::album(&paths, 2))
+                    .await
+                    .expect("replaygain panicked")
+            };
+            match measured {
+                Ok((gains, album)) => {
+                    out.gain_db = Some(album.db);
+                    gains.into_iter().map(|g| Some((g, album))).collect()
+                }
+                Err(e) => {
+                    out.problems.push(format!("replaygain: {e}"));
+                    vec![None; paths.len()]
+                }
             }
         };
 
@@ -705,6 +722,8 @@ impl Importer {
             vec![("genre".into(), Some(found.genres.join("; ")))]
         };
         out.genres = found.genres;
+        out.release_types = found.release_types.clone();
+        let release_types = found.release_types;
         let lyrics = found.lyrics;
         let files = credits.files;
 
@@ -726,12 +745,15 @@ impl Importer {
                         replaygain: gain,
                         changes: &genre,
                         lyrics: lyric.map(|l| l.text.as_str()),
+                        release_types: (!release_types.is_empty())
+                            .then_some(release_types.as_slice()),
                     };
                     let fields: Vec<&str> = [
                         (edit.credits.is_some(), "artist credits"),
                         (edit.replaygain.is_some(), "gain"),
                         (!edit.changes.is_empty(), "genre"),
                         (edit.lyrics.is_some(), "lyrics"),
+                        (edit.release_types.is_some(), "release type"),
                     ]
                     .into_iter()
                     .filter_map(|(on, name)| on.then_some(name))
@@ -779,6 +801,7 @@ impl Importer {
         Ok(EnrichPlan {
             credits,
             genres: found.genres,
+            release_types: found.release_types,
             lyrics: found.lyrics,
             problems,
         })
@@ -791,12 +814,34 @@ impl Importer {
         let untagged = tracks
             .iter()
             .all(|t| t.genre.as_deref().is_none_or(|g| g.trim().is_empty()));
-        if untagged && let Some(id) = tracks.iter().find_map(|t| t.mb_album_id.clone()) {
+        let untyped = tracks.iter().all(|t| t.release_types.is_empty());
+        let release = tracks.iter().find_map(|t| t.mb_album_id.clone());
+        let mut asked = true;
+        if (untagged || untyped)
+            && let Some(id) = &release
+        {
             crate::progress::report(crate::progress::Stage::Genres);
-            match self.mb.genres(&id).await {
-                Ok(g) => out.genres = g,
-                Err(e) => out.problems.push(format!("genres: {e}")),
+            match self.mb.genres_and_types(id).await {
+                Ok((genres, types)) => {
+                    if untagged {
+                        out.genres = genres;
+                    }
+                    if untyped {
+                        out.release_types = types;
+                    }
+                }
+                Err(e) => {
+                    asked = false;
+                    out.problems.push(format!("genres and release type: {e}"));
+                }
             }
+        }
+        // An album with no release to ask, or one whose release group names
+        // no type, is typed by its lengths, as an as-is import is. One whose
+        // lookup failed is left for a later run.
+        if untyped && asked && out.release_types.is_empty() {
+            let lengths: Vec<_> = tracks.iter().map(|t| t.duration).collect();
+            out.release_types = vec![crate::musicbrainz::type_by_length(&lengths).to_string()];
         }
         // Only a track with an artist and a title can be looked up.
         let wanted: Vec<(&Track, &String, &String)> = tracks
@@ -1737,6 +1782,7 @@ impl Importer {
             mb_release_group_id: mb_ids
                 .then(|| release.release_group.as_ref().map(|g| g.id.clone()))
                 .flatten(),
+            release_types: release.types(),
             discogs_album_id: release.id.strip_prefix("discogs:").map(str::to_string),
         }
     }
@@ -2312,6 +2358,25 @@ fn as_single(t: &Track) -> Option<Track> {
     })
 }
 
+/// The types the files name, where every file names the same ones; else the
+/// one their lengths suggest.
+fn as_is_types(tracks: &[Track]) -> Vec<String> {
+    match tracks.first() {
+        Some(first)
+            if !first.release_types.is_empty()
+                && tracks
+                    .iter()
+                    .all(|t| t.release_types == first.release_types) =>
+        {
+            first.release_types.clone()
+        }
+        _ => {
+            let lengths: Vec<_> = tracks.iter().map(|t| t.duration).collect();
+            vec![crate::musicbrainz::type_by_length(&lengths).to_string()]
+        }
+    }
+}
+
 /// Tags for filing each file as it is, or why its tags cannot be trusted to.
 fn as_is_tags(
     tracks: &[Track],
@@ -2355,6 +2420,7 @@ fn as_is_tags(
         })
         .ok_or_else(|| ImportError::Untagged("no artist tag".into()))?;
     let date = matching::consensus(tracks.iter().map(|t| t.date.as_deref()));
+    let release_types = as_is_types(tracks);
 
     let mut problems = Vec::new();
     let mut seen = HashMap::new();
@@ -2410,6 +2476,7 @@ fn as_is_tags(
                 // artist into the title: that artist is still on the track.
                 artists: names_in(&t.artists, t.artist.as_deref().unwrap_or(&album_artist)),
                 album_artists: names_in(&t.album_artists, &album_artist),
+                release_types: release_types.clone(),
                 ..Tags::default()
             },
         ));
@@ -3000,6 +3067,7 @@ mod tests {
             ("Mulch Me", "Mulch Me", "Hannah Moule x Pink Oyster")
         );
         assert_eq!((t.track, t.track_total), (1, 1));
+        assert_eq!(t.release_types, ["single"]);
 
         // Untitled, the file name gives it, less the artist before it.
         let entries = as_is_tags(
