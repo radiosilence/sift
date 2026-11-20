@@ -167,6 +167,8 @@ instead of disambiguated.
   requires one album and one artist across every file and a title and
   distinct track number for each; otherwise nothing moves and the reason is
   given, since a library filed from bad tags is worse than an album waiting.
+  What the files say about the release beyond that (original date, label,
+  identifiers) is kept rather than cleared by the rewrite.
 - **Every artist on a credit is tagged.** `artist` and `albumartist` keep the
   credit as it reads ("A × B"); `ARTISTS`, `ALBUMARTISTS` and the MusicBrainz
   artist ids hold each artist, as Picard writes them, so a player can list a

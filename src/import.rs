@@ -2512,7 +2512,6 @@ fn as_is_tags(
                 artists,
                 album_artists,
                 release_types: release_types.clone(),
-                ..Tags::default()
             },
         ));
     }
